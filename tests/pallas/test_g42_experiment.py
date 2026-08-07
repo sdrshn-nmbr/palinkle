@@ -52,7 +52,15 @@ def test_verify_release_writes_hashed_results(tmp_path: Path) -> None:
             "runtime_safety": True,
             "profile": True,
         },
-        "profile": {"speedup": 1.1},
+        "profile": {
+            "speedup": 1.1,
+            "admission": {"verified": True},
+            "timing": {
+                "speedup": 1.1,
+                "speedup_ci95": [1.06, 1.14],
+                "materially_beats_xla": True,
+            },
+        },
     }
     command = [sys.executable, "-c", f"import json; print(json.dumps({result!r}))"]
 

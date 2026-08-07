@@ -15,9 +15,11 @@ from typing import Any, Protocol
 import tomli
 
 from opjax.pallas.environment import verify_static
+from opjax.pallas.task_semantics import operation_specification, render_task_instruction
 
 SCHEMA_VERSION = 1
-TASK_SCHEMA_VERSION = "1.3"
+TASK_SCHEMA_VERSION = "1.4"
+LEGACY_TASK_SCHEMA_VERSION = "1.3"
 AGENT_IMAGE = "python@sha256:9e869b0816f5537709825b49e62dc86d1c2691eff19b05c1d4dc3a07992cc052"
 ACTION_PATTERN = re.compile(r"```mswea_bash_command\s*\n(.*?)\n```", re.DOTALL)
 MANDATORY_STAGES = (
@@ -64,6 +66,7 @@ class TaskPackage:
     input_shapes: tuple[tuple[int, ...], ...]
     input_dtypes: tuple[str, ...]
     correctness_seeds: tuple[int, ...]
+    exact_semantics: bool
 
 
 def canonical_sha256(value: Any) -> str:
@@ -102,6 +105,60 @@ def parse_action(content: str) -> dict[str, str]:
     return {"command": actions[0]}
 
 
+def _tool_call_value(tool_call: Any) -> dict[str, Any]:
+    if hasattr(tool_call, "model_dump"):
+        value = tool_call.model_dump(mode="json")
+    elif isinstance(tool_call, dict):
+        value = tool_call
+    else:
+        raise G42HarnessError("ACTION_TOOL_INVALID: unsupported tool-call value")
+    return value
+
+
+def parse_model_action(message: dict[str, Any]) -> dict[str, str]:
+    """Normalize one native TML tool call or one legacy fenced shell action."""
+    text = model_message_text(message)
+    fenced = [match.strip() for match in ACTION_PATTERN.findall(text)]
+    native: list[dict[str, str]] = []
+    for raw in message.get("tool_calls", ()) or ():
+        tool_call = _tool_call_value(raw)
+        function = tool_call.get("function")
+        if not isinstance(function, dict):
+            raise G42HarnessError("ACTION_TOOL_INVALID: function")
+        if function.get("name") != "mswea_bash_command":
+            raise G42HarnessError(
+                f"ACTION_TOOL_INVALID: name={function.get('name')!r}"
+            )
+        arguments = function.get("arguments")
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except json.JSONDecodeError as exc:
+                raise G42HarnessError("ACTION_ARGUMENTS_INVALID: malformed JSON") from exc
+        if not isinstance(arguments, dict) or not isinstance(arguments.get("command"), str):
+            raise G42HarnessError("ACTION_ARGUMENTS_INVALID: command")
+        native.append({"command": arguments["command"].strip()})
+    observed = len(fenced) + len(native)
+    if observed != 1:
+        raise G42HarnessError(f"ACTION_COUNT_INVALID: expected=1 observed={observed}")
+    action = native[0] if native else {"command": fenced[0]}
+    _require(bool(action["command"]), "ACTION_EMPTY", "command")
+    return action
+
+
+def model_message_text(message: dict[str, Any]) -> str:
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    return "\n".join(
+        part.get("text", "")
+        for part in content
+        if isinstance(part, dict) and part.get("type") in {"text", "thinking"}
+    )
+
+
 def validate_horizon_contract(
     *, turn_limit: int, snapshot_turns: tuple[int, ...]
 ) -> None:
@@ -127,7 +184,12 @@ def load_task_package(root: Path) -> TaskPackage:
         raise G42HarnessError(f"TASK_MANIFEST_MISSING: {manifest_path}") from exc
     except tomli.TOMLDecodeError as exc:
         raise G42HarnessError(f"TASK_MANIFEST_INVALID: {exc}") from exc
-    _require(manifest.get("schema_version") == TASK_SCHEMA_VERSION, "TASK_SCHEMA_INVALID", root.name)
+    schema_version = manifest.get("schema_version")
+    _require(
+        schema_version in {LEGACY_TASK_SCHEMA_VERSION, TASK_SCHEMA_VERSION},
+        "TASK_SCHEMA_INVALID",
+        root.name,
+    )
     task = manifest.get("task", {})
     metadata = manifest.get("metadata", {})
     verifier = manifest.get("verifier", {})
@@ -175,6 +237,30 @@ def load_task_package(root: Path) -> TaskPackage:
     observed_sha = canonical_sha256({"manifest": hash_manifest, "files": hashes})
     declared_sha = metadata.get("task_sha256")
     _require(declared_sha == observed_sha, "TASK_HASH_MISMATCH", f"{declared_sha} != {observed_sha}")
+    exact_semantics = schema_version == TASK_SCHEMA_VERSION
+    if exact_semantics:
+        specification = operation_specification(task_json)
+        _require(
+            task_json.get("public_specification") == specification,
+            "PUBLIC_SPECIFICATION_MISMATCH",
+            root.name,
+        )
+        _require(
+            task_json.get("public_specification_sha256")
+            == canonical_sha256(specification),
+            "PUBLIC_SPECIFICATION_HASH_MISMATCH",
+            root.name,
+        )
+        expected_instruction = render_task_instruction(
+            task_json,
+            repair=metadata["mutation"] if metadata["mode"] == "curriculum" else None,
+        )
+        _require(
+            (root / "instruction.md").read_text(encoding="utf-8")
+            == expected_instruction,
+            "PUBLIC_INSTRUCTION_MISMATCH",
+            root.name,
+        )
     return TaskPackage(
         root=root,
         task_id=root.name,
@@ -187,6 +273,7 @@ def load_task_package(root: Path) -> TaskPackage:
         input_shapes=tuple(tuple(shape) for shape in task_json["input_shapes"]),
         input_dtypes=tuple(task_json["input_dtypes"]),
         correctness_seeds=seeds,
+        exact_semantics=exact_semantics,
     )
 
 
@@ -349,10 +436,17 @@ def classify_verifier_result(result: dict[str, Any]) -> int:
     if not isinstance(stages, dict):
         return 0
     mandatory_passed = all(stages.get(stage) is True for stage in MANDATORY_STAGES)
+    profile = result.get("profile")
+    profile_admitted = bool(
+        isinstance(profile, dict)
+        and isinstance(profile.get("admission"), dict)
+        and profile["admission"].get("verified") is True
+    )
     return int(
         result.get("passed") is True
         and result.get("stage") == "verified"
         and mandatory_passed
+        and profile_admitted
     )
 
 
@@ -368,7 +462,13 @@ def write_verifier_artifacts(
     reached = result.get("stages", {})
     stage_scores = {stage: float(reached.get(stage, False)) for stage in MANDATORY_STAGES}
     profile = result.get("profile") or {}
-    speedup = profile.get("speedup")
+    timing = profile.get("timing") if isinstance(profile.get("timing"), dict) else {}
+    speedup = timing.get("speedup", profile.get("speedup"))
+    profile_admitted = bool(
+        reached.get("profile") is True
+        and isinstance(profile.get("admission"), dict)
+        and profile["admission"].get("verified") is True
+    )
     payload = {
         "schema_version": SCHEMA_VERSION,
         "task_id": task_id,
@@ -378,9 +478,11 @@ def write_verifier_artifacts(
         "correct": bool(result.get("correct", result.get("passed", False))),
         "authentic": bool(result.get("authentic", result.get("passed", False))),
         "normal_lowered": bool(result.get("normal_lowered", result.get("passed", False))),
-        "profiled": bool(profile or result.get("passed", False)),
+        "profiled": profile_admitted,
         "speedup": speedup,
-        "beats_xla": bool(isinstance(speedup, (int, float)) and speedup > 1.0),
+        "beats_xla": bool(
+            profile_admitted and timing.get("materially_beats_xla") is True
+        ),
         "failure_stage": None if reward == 1 else result.get("stage", "infrastructure"),
         "infrastructure_error": reward == -1,
         "worker_recovery_required": bool(result.get("worker_recovery_required", False)),

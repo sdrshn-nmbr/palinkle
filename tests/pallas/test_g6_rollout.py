@@ -78,9 +78,25 @@ def test_deterministic_online_step_preserves_16_by_4_credit_contract(
         sample.action_result = {"returncode": 0, "output": "ok", "exception_info": ""}
         sample.snapshot = {"kernel_path": kernel.name}
 
-    class FakeTokenizer:
-        def decode(self, tokens):
-            return "```mswea_bash_command\ntrue\n```"
+    class FakeRenderer:
+        def parse_response(self, tokens):
+            return (
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "id": None,
+                            "function": {
+                                "name": "mswea_bash_command",
+                                "arguments": {"command": "true"},
+                            },
+                        }
+                    ],
+                },
+                SimpleNamespace(value="stop_sequence"),
+            )
 
     class FakeVerifier:
         def __init__(self):
@@ -131,8 +147,8 @@ def test_deterministic_online_step_preserves_16_by_4_credit_contract(
         step=1,
         tasks=tasks,
         sampling=None,
-        renderer=None,
-        tokenizer=FakeTokenizer(),
+        renderer=FakeRenderer(),
+        tokenizer=None,
         rollout={
             "parallel_trajectories": 16,
             "refinement_turns": 4,

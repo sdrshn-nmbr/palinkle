@@ -4,20 +4,21 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib.util
 import json
+import os
+import subprocess
 import sys
-import time
 from pathlib import Path
-from types import ModuleType
 from typing import Any
 
 import chex
 import jax
+import numpy as np
 
+from opjax.pallas.benchmarking import validate_timing_result
 from opjax.pallas.corpus import _generate_inputs, _semantic_oracle
 from opjax.pallas.environment import verify_static
-from opjax.pallas.lowering import capture_lowering_case
+from opjax.pallas.lowering import validate_execution_evidence
 from opjax.pallas.scoring import inspect_pallas_source
 
 
@@ -39,6 +40,25 @@ def _is_runtime_safety_failure(error: BaseException) -> bool:
             "sigabrt",
             "segmentation fault",
         )
+    )
+
+
+def classify_seed_failure(*, phase: str, error: BaseException) -> str:
+    if _is_runtime_safety_failure(error):
+        return "runtime_safety"
+    if phase == "compile":
+        return "tpu_compile"
+    if phase == "execute":
+        return "full_shape_correctness"
+    raise EnvironmentRunnerError(f"SEED_PHASE_INVALID: {phase}")
+
+
+def classify_worker_failure(worker: dict[str, Any]) -> str:
+    if worker.get("worker_recovery_required") is True:
+        return "runtime_safety"
+    return classify_seed_failure(
+        phase=str(worker.get("phase")),
+        error=RuntimeError(worker.get("error", "candidate execution failed")),
     )
 
 
@@ -64,47 +84,143 @@ def _failed(
     }
 
 
-def _time_compiled(compiled: Any, inputs: tuple[Any, ...], *, warmups: int = 3, iterations: int = 20) -> float:
-    for _ in range(warmups):
-        jax.block_until_ready(compiled(*inputs))
-    started = time.perf_counter()
-    for _ in range(iterations):
-        jax.block_until_ready(compiled(*inputs))
-    return (time.perf_counter() - started) * 1000 / iterations
-
-
 def _sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _load_module(path: Path) -> ModuleType:
-    spec = importlib.util.spec_from_file_location("opjax_environment_candidate", path)
-    if spec is None or spec.loader is None:
-        raise EnvironmentRunnerError("MODULE_LOAD_FAILED")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+def validate_candidate_output(
+    *, actual: np.ndarray, expected: np.ndarray, rtol: float, atol: float
+) -> None:
+    chex.assert_trees_all_equal_shapes_and_dtypes(actual, expected)
+    chex.assert_trees_all_close(actual, expected, rtol=rtol, atol=atol)
 
 
-def _hardware() -> dict[str, Any]:
-    chex.assert_devices_available(1, "tpu", not_less_than=True)
-    devices = jax.devices()
-    return {
-        "platforms": sorted({device.platform for device in devices}),
-        "device_kinds": sorted({getattr(device, "device_kind", "unknown") for device in devices}),
-        "device_count": len(devices),
-        "process_count": jax.process_count(),
-        "process_index": jax.process_index(),
+def _candidate_environment() -> dict[str, str]:
+    exact = {"PATH", "PYTHONPATH", "TMPDIR", "TMP", "TEMP", "PYTHONHASHSEED"}
+    prefixes = ("JAX_", "XLA_", "LIBTPU_", "TPU_", "CLOUD_TPU_")
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if name in exact or name.startswith(prefixes)
     }
+    environment["PYTHONHASHSEED"] = "0"
+    return environment
+
+
+def classify_missing_candidate_result(
+    *, returncode: int, stderr: str
+) -> dict[str, Any]:
+    fatal_markers = (
+        "aborted",
+        "core halted",
+        "device halted",
+        "dma.hbm_to_vmem",
+        "dma.vmem_to_hbm",
+        "segmentation fault",
+        "sigabrt",
+    )
+    candidate_abort = (
+        returncode < 0
+        or returncode in {124, 134, 137, 139}
+        or any(marker in stderr.lower() for marker in fatal_markers)
+    )
+    if candidate_abort:
+        return {
+            "passed": False,
+            "phase": "execute",
+            "error": f"CANDIDATE_PROCESS_EXIT_{returncode}",
+            "worker_recovery_required": True,
+        }
+    return {
+        "passed": False,
+        "phase": "infrastructure",
+        "error": f"CANDIDATE_RESULT_MISSING:returncode={returncode}",
+    }
+
+
+def run_candidate_process(
+    *,
+    task: dict[str, Any],
+    kernel_path: Path,
+    output_dir: Path,
+    timeout_seconds: int = 120,
+) -> dict[str, Any]:
+    """Run candidate import and device execution outside the grading process.
+
+    Fault space: candidate imports may mutate shared modules, inspect the process,
+    abort, hang, poison the TPU, forge stdout, or write outside its artifact root.
+    This boundary contains Python module state and validates every consumed artifact.
+    Host filesystem and network isolation remain the outer verifier/container's job.
+    """
+    output_dir = output_dir.resolve()
+    kernel_path = kernel_path.resolve()
+    output_dir.mkdir(parents=True, exist_ok=False)
+    task_path = output_dir / "task.json"
+    task_path.write_text(json.dumps(task, sort_keys=True) + "\n", encoding="utf-8")
+    command = [
+        sys.executable,
+        "-m",
+        "opjax.pallas.candidate_worker",
+        "--task",
+        str(task_path),
+        "--kernel",
+        str(kernel_path),
+        "--output-dir",
+        str(output_dir),
+    ]
+    try:
+        process = subprocess.run(
+            command,
+            cwd=output_dir,
+            env=_candidate_environment(),
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "passed": False,
+            "phase": "execute",
+            "error": "CANDIDATE_PROCESS_TIMEOUT",
+            "returncode": 124,
+            "stdout": exc.stdout or "",
+            "stderr": exc.stderr or "",
+            "worker_recovery_required": True,
+        }
+    result = None
+    for line in reversed(process.stdout.splitlines()):
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and value.get("phase") in {
+            "compile",
+            "execute",
+            "profile",
+            "complete",
+            "infrastructure",
+        }:
+            result = value
+            break
+    if result is None:
+        return classify_missing_candidate_result(
+            returncode=process.returncode,
+            stderr=process.stderr,
+        )
+    result["returncode"] = process.returncode
+    result["stdout"] = process.stdout
+    result["stderr"] = process.stderr
+    return result
 
 
 def evaluate_task(
     *, task: dict[str, Any], kernel_path: Path, evidence_dir: Path | None = None
 ) -> dict[str, Any]:
-    hardware = _hardware()
+    hardware = {"target": "tpu", "execution": "not_started"}
     kernel_sha256 = _sha256_file(kernel_path)
     stages = {
-        "artifact_contract": True,
+        "artifact_contract": False,
         "pallas_api": False,
         "tpu_compile": False,
         "full_shape_correctness": False,
@@ -123,6 +239,7 @@ def evaluate_task(
             kernel_sha256=kernel_sha256,
             stages=stages,
         )
+    stages["artifact_contract"] = True
     inspection = inspect_pallas_source(source)
     if not inspection.authentic:
         return _failed(
@@ -136,65 +253,7 @@ def evaluate_task(
     correctness_seeds = tuple(task.get("correctness_seeds", (0, 1, 2)))
     if correctness_seeds != (0, 1, 2):
         raise EnvironmentRunnerError(f"CORRECTNESS_SEEDS_INVALID: {correctness_seeds}")
-    compiled = None
-    profile_inputs = None
-    profile_expected = None
     tolerance = task.get("correctness_tolerance", {"rtol": 1e-3, "atol": 1e-3})
-    try:
-        module = _load_module(kernel_path)
-        workload = module.workload
-        operation = task["operation"]
-        if operation == "row_sum":
-            operation = "sum"
-        seed_results = []
-        for seed in correctness_seeds:
-            inputs = _generate_inputs(
-                task["input_shapes"],
-                task.get("input_dtypes"),
-                task.get("input_ranges"),
-                seed=seed,
-            )
-            expected = _semantic_oracle(operation, *inputs)
-            lowered = jax.jit(workload).lower(*inputs)
-            compiled = lowered.compile()
-            stages["tpu_compile"] = True
-            actual = compiled(*inputs)
-            jax.block_until_ready(actual)
-            chex.assert_trees_all_close(
-                actual,
-                expected,
-                rtol=float(tolerance["rtol"]),
-                atol=float(tolerance["atol"]),
-            )
-            seed_results.append({"seed": seed, "passed": True})
-            if seed == correctness_seeds[0]:
-                profile_inputs = inputs
-                profile_expected = expected
-    except Exception as exc:  # noqa: BLE001 - candidate code can raise any exception
-        if _is_runtime_safety_failure(exc):
-            stage = "runtime_safety"
-        else:
-            stage = "full_shape_correctness" if stages["tpu_compile"] else "tpu_compile"
-        return _failed(
-            stage=stage,
-            error=f"{type(exc).__name__}: {exc}",
-            hardware=hardware,
-            kernel_sha256=kernel_sha256,
-            stages=stages,
-        )
-    stages["full_shape_correctness"] = True
-    assert compiled is not None and profile_inputs is not None and profile_expected is not None
-    executable = compiled.as_text()
-    if "tpu_custom_call" not in executable:
-        return _failed(
-            stage="normal_lowering",
-            error="TPU_CUSTOM_CALL_MISSING",
-            hardware=hardware,
-            kernel_sha256=kernel_sha256,
-            stages=stages,
-        )
-    stages["normal_lowering"] = True
-    stages["runtime_safety"] = True
     if evidence_dir is None:
         return _failed(
             stage="profile",
@@ -203,38 +262,106 @@ def evaluate_task(
             kernel_sha256=kernel_sha256,
             stages=stages,
         )
-    try:
-        profile = capture_lowering_case(
-            label="candidate",
-            function=workload,
-            inputs=profile_inputs,
-            out_dir=evidence_dir,
-            repetitions=3,
-            expected_output=profile_expected,
-            rtol=float(tolerance["rtol"]),
-            atol=float(tolerance["atol"]),
+    candidate_root = evidence_dir / "candidate-process"
+    worker = run_candidate_process(
+        task={**task, "correctness_seeds": list(correctness_seeds)},
+        kernel_path=kernel_path,
+        output_dir=candidate_root,
+    )
+    hardware = worker.get("hardware", hardware)
+    if worker.get("phase") == "infrastructure":
+        raise EnvironmentRunnerError(worker.get("error", "CANDIDATE_WORKER_FAILED"))
+    if worker.get("kernel_sha256") not in {None, kernel_sha256}:
+        raise EnvironmentRunnerError("CANDIDATE_KERNEL_HASH_MISMATCH")
+    if worker.get("phase") in {"compile", "execute"}:
+        error = RuntimeError(worker.get("error", "candidate execution failed"))
+        result = _failed(
+            stage=classify_worker_failure(worker),
+            error=f"seed={worker.get('seed')} {worker.get('error')}",
+            hardware=hardware,
+            kernel_sha256=kernel_sha256,
+            stages=stages,
         )
-        baseline = jax.jit(lambda *values: _semantic_oracle(operation, *values)).lower(*profile_inputs).compile()
-        candidate_samples = [_time_compiled(compiled, profile_inputs) for _ in range(3)]
-        baseline_samples = [_time_compiled(baseline, profile_inputs) for _ in range(3)]
-        candidate_median = sorted(candidate_samples)[1]
-        baseline_median = sorted(baseline_samples)[1]
-        profile["timing"] = {
-            "candidate_ms": candidate_samples,
-            "baseline_ms": baseline_samples,
-            "candidate_median_ms": candidate_median,
-            "baseline_median_ms": baseline_median,
-            "speedup": baseline_median / candidate_median if candidate_median > 0 else None,
-        }
-        profile["speedup"] = profile["timing"]["speedup"]
-    except Exception as exc:  # noqa: BLE001 - profiler/runtime failures are evidence
+        result["worker_recovery_required"] = bool(
+            worker.get("worker_recovery_required")
+            or _is_runtime_safety_failure(error)
+        )
+        return result
+    output_records = worker.get("outputs")
+    if not isinstance(output_records, list) or len(output_records) != len(correctness_seeds):
+        raise EnvironmentRunnerError("CANDIDATE_OUTPUT_MANIFEST_INVALID")
+    stages["tpu_compile"] = True
+    operation = "sum" if task["operation"] == "row_sum" else task["operation"]
+    seed_results = []
+    for seed, record in zip(correctness_seeds, output_records, strict=True):
+        if not isinstance(record, dict) or record.get("seed") != seed:
+            raise EnvironmentRunnerError("CANDIDATE_OUTPUT_SEED_INVALID")
+        output_path = (candidate_root / str(record.get("path"))).resolve()
+        if (
+            not output_path.is_relative_to(candidate_root.resolve())
+            or not output_path.is_file()
+            or _sha256_file(output_path) != record.get("sha256")
+        ):
+            raise EnvironmentRunnerError("CANDIDATE_OUTPUT_ARTIFACT_INVALID")
+        inputs = _generate_inputs(
+            task["input_shapes"],
+            task.get("input_dtypes"),
+            task.get("input_ranges"),
+            seed=seed,
+        )
+        expected = np.asarray(jax.device_get(_semantic_oracle(operation, *inputs)))
+        actual = np.load(output_path, allow_pickle=False)
+        try:
+            validate_candidate_output(
+                actual=actual,
+                expected=expected,
+                rtol=float(tolerance["rtol"]),
+                atol=float(tolerance["atol"]),
+            )
+        except AssertionError as exc:
+            return _failed(
+                stage="full_shape_correctness",
+                error=f"seed={seed} {type(exc).__name__}: {exc}",
+                hardware=hardware,
+                kernel_sha256=kernel_sha256,
+                stages=stages,
+            )
+        seed_results.append({"seed": seed, "passed": True})
+    stages["full_shape_correctness"] = True
+    profile_root = candidate_root / "profile" / "candidate"
+    try:
+        admission = validate_execution_evidence(profile_root)
+    except Exception as exc:  # noqa: BLE001 - evidence failure is attributable
+        stage = (
+            "normal_lowering"
+            if "TPU_CUSTOM_CALL_MISSING" in str(exc)
+            else "profile"
+        )
         return _failed(
-            stage="profile",
+            stage=stage,
             error=f"{type(exc).__name__}: {exc}",
             hardware=hardware,
             kernel_sha256=kernel_sha256,
             stages=stages,
         )
+    stages["normal_lowering"] = True
+    stages["runtime_safety"] = True
+    if worker.get("phase") == "profile":
+        return _failed(
+            stage="profile",
+            error=worker.get("error", "PROFILE_CAPTURE_FAILED"),
+            hardware=hardware,
+            kernel_sha256=kernel_sha256,
+            stages=stages,
+        )
+    profile = worker.get("profile")
+    timing = worker.get("timing")
+    if not isinstance(profile, dict) or not isinstance(timing, dict):
+        raise EnvironmentRunnerError("CANDIDATE_PROFILE_RESULT_INVALID")
+    timing["validation"] = validate_timing_result(timing, seed=0)
+    profile["admission"] = admission
+    profile["timing"] = timing
+    profile["speedup"] = timing.get("speedup")
     stages["profile"] = True
     return {
         "passed": True,
@@ -314,6 +441,12 @@ def main(argv: list[str] | None = None) -> int:
             "error": f"{type(exc).__name__}: {exc}",
             "infrastructure_error": True,
         }
+    if args.evidence_dir is not None:
+        args.evidence_dir.mkdir(parents=True, exist_ok=True)
+        (args.evidence_dir / "result.json").write_text(
+            json.dumps(result, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     print(json.dumps(result, sort_keys=True))
     return 0 if result["passed"] else 2
 

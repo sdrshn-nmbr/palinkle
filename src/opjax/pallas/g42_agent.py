@@ -16,6 +16,7 @@ from minisweagent.environments.docker import DockerEnvironment
 from minisweagent.exceptions import FormatError, Submitted
 from tinker import types
 from tinker_cookbook import model_info, renderers
+from tinker_cookbook.renderers.base import ParseTermination
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 
 from opjax.pallas.contracts import load_contracts
@@ -24,14 +25,16 @@ from opjax.pallas.g42_harness import (
     G42HarnessError,
     create_agent_workspace,
     load_task_package,
-    parse_action,
+    model_message_text,
+    parse_model_action,
     snapshot_workspace,
     validate_horizon_contract,
 )
 from opjax.pallas.sampling import _sampling_client
 
 SYSTEM_TEMPLATE = """You are a programming agent working in an isolated repository.
-Your response must contain exactly one shell action in this format:
+Your response must contain exactly one shell action. Prefer the native
+`mswea_bash_command` tool. If native tools are unavailable, use this fallback:
 
 ```mswea_bash_command
 command
@@ -97,7 +100,8 @@ class TinkerMiniSWEModel:
             ),
         ).result()
         sequence = response.sequences[0]
-        content = self.tokenizer.decode(sequence.tokens)
+        parsed_message, termination = self.renderer.parse_response(sequence.tokens)
+        content = model_message_text(dict(parsed_message))
         self.calls += 1
         sample = {
             "call": self.calls,
@@ -106,10 +110,13 @@ class TinkerMiniSWEModel:
             "stop_reason": str(sequence.stop_reason),
             "checkpoint": self.checkpoint,
             "content": content,
+            "parse_termination": termination.value,
         }
         self.samples.append(sample)
         try:
-            action = parse_action(content)
+            if termination is ParseTermination.MALFORMED:
+                raise G42HarnessError("TML_RESPONSE_MALFORMED")
+            action = parse_model_action(dict(parsed_message))
         except G42HarnessError as exc:
             raise FormatError(
                 {"role": "assistant", "content": content, "extra": sample},
@@ -119,7 +126,12 @@ class TinkerMiniSWEModel:
                     "extra": {"interrupt_type": "FormatError"},
                 },
             ) from exc
-        return {"role": "assistant", "content": content, "extra": {**sample, "actions": [action]}}
+        return {
+            "role": "assistant",
+            "content": content,
+            "tool_calls": parsed_message.get("tool_calls", []),
+            "extra": {**sample, "actions": [action]},
+        }
 
     def format_message(self, **kwargs: Any) -> dict[str, Any]:
         return dict(kwargs)

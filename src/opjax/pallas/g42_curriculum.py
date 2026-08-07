@@ -15,11 +15,13 @@ from typing import Any
 import tomli
 
 from opjax.pallas.g42_harness import (
+    TASK_SCHEMA_VERSION,
     canonical_sha256,
     file_sha256,
     load_task_package,
     validate_task_release,
 )
+from opjax.pallas.task_semantics import operation_specification, render_task_instruction
 
 MUTATIONS = (
     "reversed_blockspec",
@@ -96,7 +98,7 @@ def _write(path: Path, text: str, *, executable: bool = False) -> None:
 def _task_toml(*, task_id: str, metadata: dict[str, Any], task_sha256: str | None) -> str:
     shapes = json.dumps(metadata["input_shapes"], separators=(",", ":"))
     dtypes = json.dumps(metadata["input_dtypes"], separators=(",", ":"))
-    return f'''schema_version = "1.3"
+    return f'''schema_version = "{TASK_SCHEMA_VERSION}"
 artifacts = ["/logs/artifacts/model.patch"]
 
 [task]
@@ -196,13 +198,7 @@ def _write_task(*, root: Path, row: dict[str, Any], task: dict[str, Any], mutati
         "input_shapes": task["input_shapes"],
         "input_dtypes": task["input_dtypes"],
     }
-    instruction = (
-        f"Repair the Pallas kernel in kernel.py for `{task['operation']}` with input shapes "
-        f"{task['input_shapes']} and dtypes {task['input_dtypes']}. The starter contains one "
-        f"known `{mutation}` defect. Preserve the workload interface, run public checks, and "
-        "submit a complete authentic normally lowered Pallas kernel. Do not use interpret mode "
-        "or a plain-JAX fallback.\n"
-    )
+    instruction = render_task_instruction(task, repair=mutation)
     verifier_task = {
         **task,
         "task_id": task_id,
@@ -237,6 +233,12 @@ def _write_package(
     expected_stage: str,
 ) -> dict[str, Any]:
     task_root = root / "tasks" / task_id
+    specification = operation_specification(verifier_task)
+    verifier_task = {
+        **verifier_task,
+        "public_specification": specification,
+        "public_specification_sha256": canonical_sha256(specification),
+    }
     _write(task_root / "instruction.md", instruction)
     _write(task_root / "environment" / "Dockerfile", "FROM python:3.12-slim\nWORKDIR /workspace\n")
     _write(task_root / "environment" / "starter" / "kernel.py", starter)
@@ -464,11 +466,7 @@ def build_benchmark_release(*, diagnostic_config: Path, out_dir: Path) -> dict[s
             root=out_dir,
             task_id=task_id,
             metadata=metadata,
-            instruction=(
-                f"Implement an authentic normally lowered Pallas kernel in kernel.py for `{task['operation']}` "
-                f"with input shapes {task['input_shapes']} and dtypes {task['input_dtypes']}. Run public checks. "
-                "Do not use interpret mode or a plain-JAX fallback. The TPU verifier is hidden.\n"
-            ),
+            instruction=render_task_instruction(task, repair=None),
             starter="def workload(*inputs):\n    ...\n",
             solution=solution,
             verifier_task=verifier_task,

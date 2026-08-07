@@ -200,6 +200,7 @@ def test_verifier_reward_distinguishes_candidate_and_infrastructure_failures(tmp
                 "runtime_safety": True,
                 "profile": True,
             },
+            "profile": {"admission": {"verified": True}},
         }
     ) == 1
     assert classify_verifier_result({"passed": True, "stage": "verified", "stages": {}}) == 0

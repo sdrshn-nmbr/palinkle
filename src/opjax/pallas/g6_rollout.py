@@ -5,10 +5,11 @@ from __future__ import annotations
 import copy
 import json
 import subprocess
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 from tinker import ModelInput, SamplingClient, types
 
@@ -18,7 +19,8 @@ from opjax.pallas.g42_harness import (
     TaskPackage,
     create_agent_workspace,
     file_sha256,
-    parse_action,
+    model_message_text,
+    parse_model_action,
     snapshot_workspace,
 )
 from opjax.pallas.g6_contracts import (
@@ -31,7 +33,8 @@ from opjax.pallas.g6_verifier_backend import VerifierBackend, VerifierCandidate
 
 
 SYSTEM_PROMPT = """You are optimizing a JAX Pallas kernel in an isolated repository.
-Return exactly one shell action in one fenced mswea_bash_command block. Inspect or edit
+Return exactly one shell action using the native mswea_bash_command tool or one fenced
+mswea_bash_command fallback block. Inspect or edit
 kernel.py and use dev_check.py as needed. The authoritative TPU verifier runs after this
 action and returns real compiler, runtime, correctness, and profile feedback. Never use
 interpret=True or a plain-JAX fallback. Do not attempt to access hidden tests, reference
@@ -154,7 +157,7 @@ def _turn_sample(
     prompt: ModelInput,
     messages: list[dict[str, str]],
     sequence: Any,
-    tokenizer: Any,
+    renderer: Any,
 ) -> TurnSample:
     tokens = list(sequence.tokens)
     logprobs = list(sequence.logprobs or ())
@@ -162,11 +165,15 @@ def _turn_sample(
         raise G6RolloutError(
             f"G6_BEHAVIOR_LOGPROBS_INVALID: {state.task.task_id}:{state.trajectory}:{turn}"
         )
-    text = tokenizer.decode(tokens)
+    parsed_message, termination = renderer.parse_response(tokens)
+    message = dict(parsed_message)
+    text = model_message_text(message)
     action = None
     action_result: dict[str, Any]
     try:
-        action = parse_action(text)
+        if getattr(termination, "value", None) == "malformed":
+            raise G42HarnessError("TML_RESPONSE_MALFORMED")
+        action = parse_model_action(message)
         action_result = {}
     except G42HarnessError as exc:
         action_result = {
@@ -213,6 +220,7 @@ def _execute_action(state: TrajectoryState, sample: TurnSample) -> None:
                 capture_output=True,
                 text=True,
                 timeout=120,
+                check=False,
             )
             sample.action_result = {
                 "returncode": process.returncode,
@@ -341,12 +349,14 @@ def collect_rollout_step(
                                 prompt=prompt,
                                 messages=messages,
                                 sequence=sequence,
-                                tokenizer=tokenizer,
+                                renderer=renderer,
                             ),
                         )
                     )
         else:
-            def sample_state(state: TrajectoryState) -> tuple[TrajectoryState, TurnSample]:
+            def sample_state(
+                state: TrajectoryState, active_turn: int = turn
+            ) -> tuple[TrajectoryState, TurnSample]:
                 messages = _messages(state)
                 task_index = next(
                     index for index, task in enumerate(tasks) if task.task_id == state.task.task_id
@@ -360,17 +370,17 @@ def collect_rollout_step(
                         base_seed
                         + task_index * 100_000
                         + state.trajectory * 1_000
-                        + turn
+                        + active_turn
                     ),
                     rollout=rollout,
                 )
                 return state, _turn_sample(
                     state=state,
-                    turn=turn,
+                    turn=active_turn,
                     prompt=prompt,
                     messages=messages,
                     sequence=sequences[0],
-                    tokenizer=tokenizer,
+                    renderer=renderer,
                 )
 
             with ThreadPoolExecutor(

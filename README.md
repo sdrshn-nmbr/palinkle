@@ -266,27 +266,23 @@ cloud environment and produce evidence manifests.
   Gate 5 binary add spent about 5.54 microseconds in the TPU program but about
   53.21 microseconds in the blocking region, so its 0.99842x end-to-end result
   is dispatch and synchronization dominated.
+- Historical G4.2 and G4.3 scores used a lossy action parser and underspecified
+  task prompts. They remain useful legacy diagnostics, but they are not valid
+  capability baselines for the repaired evaluator.
 
 The main lesson is simple: keep the claim, the training change, and the
 evidence separate. If any one changes, score the result again.
 
 ## Next step
 
-Gate 7 is paused at backend conformance while training moves from Tinker to an
-open GPU runtime. Miles is the first execution target because the pinned source
-already supports Inkling Small, LoRA, SGLang rollouts, GRPO, and OPD. The
-matching `sglang-miles` source is pinned separately so renderer, routed-expert
-capture, behavior log probabilities, and adapter synchronization can be
-audited. Prime Intellect runtimes are deferred.
+Phase 1 repaired the evaluator boundary. Phase 2 is a new DeepSWE-style
+benchmark release with exact task contracts and JAXBench-like, independently
+specified tasks, weighted toward compound kernels with measured XLA headroom.
+Legacy G4.2 and G4.3 scores will not be relabeled; all model arms must run again
+through the new contract.
 
-The next probe is renderer and base-logit parity between the frozen Tinker
-contract and the Miles Inkling implementation, followed by a one-batch
-rank-64 SFT canary. Laguna runs as a parallel model arm: its six-call baseline
-is now frozen, and matched training requires a Miles Laguna model-plugin port.
-DAPT, rollout, and G6 GRPO reproduction follow in that
-order for each supported arm. Only after the reproduced S0 lane passes the
-unchanged frozen evaluation does Gate 7 run Miles OPD. The mapping and exact
-pass conditions are in
+Provider-neutral checkpoint storage, Miles resume parity, and SGLang logit
+parity move to Phase 3. The backend mapping remains in
 [`training-backend-migration.md`](docs/training-backend-migration.md).
 
 The JAXBench v5e check found one possible performance task: a corrected
@@ -323,3 +319,4 @@ result is overturned, a later entry records the correction. The manifests in
 | 2026-08-06 | Added Laguna XS 2.1 as an exact-revision SGLang model arm and ran the frozen 16-task, three-call baseline through the authoritative TPU verifier. | BF16 tensor-parallel-1 inference fit on one H200. Laguna scored 0/16 with zero infrastructure failures because every trajectory used all three calls for inspection, emitted an empty patch, and failed the artifact contract. Miles training support remains unimplemented. |
 | 2026-08-06 | Extended the Laguna baseline to six calls while preserving immutable call-3 and call-6 snapshots from each trajectory. | Both horizons scored 0/16 with no infrastructure failures. Calls 4–6 continued inspection, no patch was created, and all 16 tasks remained fail-to-fail. The action-level k=3 prefix matched the original run on all tasks. |
 | 2026-08-06 to 2026-08-07 | Closed Phase 0 by preserving all five loadable Inkling Small checkpoints, their training manifests, exact Hub revisions, LFS hashes, Tinker resume URIs, frozen evaluation results, and the Laguna k=3/k=6 controls. | The private model repositories hold 84,507,051,680 bytes of verified adapter weights. The private `sdrshn-nmbr/opjax-checkpoints` Bucket holds the canonical index and separately validated `best` and `latest` pointers. The Bucket could not duplicate a 16.9 GB adapter under its storage limit, so weight identity is the immutable repo revision plus LFS SHA-256. Phase 0 is complete; cross-provider optimizer resume and SGLang logit parity remain Phase 1. |
+| 2026-08-07 | Completed the recalibrated Phase 1 evaluator repair with native TML parsing, schema-bound exact task semantics, honest stage accounting, isolated candidate execution, strict compiler and Perfetto admission, and balanced interleaved uncertainty-aware timing. | The authoritative v5e verifier gave the reference reward 1 across seeds 0, 1, and 2. It gave a Chex-tampering kernel reward 0 at correctness and a SIGABRT kernel reward 0 at runtime safety with recovery required; the reference then passed again. The reference measured 0.98788x XLA with a 95% interval of 0.98100x to 0.99940x, so it has no performance headroom. Historical G4.2/G4.3 scores remain legacy diagnostics and Phase 2 requires a fresh benchmark. |

@@ -17,6 +17,7 @@ from opjax.pallas.g42_harness import (
     load_task_package,
     validate_task_release,
 )
+from opjax.pallas.task_semantics import render_task_instruction
 from opjax.pallas.g42_traces import validate_trace_release
 
 
@@ -331,13 +332,7 @@ def build_benchmark_release(
                 root=out_dir,
                 task_id=task_id,
                 metadata=metadata,
-                instruction=(
-                    "Implement an authentic normally lowered Pallas kernel in kernel.py for "
-                    f"`{task['operation']}` in the `{task['family']}` family with input shapes "
-                    f"{task['input_shapes']} and dtypes {task['input_dtypes']}. Run public checks. "
-                    "Do not use interpret mode or a plain-JAX fallback. Hidden tests use three "
-                    "input seeds and profile execution against the semantic XLA oracle.\n"
-                ),
+                instruction=render_task_instruction(task, repair=None),
                 starter="def workload(*inputs):\n    ...\n",
                 solution=solution,
                 verifier_task=verifier_task,

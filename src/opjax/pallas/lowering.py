@@ -285,6 +285,31 @@ def _validate_case_artifacts(case_dir: Path, case: dict[str, Any]) -> None:
             )
 
 
+def validate_execution_evidence(case_dir: Path) -> dict[str, Any]:
+    """Admit one capture only with compiler and observed TPU execution proof."""
+    case = _load_json_object(case_dir / "evidence.json")
+    _validate_case_artifacts(case_dir, case)
+    for section in ("stablehlo_markers", "executable_hlo_markers"):
+        if _marker_count(case, section, "tpu_custom_call") < 1:
+            raise LoweringEvidenceError(f"TPU_CUSTOM_CALL_MISSING:{section}")
+    repetitions = case.get("repetitions")
+    trace = case.get("trace")
+    if (
+        not isinstance(repetitions, int)
+        or isinstance(repetitions, bool)
+        or repetitions < 1
+        or not isinstance(trace, dict)
+        or _event_count(trace, "tpu::System::Execute=>Done") < repetitions
+    ):
+        raise LoweringEvidenceError("TRACE_EXECUTION_MISSING")
+    return {
+        "verified": True,
+        "evidence_sha256": _sha256_file(case_dir / "evidence.json"),
+        "execute_count": _event_count(trace, "tpu::System::Execute=>Done"),
+        "repetitions": repetitions,
+    }
+
+
 def validate_calibration(
     calibration_root: Path,
     *,
