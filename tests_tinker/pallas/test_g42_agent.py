@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 from minisweagent.exceptions import FormatError
+from tinker_cookbook.renderers.base import ParseTermination
 
 from opjax.pallas.g42_agent import TinkerMiniSWEModel, _close_service_holder
 
@@ -26,11 +27,22 @@ class _Client:
 
 
 class _Renderer:
+    def __init__(self, text: str):
+        self.text = text
+
     def build_generation_prompt(self, messages):
         return messages
 
     def get_stop_sequences(self):
         return ["stop"]
+
+    def parse_response(self, tokens):
+        termination = (
+            ParseTermination.STOP_SEQUENCE
+            if self.text.startswith("```mswea_bash_command")
+            else ParseTermination.MALFORMED
+        )
+        return {"role": "assistant", "content": self.text}, termination
 
 
 class _Tokenizer:
@@ -52,7 +64,7 @@ class _Holder:
 def _model(text: str) -> TinkerMiniSWEModel:
     return TinkerMiniSWEModel(
         client=_Client(text),
-        renderer=_Renderer(),
+        renderer=_Renderer(text),
         tokenizer=_Tokenizer(text),
         checkpoint=None,
         seed=2,

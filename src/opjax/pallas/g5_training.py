@@ -21,6 +21,7 @@ from opjax.pallas.contracts import git_revision
 from opjax.pallas.g42_harness import canonical_sha256, file_sha256
 from opjax.pallas.g42_training import prepare_g42_training
 from opjax.pallas.g5_corpus import validate_g5_dapt_release
+from opjax.pallas.phase2_contamination import assert_project_training_content_clean
 from opjax.pallas.training import TrainingError, run_prepared_sft
 
 
@@ -233,6 +234,7 @@ def prepare_g5_dapt(
             raise TrainingError(f"G5_DAPT_DATASET_HASH_MISMATCH: {key}")
     tokenizer = get_tokenizer(config["base_model"])
     raw_rows = _rows(corpus_root / "datasets/dapt.jsonl")
+    assert_project_training_content_clean(raw_rows)
     packs = _pack_rows(rows=raw_rows, tokenizer=tokenizer, packing=config["packing"])
     train_rows = [pack for pack in packs if pack["split"] == "train"]
     validation_rows = [pack for pack in packs if pack["split"] == "validation"]

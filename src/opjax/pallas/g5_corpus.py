@@ -24,6 +24,7 @@ from opjax.pallas.hub_admission import (
     _shingle_hashes,
     validate_hub_dapt_admission,
 )
+from opjax.pallas.phase2_contamination import assert_project_training_content_clean
 
 
 SCHEMA_VERSION = 1
@@ -298,6 +299,7 @@ def build_g5_dapt_release(
     )
     train_rows = [row for row in rows if row["split"] == "train"]
     validation_rows = [row for row in rows if row["split"] == "validation"]
+    assert_project_training_content_clean(rows)
     _write_jsonl(out_dir / "datasets/dapt.jsonl", rows)
     _write_jsonl(out_dir / "datasets/train.jsonl", train_rows)
     _write_jsonl(out_dir / "datasets/validation.jsonl", validation_rows)

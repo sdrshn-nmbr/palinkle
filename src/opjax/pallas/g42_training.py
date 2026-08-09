@@ -17,6 +17,7 @@ from opjax.pallas.contracts import git_revision
 from opjax.pallas.g42_harness import canonical_sha256, file_sha256
 from opjax.pallas.g42_traces import validate_trace_release
 from opjax.pallas.training import TrainingError, run_prepared_sft
+from opjax.pallas.phase2_contamination import assert_project_training_content_clean
 
 
 def _rows(path: Path) -> list[dict[str, Any]]:
@@ -36,6 +37,7 @@ def prepare_g42_training(
     if file_sha256(dataset) != config["dataset_sha256"]:
         raise TrainingError("G42_DATASET_HASH_MISMATCH")
     rows = _rows(dataset)
+    assert_project_training_content_clean(rows)
     if len(rows) != config["prefix_sft_rows"] or len({row["task_id"] for row in rows}) != config["verified_trajectories"]:
         raise TrainingError("G42_TRAINING_ROW_COUNT_INVALID")
     if len({row["row_id"] for row in rows}) != len(rows):

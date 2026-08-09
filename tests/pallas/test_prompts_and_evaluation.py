@@ -52,7 +52,8 @@ def test_spec_prompt_withholds_reference_body() -> None:
     assert "return jnp.square(x)" not in specification
     assert "return jnp.square(x)" not in prompt
     assert "CONFIG" in prompt
-    assert "create_inputs" in prompt
+    assert "create_inputs" not in prompt
+    assert "jax.numpy" not in prompt
     assert "def workload(x)" in prompt
 
 

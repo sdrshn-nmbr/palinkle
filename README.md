@@ -275,11 +275,33 @@ evidence separate. If any one changes, score the result again.
 
 ## Next step
 
-Phase 1 repaired the evaluator boundary. Phase 2 is a new DeepSWE-style
-benchmark release with exact task contracts and JAXBench-like, independently
-specified tasks, weighted toward compound kernels with measured XLA headroom.
-Legacy G4.2 and G4.3 scores will not be relabeled; all model arms must run again
-through the new contract.
+Phase 2 now uses the pinned, unmodified 50-workload JAXBench revision as the
+capability benchmark. Every task preserves the original configuration, input
+generator, semantics, and deployment shapes. The agent receives only the
+operation specification, required interface, starter file, and public Pallas
+documentation. The JAX implementation, exact inputs, optimized reference,
+tests, and grading logic remain inside the hidden verifier. Exact and near-copy
+contamination checks forbid all 50 baselines and all eight optimized references
+from every training renderer.
+
+The earlier 10-task scaled suite is retained only as a verifier conformance
+suite. It tests patch capture, hidden-solution isolation, hostile candidate
+sandboxing, normal lowering, compiler and Perfetto evidence, correctness, and
+worker recovery. Its task scores and speed measurements are not model
+capability claims. The authoritative capability path requires model-generated
+candidates to run on isolated disposable TPU workers. Google's pinned
+implementations are trusted references and do not use the hostile-candidate
+path.
+
+The first original-shape hardware canary ran the pinned `8p_GEMM` reference at
+`8192 x 8192 x 28672` on a v5e. It was correct and measured 19.9141 ms versus
+19.8461 ms for XLA, or 0.9966x. The exact Megablox canary exposed an upstream
+dynamic-shape incompatibility under the pinned JAX 0.10.1 runtime and is
+recorded as an infrastructure failure, not a candidate failure. This canary
+proves the package's exact-source binding and trusted-reference original-shape
+runtime path. It does not prove the unimplemented patch-to-disposable-worker
+adapter, that all 50 workloads share one valid dependency environment, or that
+a model checkpoint passes the new benchmark.
 
 Provider-neutral checkpoint storage, Miles resume parity, and SGLang logit
 parity move to Phase 3. The backend mapping remains in
@@ -320,3 +342,9 @@ result is overturned, a later entry records the correction. The manifests in
 | 2026-08-06 | Extended the Laguna baseline to six calls while preserving immutable call-3 and call-6 snapshots from each trajectory. | Both horizons scored 0/16 with no infrastructure failures. Calls 4–6 continued inspection, no patch was created, and all 16 tasks remained fail-to-fail. The action-level k=3 prefix matched the original run on all tasks. |
 | 2026-08-06 to 2026-08-07 | Closed Phase 0 by preserving all five loadable Inkling Small checkpoints, their training manifests, exact Hub revisions, LFS hashes, Tinker resume URIs, frozen evaluation results, and the Laguna k=3/k=6 controls. | The private model repositories hold 84,507,051,680 bytes of verified adapter weights. The private `sdrshn-nmbr/opjax-checkpoints` Bucket holds the canonical index and separately validated `best` and `latest` pointers. The Bucket could not duplicate a 16.9 GB adapter under its storage limit, so weight identity is the immutable repo revision plus LFS SHA-256. Phase 0 is complete; cross-provider optimizer resume and SGLang logit parity remain Phase 1. |
 | 2026-08-07 | Completed the recalibrated Phase 1 evaluator repair with native TML parsing, schema-bound exact task semantics, honest stage accounting, isolated candidate execution, strict compiler and Perfetto admission, and balanced interleaved uncertainty-aware timing. | The authoritative v5e verifier gave the reference reward 1 across seeds 0, 1, and 2. It gave a Chex-tampering kernel reward 0 at correctness and a SIGABRT kernel reward 0 at runtime safety with recovery required; the reference then passed again. The reference measured 0.98788x XLA with a 95% interval of 0.98100x to 0.99940x, so it has no performance headroom. Historical G4.2/G4.3 scores remain legacy diagnostics and Phase 2 requires a fresh benchmark. |
+| 2026-08-07 | Built and froze the first Phase 2 release as 10 independently specified, JAXBench-like Harbor task packages. | This first closeout was superseded after system review found semantic labels that did not match the pinned JAXBench operations, a Pier verifier that could not see the agent workspace, and no isolated disposable-worker proof. |
+| 2026-08-07 | Rebuilt Phase 2 from the pinned JAXBench semantics, repaired Pier patch capture, separated staging from authoritative grading, compacted transient candidate arrays after parent verification, and reran every hardware and adversarial check. | All 10 references earned reward 1 on the pinned v5e. The full-shape Megablox GMM formed a one-task performance subset at 1.38829x XLA with a 95% interval of 1.38490x to 1.39029x. Pier completed and captured a no-op patch with no infrastructure error; a static-valid wrong kernel compiled on a fresh disposable TPU, failed correctness, earned reward 0, and the worker was confirmed deleted. The refreshed Phase 1 canary stayed negative at 0.98239x. Phase 3 becomes active. |
+| 2026-08-07 | Adversarial system review reopened Phase 2 after finding hidden solutions on the candidate worker, no enforced candidate sandbox, two semantic mismatches, helper-based plain-JAX bypasses, opt-in contamination checks, and incomplete runtime hashing. | The earlier closeout and its 1.38829x modified-oracle result were superseded. |
+| 2026-08-07 | Rebuilt and re-froze Phase 2 after the system review. | The worker now receives a sanitized solution-free bundle; candidate code runs as `nobody` with denied network and metadata access; exact task semantics, closed-call authenticity, fail-closed contamination checks, a transitive runtime lock, and execution-path hashes are enforced. All 10 references passed. Exact bf16 Megablox measured 1.40591x XLA with a 95% interval of 1.40474x to 1.40751x. Pier produced a non-empty wrong patch; that exact patch compiled on a disposable TPU, failed correctness, earned reward 0, and the worker was confirmed deleted. A zero-privilege worker service account remains a defense-in-depth IAM follow-up. |
+| 2026-08-07 | A second adversarial review found that candidate Python still shared the process that wrote verifier artifacts and could attempt `__main__`, `atexit`, file, and stdout forgery. | Phase 2 reopened. A fail-closed module policy and reduced runtime builtins/import surface now reject the explicit forgery before TPU execution. All 10 references were regraded from the changed source and passed. Exact bf16 Megablox measured 1.40577x XLA with a 95% interval of 1.40525x to 1.40733x. Pier produced a new policy-valid wrong patch; the exact patch compiled, failed full-shape correctness, earned reward 0, and its disposable worker was confirmed deleted. |
+| 2026-08-08 | Recalibrated Phase 2 after recognizing that verifier isolation concerns had incorrectly changed the capability benchmark. | The 10-task scaled suite was demoted to verifier conformance. A frozen DeepSWE-style package now wraps all 50 workloads from JAXBench revision `6b6c442` with original shapes, exact public tensor and semantic contracts, and hidden implementations, inputs, tests, and eight optimized references. Training renderers fail closed on JAXBench specifications and source. An original-shape `8p_GEMM` TPU canary passed at 0.9966x XLA; Megablox exposed a candidate-independent upstream dynamic-shape failure. The patch-to-disposable-worker adapter and full 50-task scoreability matrix remain open execution work. |

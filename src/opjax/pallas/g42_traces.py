@@ -18,6 +18,7 @@ from opjax.pallas.g42_harness import (
     snapshot_workspace,
 )
 from opjax.pallas.g42_verifier import sanitized_feedback
+from opjax.pallas.phase2_contamination import assert_project_training_content_clean
 
 SYSTEM_PROMPT = """You are a programming agent in an isolated repository.
 Return exactly one shell action in an mswea_bash_command fence per turn. Inspect and repair kernel.py.
@@ -188,6 +189,7 @@ def build_trace_release(*, task_release: Path, admission_root: Path, out_dir: Pa
         )
         shutil.rmtree(workspace)
     dataset = out_dir / "datasets" / "prefix-sft.jsonl"
+    assert_project_training_content_clean(sft_rows)
     dataset.parent.mkdir(parents=True)
     dataset.write_text("".join(json.dumps(row, sort_keys=True) + "\n" for row in sft_rows), encoding="utf-8")
     manifest: dict[str, Any] = {

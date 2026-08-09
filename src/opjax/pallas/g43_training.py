@@ -17,6 +17,7 @@ from opjax.pallas.contracts import git_revision
 from opjax.pallas.g42_harness import canonical_sha256, file_sha256
 from opjax.pallas.g43_corpus import validate_trace_subset
 from opjax.pallas.training import TrainingError, run_prepared_sft
+from opjax.pallas.phase2_contamination import assert_project_training_content_clean
 
 
 def _rows(path: Path) -> list[dict[str, Any]]:
@@ -41,6 +42,7 @@ def prepare_g43_training(
     if file_sha256(dataset) != config.get("dataset_sha256"):
         raise TrainingError("G43_DATASET_HASH_MISMATCH")
     rows = _rows(dataset)
+    assert_project_training_content_clean(rows)
     if len({row["row_id"] for row in rows}) != len(rows):
         raise TrainingError("G43_TRAINING_ROW_ID_DUPLICATE")
     recommended = model_info.get_recommended_renderer_name(config["base_model"])

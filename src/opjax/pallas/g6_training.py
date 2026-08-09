@@ -21,6 +21,7 @@ from opjax.pallas.g42_harness import canonical_sha256, load_task_package
 from opjax.pallas.g6_contracts import G6ContractError, load_g6_config
 from opjax.pallas.g6_rollout import RolloutStep, TurnSample, collect_rollout_step
 from opjax.pallas.g6_verifier_backend import RemoteTPUPoolVerifier
+from opjax.pallas.phase2_contamination import assert_project_training_content_clean
 
 
 class G6TrainingError(RuntimeError):
@@ -169,6 +170,17 @@ def train_lane(
     )
     lane = _lane(config, lane_id)
     tasks = _tasks(task_root, config["task_ids"])
+    assert_project_training_content_clean(
+        [
+            {
+                "task_id": task.task_id,
+                "instruction": (task.root / "instruction.md").read_text(
+                    encoding="utf-8"
+                ),
+            }
+            for task in tasks
+        ]
+    )
     rollout_config = config["rollout"]
     if len(tasks) != rollout_config["tasks_per_step"] * rollout_config["steps"]:
         raise G6TrainingError("G6_TASK_SCHEDULE_INVALID")

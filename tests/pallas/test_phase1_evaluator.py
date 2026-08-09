@@ -237,7 +237,8 @@ def _profile_case(tmp_path: Path, *, marker: int, execute_count: int) -> Path:
     trace.write_bytes(b"trace")
     import hashlib
 
-    sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+    def sha(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
     evidence = {
         "label": "candidate",
         "repetitions": 3,
@@ -322,7 +323,9 @@ def test_candidate_process_abort_is_not_mislabeled_as_infrastructure() -> None:
     assert classify_worker_failure(result) == "runtime_safety"
 
 
-def test_candidate_module_mutation_is_confined_to_worker_process(tmp_path: Path) -> None:
+def test_candidate_module_mutation_is_rejected_by_runtime_import_policy(
+    tmp_path: Path,
+) -> None:
     kernel = tmp_path / "kernel.py"
     kernel.write_text(
         "import chex\n"
@@ -367,15 +370,10 @@ def test_candidate_module_mutation_is_confined_to_worker_process(tmp_path: Path)
         check=False,
     )
 
-    assert process.returncode == 0, process.stderr
-    import chex
-    import numpy as np
-
-    with pytest.raises(AssertionError):
-        chex.assert_trees_all_close(
-            np.load(output / "seed-0-actual.npy", allow_pickle=False),
-            np.ones((4,), dtype=np.float32),
-        )
+    assert process.returncode == 2, process.stderr
+    result = json.loads(process.stdout.splitlines()[-1])
+    assert result["phase"] == "compile"
+    assert "CANDIDATE_IMPORT_NOT_ALLOWED:chex" in result["error"]
 
 
 def test_adversarial_pallas_fixture_reaches_dynamic_isolation_probe() -> None:
