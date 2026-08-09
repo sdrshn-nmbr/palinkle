@@ -29,7 +29,7 @@ def workload(x, weight, bias, gn_weight, gn_bias):
 {
   "inputs": [
     {
-      "dtype": "float32",
+      "dtype": "bfloat16",
       "name": "x",
       "shape": [
         8192,
@@ -37,7 +37,7 @@ def workload(x, weight, bias, gn_weight, gn_bias):
       ]
     },
     {
-      "dtype": "float32",
+      "dtype": "bfloat16",
       "name": "weight",
       "shape": [
         4096,
@@ -45,21 +45,21 @@ def workload(x, weight, bias, gn_weight, gn_bias):
       ]
     },
     {
-      "dtype": "float32",
+      "dtype": "bfloat16",
       "name": "bias",
       "shape": [
         4096
       ]
     },
     {
-      "dtype": "float32",
+      "dtype": "bfloat16",
       "name": "gn_weight",
       "shape": [
         4096
       ]
     },
     {
-      "dtype": "float32",
+      "dtype": "bfloat16",
       "name": "gn_bias",
       "shape": [
         4096
@@ -68,7 +68,7 @@ def workload(x, weight, bias, gn_weight, gn_bias):
   ],
   "outputs": [
     {
-      "dtype": "float32",
+      "dtype": "bfloat16",
       "shape": [
         8192,
         4096

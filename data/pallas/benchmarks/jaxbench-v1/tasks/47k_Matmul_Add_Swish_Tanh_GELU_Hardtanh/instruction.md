@@ -28,7 +28,7 @@ def workload(x, weight, bias, add_value):
 {
   "inputs": [
     {
-      "dtype": "float32",
+      "dtype": "bfloat16",
       "name": "x",
       "shape": [
         4096,
@@ -36,7 +36,7 @@ def workload(x, weight, bias, add_value):
       ]
     },
     {
-      "dtype": "float32",
+      "dtype": "bfloat16",
       "name": "weight",
       "shape": [
         8192,
@@ -44,14 +44,14 @@ def workload(x, weight, bias, add_value):
       ]
     },
     {
-      "dtype": "float32",
+      "dtype": "bfloat16",
       "name": "bias",
       "shape": [
         8192
       ]
     },
     {
-      "dtype": "float32",
+      "dtype": "bfloat16",
       "name": "add_value",
       "shape": [
         8192
@@ -60,7 +60,7 @@ def workload(x, weight, bias, add_value):
   ],
   "outputs": [
     {
-      "dtype": "float32",
+      "dtype": "bfloat16",
       "shape": [
         4096,
         8192

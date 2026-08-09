@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import sys
 from pathlib import Path
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 
 from JAXBench.harness.loader import load_module
 
@@ -22,7 +24,12 @@ def _tensor_schema(value: Any) -> dict[str, Any]:
 
 def probe_schema(path: Path) -> dict[str, Any]:
     module = load_module(str(path), f"{path.parent.name}.public_schema")
-    inputs = jax.eval_shape(module.create_inputs)
+    create_parameters = inspect.signature(module.create_inputs).parameters
+    inputs = (
+        jax.eval_shape(lambda: module.create_inputs(dtype=jnp.bfloat16))
+        if "dtype" in create_parameters
+        else jax.eval_shape(module.create_inputs)
+    )
     input_leaves = jax.tree.leaves(inputs)
     argument_names = module.workload.__code__.co_varnames[
         : module.workload.__code__.co_argcount

@@ -29,7 +29,7 @@ def workload(x, w1, b1, w2, b2):
 {
   "inputs": [
     {
-      "dtype": "float32",
+      "dtype": "bfloat16",
       "name": "x",
       "shape": [
         16384,
@@ -37,7 +37,7 @@ def workload(x, w1, b1, w2, b2):
       ]
     },
     {
-      "dtype": "float32",
+      "dtype": "bfloat16",
       "name": "w1",
       "shape": [
         4096,
@@ -45,14 +45,14 @@ def workload(x, w1, b1, w2, b2):
       ]
     },
     {
-      "dtype": "float32",
+      "dtype": "bfloat16",
       "name": "b1",
       "shape": [
         4096
       ]
     },
     {
-      "dtype": "float32",
+      "dtype": "bfloat16",
       "name": "w2",
       "shape": [
         1024,
@@ -60,7 +60,7 @@ def workload(x, w1, b1, w2, b2):
       ]
     },
     {
-      "dtype": "float32",
+      "dtype": "bfloat16",
       "name": "b2",
       "shape": [
         1024
@@ -69,7 +69,7 @@ def workload(x, w1, b1, w2, b2):
   ],
   "outputs": [
     {
-      "dtype": "float32",
+      "dtype": "bfloat16",
       "shape": [
         16384
       ]

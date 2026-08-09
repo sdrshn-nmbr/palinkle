@@ -28,7 +28,7 @@ def workload(x, y, bmm_weight, bmm_bias, in_weight, in_bias):
 {
   "inputs": [
     {
-      "dtype": "float32",
+      "dtype": "bfloat16",
       "name": "x",
       "shape": [
         4096,
@@ -36,7 +36,7 @@ def workload(x, y, bmm_weight, bmm_bias, in_weight, in_bias):
       ]
     },
     {
-      "dtype": "float32",
+      "dtype": "bfloat16",
       "name": "y",
       "shape": [
         4096,
@@ -44,7 +44,7 @@ def workload(x, y, bmm_weight, bmm_bias, in_weight, in_bias):
       ]
     },
     {
-      "dtype": "float32",
+      "dtype": "bfloat16",
       "name": "bmm_weight",
       "shape": [
         8192,
@@ -52,21 +52,21 @@ def workload(x, y, bmm_weight, bmm_bias, in_weight, in_bias):
       ]
     },
     {
-      "dtype": "float32",
+      "dtype": "bfloat16",
       "name": "bmm_bias",
       "shape": [
         8192
       ]
     },
     {
-      "dtype": "float32",
+      "dtype": "bfloat16",
       "name": "in_weight",
       "shape": [
         8192
       ]
     },
     {
-      "dtype": "float32",
+      "dtype": "bfloat16",
       "name": "in_bias",
       "shape": [
         8192
@@ -75,7 +75,7 @@ def workload(x, y, bmm_weight, bmm_bias, in_weight, in_bias):
   ],
   "outputs": [
     {
-      "dtype": "float32",
+      "dtype": "bfloat16",
       "shape": [
         4096,
         8192

@@ -1,0 +1,70 @@
+HloModule jit_workload, is_scheduled=true, entry_computation_layout={(bf16[8192,8192]{1,0:T(8,128)(2,1)}, bf16[8192,28672]{1,0:T(8,128)(2,1)})->bf16[8192,28672]{1,0:T(8,128)(2,1)}}, allow_spmd_sharding_propagation_to_parameters={true,true}, allow_spmd_sharding_propagation_to_output={true}
+
+FileNames
+1 "/tmp/opjax-jaxbench-worker-1kj0xj2r/candidate/workspace/kernel.py"
+2 "<frozen runpy>"
+3 "/tmp/opjax-jaxbench-worker-1kj0xj2r/candidate/lib/opjax/pallas/jaxbench_executable.py"
+
+FunctionNames
+1 "workload"
+2 "matmul"
+3 "_run_module_as_main"
+4 "_run_code"
+5 "<module>"
+6 "main"
+7 "compile_submission"
+
+FileLocations
+1 {file_name_id=1 function_name_id=1 line=119 end_line=124 column=13 end_column=5}
+2 {file_name_id=1 function_name_id=2 line=85 end_line=101 column=9 end_column=9}
+3 {file_name_id=2 function_name_id=3 line=198 end_line=199 column=11 end_column=42}
+4 {file_name_id=2 function_name_id=4 line=88 end_line=88 column=4 end_column=27}
+5 {file_name_id=3 function_name_id=5 line=205 end_line=205 column=21 end_column=27}
+6 {file_name_id=3 function_name_id=6 line=186 end_line=191 column=17 end_column=9}
+7 {file_name_id=3 function_name_id=7 line=135 end_line=135 column=14 end_column=46}
+8 {file_name_id=1 function_name_id=1 line=125 end_line=125 column=10 end_column=15}
+9 {file_name_id=1 function_name_id=1 line=126 end_line=126 column=21 end_column=38}
+10 {file_name_id=1 function_name_id=1 line=126 end_line=126 column=11 end_column=52}
+
+StackFrames
+1 {file_location_id=1 parent_frame_id=1}
+2 {file_location_id=2 parent_frame_id=2}
+3 {file_location_id=3 parent_frame_id=1}
+4 {file_location_id=4 parent_frame_id=4}
+5 {file_location_id=5 parent_frame_id=5}
+6 {file_location_id=6 parent_frame_id=6}
+7 {file_location_id=7 parent_frame_id=7}
+8 {file_location_id=8 parent_frame_id=8}
+9 {file_location_id=9 parent_frame_id=8}
+10 {file_location_id=10 parent_frame_id=1}
+
+
+%bitcast_fusion (bitcast_input: bf16[8192,8192]) -> bf16[8192,8192] {
+  %bitcast_input = bf16[8192,8192]{1,0:T(8,128)(2,1)} parameter(0)
+  ROOT %bitcast = bf16[8192,8192]{1,0:T(8,128)(2,1)} bitcast(%bitcast_input)
+}
+
+%bitcast_fusion.1 (bitcast_input.1: bf16[8192,28672]) -> bf16[8192,28672] {
+  %bitcast_input.1 = bf16[8192,28672]{1,0:T(8,128)(2,1)} parameter(0)
+  ROOT %bitcast.1 = bf16[8192,28672]{1,0:T(8,128)(2,1)} bitcast(%bitcast_input.1)
+}
+
+%fused_computation (param_0.1: bf16[8192,28672], param_1.2: bf16[8192,8192], param_2.1: bf16[8192,28672]) -> bf16[8192,28672] {
+  %param_0.1 = bf16[8192,28672]{1,0:T(8,128)(2,1)} parameter(0)
+  %convert = f32[8192,28672]{1,0:T(8,128)} convert(%param_0.1)
+  %ne.0 = pred[8192,28672]{1,0:T(8,128)(4,1)} compare(%convert, %convert), direction=NE, metadata={op_name="jit(workload)/ne" stack_frame_id=9}
+  %param_1.2 = bf16[8192,8192]{1,0:T(8,128)(2,1)} parameter(1)
+  %fusion = bf16[8192,8192]{1,0:T(8,128)(2,1)} fusion(%param_1.2), kind=kLoop, calls=%bitcast_fusion
+  %param_2.1 = bf16[8192,28672]{1,0:T(8,128)(2,1)} parameter(2)
+  %fusion.1 = bf16[8192,28672]{1,0:T(8,128)(2,1)} fusion(%param_2.1), kind=kLoop, calls=%bitcast_fusion.1
+  %convolution.1 = bf16[8192,28672]{1,0:T(8,128)(2,1)} convolution(%fusion, %fusion.1), dim_labels=bf_io->bf, metadata={op_name="jit(workload)/dot_general" stack_frame_id=8}
+  ROOT %select_n.2 = bf16[8192,28672]{1,0:T(8,128)(2,1)} select(%ne.0, %param_0.1, %convolution.1), metadata={op_name="jit(workload)/jit(_where)/select_n" stack_frame_id=10}
+}
+
+ENTRY %main.3 (x.1: bf16[8192,8192], y.1: bf16[8192,28672]) -> bf16[8192,28672] {
+  %y.1 = bf16[8192,28672]{1,0:T(8,128)(2,1)} parameter(1), metadata={op_name="y"}
+  %x.1 = bf16[8192,8192]{1,0:T(8,128)(2,1)} parameter(0), metadata={op_name="x"}
+  %matmul.1 = bf16[8192,28672]{1,0:T(8,128)(2,1)} custom-call(%x.1, %y.1), custom_call_target="tpu_custom_call", operand_layout_constraints={bf16[8192,8192]{1,0}, bf16[8192,28672]{1,0}}, frontend_attributes={kernel_metadata={}}, metadata={op_name="jit(workload)/jit(matmul)/pallas_call" stack_frame_id=2}, backend_config={"aliasing_operands":{"lists":[]},"custom_call_config":{"allow_input_fusion":[],"body":"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LnB5AG1hdG11bF9rZXJuZWwAZnVuY3Rpb25fdHlwZQBzeW1fbmFtZQB2YWx1ZQBnZXQ6AGdldAB0cmFuc2Zvcm1faW5kaWNlcwB3aW5kb3dfYm91bmRzAHN3YXA6AHN3YXAAdHJhbnNmb3JtXzAAdHJhbnNmb3JtXzEAdHJhbnNmb3JtXzIAcHJlZGljYXRlAGNvbnZlcnRfZWxlbWVudF90eXBlOgBjb252ZXJ0X2VsZW1lbnRfdHlwZQBhZGQAbWF0bXVsX2tlcm5lbC48bG9jYWxzPi5pbml0AHN0YWJsZV9tb3NhaWMudmVyc2lvbgBkaW1lbnNpb25fc2VtYW50aWNzAGl0ZXJhdGlvbl9ib3VuZHMAc2NhbGFyX3ByZWZldGNoAHNjcmF0Y2hfb3BlcmFuZHMAdHB1LmNvcmVfdHlwZQB3aW5kb3dfcGFyYW1zAGVxOgBlcQBjb25kOgBjb25kAGRvdF9nZW5lcmFsOgBkb3RfZ2VuZXJhbABkaW1lbnNpb25fbnVtYmVycwB0cmFuc3Bvc2VfbGhzAHRyYW5zcG9zZV9saHNfaGludAB0cmFuc3Bvc2VfcmhzAGZhc3RtYXRoAGFkZDoAb3BlcmFuZFNlZ21lbnRTaXplcwBzdHJpZGVzAGJyb2FkY2FzdF9pbl9kaW06AGJyb2FkY2FzdF9pbl9kaW0A","input_memory_space_colors":[],"needs_layout_passes":true,"output_memory_colors":[],"output_memory_space_colors":[],"serialization_format":"1"},"flag_configs":[],"retry_config":{"retry_count":"0"},"scoped_memory_configs":[],"used_scoped_memory_configs":[{"memory_space":"1","offset":"0","size":"31825920"}]}
+  ROOT %compare_select_fusion = bf16[8192,28672]{1,0:T(8,128)(2,1)} fusion(%matmul.1, %x.1, %y.1), kind=kOutput, calls=%fused_computation, metadata={op_name="jit(workload)/dot_general" stack_frame_id=8}, backend_config={"aliasing_operands":{"lists":[{"indices":["0","3"]}]},"convolution_algorithm_config":{"emitter":"EmitAllBatchInSublanes"},"flag_configs":[],"retry_config":{"retry_count":"0"},"scoped_memory_configs":[],"used_scoped_memory_configs":[{"memory_space":"1","offset":"0","size":"49106944"}],"window_config":{"cost_model_type":"COST_MODEL_TYPE_CLASSIC","estimated_bundle_count":"0","estimated_cycles":"30071921","estimated_scoped_vmem_bytes":"0","estimated_vmem_bytes":"0","input_window_bounds":["64","64"],"is_mask":false,"iteration_bounds":["45","16","1"],"kernel_window_bounds":["1024","5"],"ml_estimated_microseconds":0,"output_window_bounds":["64","5"],"pad_input_on_minor_dim":"0","pad_output_on_minor_dim":"0"}}
+}
+

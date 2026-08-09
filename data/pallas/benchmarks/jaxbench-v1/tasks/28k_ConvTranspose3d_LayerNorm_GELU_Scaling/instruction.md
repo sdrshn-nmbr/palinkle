@@ -34,7 +34,7 @@ def workload(x, conv_weight, conv_bias, ln_weight, ln_bias):
 {
   "inputs": [
     {
-      "dtype": "float32",
+      "dtype": "bfloat16",
       "name": "x",
       "shape": [
         32,
@@ -45,7 +45,7 @@ def workload(x, conv_weight, conv_bias, ln_weight, ln_bias):
       ]
     },
     {
-      "dtype": "float32",
+      "dtype": "bfloat16",
       "name": "conv_weight",
       "shape": [
         32,
@@ -56,21 +56,21 @@ def workload(x, conv_weight, conv_bias, ln_weight, ln_bias):
       ]
     },
     {
-      "dtype": "float32",
+      "dtype": "bfloat16",
       "name": "conv_bias",
       "shape": [
         64
       ]
     },
     {
-      "dtype": "float32",
+      "dtype": "bfloat16",
       "name": "ln_weight",
       "shape": [
         64
       ]
     },
     {
-      "dtype": "float32",
+      "dtype": "bfloat16",
       "name": "ln_bias",
       "shape": [
         64
@@ -79,7 +79,7 @@ def workload(x, conv_weight, conv_bias, ln_weight, ln_bias):
   ],
   "outputs": [
     {
-      "dtype": "float32",
+      "dtype": "bfloat16",
       "shape": [
         32,
         64,

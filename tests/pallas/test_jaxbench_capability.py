@@ -102,8 +102,14 @@ def test_release_wraps_all_original_tasks_and_eight_optimized_references(
         .startswith("                                 Apache License")
     )
     assert manifest["shape_policy"] == "original_unmodified"
-    assert manifest["execution_status"] == "package_frozen_worker_adapter_pending"
+    assert manifest["execution_status"] == "worker_adapter_ready"
     assert manifest["scoreability_status"] == "original_shape_canary_only"
+    assert manifest["worker_requirements_lock_sha256"]
+    assert set(manifest["worker_source_sha256"]) == {
+        "jaxbench_executable.py",
+        "jaxbench_verifier.py",
+        "jaxbench_worker.py",
+    }
     assert all(
         task["shape_policy"] == "original_unmodified" for task in manifest["tasks"]
     )
@@ -189,7 +195,7 @@ def test_jaxbench_specification_is_forbidden_after_identifier_removal() -> None:
         assert_project_training_content_clean([{"messages": [{"content": stripped}]}])
 
 
-def test_original_shape_tpu_canary_is_hash_bound() -> None:
+def test_legacy_original_shape_canary_is_explicitly_superseded() -> None:
     root = Path(__file__).parents[2]
     evidence_root = root / "data/pallas/runs/jaxbench-full-v1-canary"
     manifest = json.loads((evidence_root / "manifest.json").read_text())
@@ -199,7 +205,7 @@ def test_original_shape_tpu_canary_is_hash_bound() -> None:
 
     assert manifest["status"] == "complete"
     assert manifest["shape_policy"] == "original_unmodified"
-    assert manifest["benchmark_release_sha256"] == release["release_sha256"]
+    assert manifest["benchmark_release_sha256"] != release["release_sha256"]
     gemm, megablox = manifest["results"]
     assert gemm["task_id"] == "8p_GEMM"
     assert gemm["correct"] is True

@@ -30,6 +30,11 @@ PYTHON_IMAGE = (
     "python:3.12.11-slim-bookworm@sha256:"
     "519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7"
 )
+WORKER_SOURCE_FILES = (
+    "jaxbench_executable.py",
+    "jaxbench_verifier.py",
+    "jaxbench_worker.py",
+)
 
 
 class JaxBenchCapabilityError(RuntimeError):
@@ -630,12 +635,16 @@ def build_release(*, source_root: Path, out_dir: Path) -> dict[str, Any]:
         signatures_path,
         json.dumps(_contamination_signatures(out_dir), indent=2, sort_keys=True) + "\n",
     )
+    worker_lock = (
+        Path(__file__).parents[3]
+        / "config/pallas/phase2-worker-requirements.lock"
+    )
     manifest = {
         "schema_version": 1,
         "kind": "opjax_jaxbench_capability_benchmark",
         "benchmark_id": "opjax-jaxbench-full-v1",
         "status": "frozen",
-        "execution_status": "package_frozen_worker_adapter_pending",
+        "execution_status": "worker_adapter_ready",
         "scoreability_status": "original_shape_canary_only",
         "jaxbench_revision": PINNED_JAXBENCH_REVISION,
         "shape_policy": "original_unmodified",
@@ -644,6 +653,18 @@ def build_release(*, source_root: Path, out_dir: Path) -> dict[str, Any]:
         "schema_probe_source_sha256": file_sha256(
             Path(__file__).with_name("jaxbench_schema.py")
         ),
+        "worker_requirements_lock_sha256": file_sha256(worker_lock),
+        "worker_source_sha256": {
+            name: file_sha256(Path(__file__).with_name(name))
+            for name in WORKER_SOURCE_FILES
+        },
+        "runtime": {
+            "python": "3.12.11",
+            "jax": "0.10.1",
+            "jaxlib": "0.10.1",
+            "libtpu": "0.0.41",
+            "accelerator_type": "v5litepod-1",
+        },
         "task_count": len(tasks),
         "optimized_reference_count": sum(
             task["optimized_sha256"] is not None for task in tasks
@@ -664,6 +685,10 @@ def validate_release(*, root: Path, source_root: Path) -> dict[str, Any]:
     baselines = validate_source_checkout(source_root)
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     signatures_path = root / "contamination-signatures.json"
+    worker_lock = (
+        Path(__file__).parents[3]
+        / "config/pallas/phase2-worker-requirements.lock"
+    )
     payload = dict(manifest)
     expected_release = payload.pop("release_sha256", None)
     if (
@@ -671,13 +696,20 @@ def validate_release(*, root: Path, source_root: Path) -> dict[str, Any]:
         or canonical_sha256(payload) != expected_release
         or manifest.get("task_count") != EXPECTED_WORKLOAD_COUNT
         or manifest.get("shape_policy") != "original_unmodified"
-        or manifest.get("execution_status") != "package_frozen_worker_adapter_pending"
+        or manifest.get("execution_status") != "worker_adapter_ready"
         or manifest.get("scoreability_status") != "original_shape_canary_only"
         or manifest.get("upstream_license_sha256")
         != file_sha256(root / "UPSTREAM_LICENSE")
         or manifest.get("builder_source_sha256") != file_sha256(Path(__file__))
         or manifest.get("schema_probe_source_sha256")
         != file_sha256(Path(__file__).with_name("jaxbench_schema.py"))
+        or manifest.get("worker_requirements_lock_sha256")
+        != file_sha256(worker_lock)
+        or manifest.get("worker_source_sha256")
+        != {
+            name: file_sha256(Path(__file__).with_name(name))
+            for name in WORKER_SOURCE_FILES
+        }
         or not signatures_path.is_file()
         or file_sha256(signatures_path)
         != manifest.get("contamination_signatures_sha256")
