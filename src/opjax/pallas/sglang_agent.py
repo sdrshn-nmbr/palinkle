@@ -43,6 +43,7 @@ class SGLangEndpointModel(LitellmModel):
             model_kwargs["extra_headers"] = dict(proxy_headers)
         if reasoning_effort is not None:
             model_kwargs["reasoning_effort"] = reasoning_effort
+            model_kwargs["allowed_openai_params"] = ["reasoning_effort"]
         if chat_template_kwargs:
             model_kwargs["extra_body"] = {
                 "chat_template_kwargs": dict(chat_template_kwargs)

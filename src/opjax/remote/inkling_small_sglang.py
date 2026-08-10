@@ -6,7 +6,7 @@ import subprocess
 
 import modal
 
-from opjax.pallas.phase3_baseline import INKLING_HF_REVISION, INKLING_MODEL_ID
+from opjax.pallas.model_registry import INKLING_HF_REVISION, INKLING_MODEL_ID
 from opjax.remote.config import (
     HF_CACHE_DIR,
     HF_CACHE_VOLUME_NAME,
@@ -24,6 +24,7 @@ SGLANG_IMAGE = (
 SGLANG_REVISION = "b7252cc6b0c78b25ecea7ee5efa91a6ae37d0f19"
 PRECISION = "bfloat16"
 PORT = 8000
+ENDPOINT_URL = "https://conway--opjax-inkling-small-openai-serve.modal.run"
 
 app = modal.App("opjax-inkling-small-openai")
 hf_cache_volume = modal.Volume.from_name(

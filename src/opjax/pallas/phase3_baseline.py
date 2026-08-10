@@ -10,11 +10,12 @@ from pathlib import Path
 from typing import Any
 
 from opjax.pallas.g42_harness import G42HarnessError, canonical_sha256, file_sha256
-
-INKLING_MODEL_ID = "thinkingmachines/Inkling-Small"
-INKLING_HF_REVISION = "8cc5877b44d343f88b92086aa1fb72897950f06a"
-LAGUNA_MODEL_ID = "poolside/Laguna-XS-2.1"
-LAGUNA_HF_REVISION = "e9df9a59996d790b94b70f3fef343fe1d9e34bdf"
+from opjax.pallas.model_registry import (
+    INKLING_HF_REVISION,
+    INKLING_MODEL_ID,
+    LAGUNA_HF_REVISION,
+    LAGUNA_MODEL_ID,
+)
 EXPECTED_RELEASE_SHA256 = (
     "4015d3db9e395d9f5d564f3eda2b971483c71c3e77e5ec4bf273fa17a4dcca0b"
 )

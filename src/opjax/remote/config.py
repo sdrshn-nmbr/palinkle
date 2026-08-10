@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 
 
 MODAL_APP_NAME = "opjax"
@@ -30,12 +31,44 @@ CHECKPOINT_DIR = "/mnt/checkpoints"
 
 EXPECTED_SECRET_KEYS = ("HF_TOKEN", "ANTHROPIC_API_KEY", "WANDB_API_KEY")
 
+MODAL_PROXY_TOKEN_ENV = "MODAL_PROXY_TOKEN"
+MODAL_PROXY_KEYCHAIN_ACCOUNT = "opjax"
+MODAL_PROXY_KEYCHAIN_SERVICE = "com.opjax.modal.proxy.main"
+
+
+def _modal_proxy_token() -> str:
+    token = os.environ.get(MODAL_PROXY_TOKEN_ENV, "").strip()
+    if not token:
+        result = subprocess.run(
+            [
+                "/usr/bin/security",
+                "find-generic-password",
+                "-a",
+                MODAL_PROXY_KEYCHAIN_ACCOUNT,
+                "-s",
+                MODAL_PROXY_KEYCHAIN_SERVICE,
+                "-w",
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            token = result.stdout.strip()
+    token_id, separator, token_secret = token.partition(".")
+    if (
+        separator != "."
+        or not token_id.startswith("wk-")
+        or not token_secret.startswith("ws-")
+    ):
+        raise RuntimeError("MODAL_PROXY_TOKEN_MISSING")
+    return token
+
 
 def modal_proxy_headers() -> dict[str, str]:
-    token_id = os.environ.get("MODAL_PROXY_TOKEN_ID", "")
-    token_secret = os.environ.get("MODAL_PROXY_TOKEN_SECRET", "")
-    if not token_id.startswith("wk-") or not token_secret.startswith("ws-"):
-        raise RuntimeError("MODAL_PROXY_TOKEN_MISSING")
+    token_id, token_secret = _modal_proxy_token().split(".", maxsplit=1)
     return {"Modal-Key": token_id, "Modal-Secret": token_secret}
 
 REMOTE_IMAGE_PACKAGES = (

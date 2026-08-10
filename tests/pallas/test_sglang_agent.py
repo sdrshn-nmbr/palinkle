@@ -58,6 +58,27 @@ def _model() -> SGLangEndpointModel:
     )
 
 
+def test_reasoning_effort_is_forwarded_to_custom_openai_endpoint() -> None:
+    model = SGLangEndpointModel(
+        base_url="https://example.invalid",
+        api_key="secret-key",
+        model_id="thinkingmachines/Inkling-Small",
+        model_revision="model-revision",
+        runtime_revision="runtime-revision",
+        precision="bfloat16",
+        seed=0,
+        max_tokens=512,
+        temperature=0.2,
+        top_p=0.95,
+        reasoning_effort="high",
+    )
+
+    assert model.config.model_kwargs["reasoning_effort"] == "high"
+    assert model.config.model_kwargs["allowed_openai_params"] == [
+        "reasoning_effort"
+    ]
+
+
 def _stub_responses(
     model: SGLangEndpointModel, responses: Iterator[ModelResponse]
 ) -> list[list[dict]]:

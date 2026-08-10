@@ -23,6 +23,7 @@ SGLANG_IMAGE = (
 SGLANG_REVISION = "v0.5.16"
 PRECISION = "bfloat16"
 PORT = 8000
+ENDPOINT_URL = "https://conway--opjax-laguna-openai-serve.modal.run"
 
 app = modal.App("opjax-laguna-openai")
 hf_cache_volume = modal.Volume.from_name(

@@ -13,12 +13,12 @@ from opjax.pallas.phase31_conformance import run_two_turn_conformance
 from opjax.pallas.phase32_experiment import validate_experiment
 from opjax.pallas.sglang_agent import SGLangEndpointModel
 from opjax.remote.laguna_sglang import (
+    ENDPOINT_URL,
     MODEL_ID,
     MODEL_REVISION,
     PRECISION,
     SGLANG_REVISION,
     app,
-    serve,
 )
 from opjax.remote.config import modal_proxy_headers
 
@@ -273,7 +273,7 @@ def summarize_baseline(
 
 
 def _endpoint() -> tuple[str, dict[str, str]]:
-    return serve.get_web_url(), modal_proxy_headers()
+    return ENDPOINT_URL, modal_proxy_headers()
 
 
 @app.local_entrypoint()

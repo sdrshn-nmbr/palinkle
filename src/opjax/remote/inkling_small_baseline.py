@@ -12,12 +12,12 @@ from opjax.pallas.phase3_sampling import sample_sglang_matrix
 from opjax.pallas.sglang_agent import SGLangEndpointModel
 from opjax.remote.config import modal_proxy_headers
 from opjax.remote.inkling_small_sglang import (
+    ENDPOINT_URL,
     MODEL_ID,
     MODEL_REVISION,
     PRECISION,
     SGLANG_REVISION,
     app,
-    serve,
 )
 
 
@@ -33,7 +33,7 @@ def _write(path: Path, value: dict) -> None:
 def protocol_canary(
     out_path: str = "data/pallas/runs/phase32-provider-conformance/inkling-small.json",
 ) -> None:
-    base_url = serve.get_web_url()
+    base_url = ENDPOINT_URL
     model = SGLangEndpointModel(
         base_url=base_url,
         api_key="EMPTY",
@@ -85,7 +85,7 @@ def phase32(
         value=json.loads(Path(experiment_path).resolve().read_text(encoding="utf-8")),
         contract=contract,
     )
-    base_url = serve.get_web_url()
+    base_url = ENDPOINT_URL
     manifest = sample_sglang_matrix(
         contract=contract,
         experiment=experiment,
