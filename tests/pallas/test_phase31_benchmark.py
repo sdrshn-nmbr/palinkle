@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
+import jax
 import jax.numpy as jnp
 import pytest
 
@@ -19,6 +21,29 @@ from opjax.pallas.phase31_validity import load_runtime_exclusions
 REPO_ROOT = Path(__file__).parents[2]
 SOURCE_RELEASE = REPO_ROOT / "data/pallas/benchmarks/jaxbench-v1"
 SOURCE_CHECKOUT = REPO_ROOT / "references/accelerator-agents"
+
+
+def test_positive_controls_match_exact_task_output_contracts() -> None:
+    control_root = REPO_ROOT / "config/pallas/phase31-controls"
+    release_root = REPO_ROOT / "data/pallas/benchmarks/jaxbench-phase31"
+    for source in sorted(control_root.glob("*.py")):
+        task = json.loads(
+            (release_root / f"tasks/{source.stem}/tests/task.json").read_text()
+        )
+        specification = importlib.util.spec_from_file_location(
+            f"phase31_control_{source.stem}", source
+        )
+        assert specification is not None and specification.loader is not None
+        module = importlib.util.module_from_spec(specification)
+        specification.loader.exec_module(module)
+        inputs = [
+            jax.ShapeDtypeStruct(tuple(record["shape"]), jnp.dtype(record["dtype"]))
+            for record in task["tensor_schema"]["inputs"]
+        ]
+        output = jax.eval_shape(module.workload, *inputs)
+        expected = task["tensor_schema"]["outputs"][0]
+        assert list(output.shape) == expected["shape"]
+        assert str(output.dtype) == expected["dtype"]
 
 
 def test_phase31_release_preserves_all_tasks_and_binds_new_public_contract(

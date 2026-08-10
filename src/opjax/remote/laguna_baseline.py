@@ -11,7 +11,8 @@ from opjax.pallas.g43_corpus import validate_benchmark_release
 from opjax.pallas.phase3_baseline import load_phase3_contract, validate_sample_matrix
 from opjax.pallas.phase3_sampling import sample_sglang_matrix
 from opjax.pallas.phase31_experiment import load_contract, validate_experiment
-from opjax.pallas.sglang_agent import run_sglang_agent
+from opjax.pallas.phase31_conformance import run_two_turn_conformance
+from opjax.pallas.sglang_agent import SGLangMiniSWEModel, run_sglang_agent
 from opjax.remote.laguna_sglang import (
     MODEL_ID,
     MODEL_REVISION,
@@ -283,6 +284,42 @@ def canary() -> None:
 
 
 @app.local_entrypoint()
+def protocol_canary(
+    out_path: str = "data/pallas/runs/phase31-provider-conformance/sglang.json",
+) -> None:
+    engine = LagunaEngine()
+
+    def generate(
+        messages: list[dict[str, Any]], sampling: dict[str, Any]
+    ) -> dict[str, Any]:
+        return engine.generate.remote(messages, sampling)
+
+    model = SGLangMiniSWEModel(
+        generate=generate,
+        model_id=MODEL_ID,
+        model_revision=MODEL_REVISION,
+        runtime_revision=SGLANG_REVISION,
+        precision=PRECISION,
+        seed=0,
+        max_tokens=512,
+        temperature=0.2,
+        top_p=0.95,
+    )
+    result = run_two_turn_conformance(
+        model=model,
+        provider="sglang",
+        model_identity={
+            "model_id": MODEL_ID,
+            "model_revision": MODEL_REVISION,
+            "runtime_revision": SGLANG_REVISION,
+            "precision": PRECISION,
+        },
+    )
+    _write(Path(out_path).resolve(), result)
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+@app.local_entrypoint()
 def baseline(
     benchmark_root: str = "data/pallas/runs/g43-benchmark-release",
     out_dir: str = "data/pallas/runs/laguna-xs-21-baseline-samples",
@@ -432,6 +469,7 @@ def phase31(
     out_dir: str = "data/pallas/runs/phase31-base-capability/laguna-samples",
     task_ids: str = "",
     seeds: str = "0,1,2",
+    max_concurrency: int = 4,
 ) -> None:
     release_path = Path(release_root).resolve()
     experiment_file = Path(experiment_path).resolve()
@@ -461,5 +499,6 @@ def phase31(
         precision=PRECISION,
         task_ids=selected_tasks,
         seeds=selected_seeds,
+        max_concurrency=max_concurrency,
     )
     print(json.dumps(manifest, indent=2, sort_keys=True))

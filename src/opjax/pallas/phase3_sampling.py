@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import json
 import sys
 from collections.abc import Callable
@@ -282,6 +283,7 @@ def sample_sglang_matrix(
     precision: str,
     task_ids: set[str] | None,
     seeds: set[int] | None,
+    max_concurrency: int = 1,
 ) -> dict[str, Any]:
     cells = select_cells(
         experiment=experiment,
@@ -289,12 +291,15 @@ def sample_sglang_matrix(
         task_ids=task_ids,
         seeds=seeds,
     )
+    if max_concurrency < 1:
+        raise G42HarnessError("PHASE3_CONCURRENCY_INVALID")
     output_root.mkdir(parents=True, exist_ok=True)
-    for index, cell in enumerate(cells, start=1):
+
+    def run_cell(index: int, cell: dict[str, Any]) -> None:
         run_root = output_root / "runs" / cell_run_id(cell)
         if run_root.exists():
             validate_completed_run(path=run_root, cell=cell, experiment=experiment)
-            continue
+            return
         model = SGLangMiniSWEModel(
             generate=generate,
             model_id=cell["model_id"],
@@ -338,6 +343,16 @@ def sample_sglang_matrix(
             f"cell={cell_run_id(cell)}",
             flush=True,
         )
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=max_concurrency
+    ) as executor:
+        futures = [
+            executor.submit(run_cell, index, cell)
+            for index, cell in enumerate(cells, start=1)
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            future.result()
     manifest = assemble_sample_manifest(
         experiment=experiment,
         cells=cells,

@@ -6,6 +6,7 @@ import pytest
 from minisweagent.exceptions import FormatError
 
 from opjax.pallas.g42_harness import G42HarnessError, canonical_sha256, file_sha256
+from opjax.pallas.phase31_conformance import run_two_turn_conformance
 from opjax.pallas.sglang_agent import SGLangMiniSWEModel, parse_sglang_action
 from opjax.remote.laguna_baseline import summarize_baseline
 from opjax.remote.laguna_sglang import render_laguna_prompt
@@ -23,6 +24,29 @@ def _model(generate):
         temperature=0.2,
         top_p=0.95,
     )
+
+
+def test_two_turn_conformance_requires_linked_native_observation() -> None:
+    responses = iter(
+        [
+            "<tool_call>shell<arg_key>command</arg_key>"
+            "<arg_value>printf PROTOCOL_ONE</arg_value></tool_call>",
+            "<tool_call>shell<arg_key>command</arg_key>"
+            "<arg_value>printf PROTOCOL_TWO</arg_value></tool_call>",
+        ]
+    )
+    model = _model(lambda messages, sampling: {"text": next(responses)})
+
+    result = run_two_turn_conformance(
+        model=model,
+        provider="sglang",
+        model_identity={"model_id": "test", "model_revision": "revision"},
+    )
+
+    assert result["passed"] is True
+    assert result["model_calls"] == 2
+    assert result["messages"][1]["role"] == "tool"
+    assert result["messages"][1]["tool_call_id"] == "call-1-1"
 
 
 def test_sglang_model_records_identity_sampling_and_action() -> None:

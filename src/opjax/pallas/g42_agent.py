@@ -206,13 +206,17 @@ class TinkerMiniSWEModel:
                     "extra": {"interrupt_type": "FormatError"},
                 },
             ) from exc
+        tool_calls = [
+            _serialize_tool_call(tool_call)
+            for tool_call in parsed_message.get("tool_calls", []) or ()
+        ]
+        for index, tool_call in enumerate(tool_calls, start=1):
+            if not tool_call.get("id"):
+                tool_call["id"] = f"call-{self.calls}-{index}"
         return {
             "role": "assistant",
             "content": content,
-            "tool_calls": [
-                _serialize_tool_call(tool_call)
-                for tool_call in parsed_message.get("tool_calls", []) or ()
-            ],
+            "tool_calls": tool_calls,
             "extra": {**sample, "actions": [action]},
         }
 

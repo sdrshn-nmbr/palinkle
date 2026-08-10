@@ -31,6 +31,7 @@ def test_experiment_binds_provider_runtime_files() -> None:
             "agent_environment": {"image": "image", "image_id": "image-id"},
             "bound_source_sha256": {"verifier": "hash"},
         },
+        protocol_conformance_sha256={"sglang": "a" * 64, "tinker": "b" * 64},
     )
     validate_experiment(value=experiment, contract=contract)
     experiment["harness"]["provider_runtime_sha256"]["uv.lock"] = "tampered"

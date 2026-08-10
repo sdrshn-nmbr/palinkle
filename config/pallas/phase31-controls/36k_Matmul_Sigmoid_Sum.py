@@ -7,7 +7,9 @@ from jax.experimental.pallas.ops.tpu.matmul import matmul
 
 def _reduce_kernel(value_ref, bias_ref, out_ref):
     logits = value_ref[...].astype(jnp.float32) + bias_ref[...]
-    out_ref[...] = jnp.sum(jax.nn.sigmoid(logits), axis=1, keepdims=True)
+    out_ref[...] = jnp.sum(
+        jax.nn.sigmoid(logits), axis=1, keepdims=True
+    ).astype(jnp.bfloat16)
 
 
 def workload(x, weight, bias):
@@ -21,7 +23,7 @@ def workload(x, weight, bias):
     )
     return pl.pallas_call(
         _reduce_kernel,
-        out_shape=jax.ShapeDtypeStruct((x.shape[0], 1), jnp.float32),
+        out_shape=jax.ShapeDtypeStruct((x.shape[0], 1), jnp.bfloat16),
         grid=(x.shape[0] // block_rows,),
         in_specs=(
             pl.BlockSpec((block_rows, values.shape[1]), lambda row: (row, 0)),

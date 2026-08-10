@@ -1,9 +1,11 @@
 import json
+import threading
 from pathlib import Path
 
 import pytest
 
 from opjax.pallas.g42_harness import G42HarnessError, file_sha256
+from opjax.pallas import phase3_sampling
 from opjax.pallas.phase3_baseline import build_experiment, load_phase3_contract
 from opjax.pallas.phase3_sampling import (
     cell_run_id,
@@ -93,3 +95,48 @@ def test_completed_run_validation_binds_snapshot_files(tmp_path: Path) -> None:
     (snapshots / "turn-6.patch").write_text("tampered", encoding="utf-8")
     with pytest.raises(G42HarnessError, match="PHASE3_RUN_SNAPSHOT_INVALID"):
         validate_completed_run(path=tmp_path, cell=cell)
+
+
+def test_sglang_sampling_runs_independent_cells_concurrently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    contract = load_phase3_contract(
+        release_root=REPO_ROOT / "data/pallas/benchmarks/jaxbench-v1",
+        closeout_root=REPO_ROOT / "data/pallas/runs/jaxbench-full-v1-closeout",
+    )
+    experiment = build_experiment(contract=contract)
+    barrier = threading.Barrier(2)
+    lock = threading.Lock()
+    active = 0
+    maximum_active = 0
+
+    def fake_run(**_: object) -> None:
+        nonlocal active, maximum_active
+        with lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        barrier.wait(timeout=2)
+        with lock:
+            active -= 1
+
+    monkeypatch.setattr(phase3_sampling, "run_jaxbench_agent", fake_run)
+    monkeypatch.setattr(
+        phase3_sampling,
+        "assemble_sample_manifest",
+        lambda **_: {"kind": "test-manifest"},
+    )
+
+    result = phase3_sampling.sample_sglang_matrix(
+        contract=contract,
+        experiment=experiment,
+        output_root=tmp_path,
+        generate=lambda messages, sampling: {},
+        runtime_revision="runtime",
+        precision="bfloat16",
+        task_ids={"8p_GEMM"},
+        seeds={0, 1},
+        max_concurrency=2,
+    )
+
+    assert result == {"kind": "test-manifest"}
+    assert maximum_active == 2

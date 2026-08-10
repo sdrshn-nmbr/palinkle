@@ -100,7 +100,7 @@ def test_tinker_adapter_uses_renderer_parse_response_for_native_action() -> None
                 assert mode == "json"
                 return {
                     "type": "function",
-                    "id": "call-1",
+                    "id": None,
                     "function": {
                         "name": "mswea_bash_command",
                         "arguments": {"command": "pwd"},
@@ -145,6 +145,7 @@ def test_tinker_adapter_uses_renderer_parse_response_for_native_action() -> None
 
     assert renderer.parsed is True
     assert message["extra"]["actions"] == [{"command": "pwd"}]
+    assert message["tool_calls"][0]["id"] == "call-1-1"
     assert message["tool_calls"][0]["function"]["name"] == "mswea_bash_command"
 
 

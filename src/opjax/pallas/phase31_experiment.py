@@ -26,6 +26,7 @@ PROVIDER_RUNTIME_FILES = (
     "src/opjax/pallas/agent_protocol.py",
     "src/opjax/pallas/jaxbench_agent.py",
     "src/opjax/pallas/phase31_experiment.py",
+    "src/opjax/pallas/phase31_conformance.py",
     "src/opjax/pallas/phase31_grading.py",
     "src/opjax/pallas/phase31_sampling.py",
     "src/opjax/pallas/phase3_grading.py",
@@ -35,6 +36,19 @@ PROVIDER_RUNTIME_FILES = (
     "src/opjax/remote/laguna_baseline.py",
     "src/opjax/remote/laguna_sglang.py",
 )
+
+
+def _conformance_hashes_valid(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {"sglang", "tinker"}
+        and all(
+            isinstance(digest, str)
+            and len(digest) == 64
+            and not set(digest) - set("0123456789abcdef")
+            for digest in value.values()
+        )
+    )
 
 
 def provider_runtime_hashes() -> dict[str, str]:
@@ -87,7 +101,14 @@ def load_contract(
     )
 
 
-def build_experiment(*, contract: Phase31Contract, release: dict[str, Any]) -> dict[str, Any]:
+def build_experiment(
+    *,
+    contract: Phase31Contract,
+    release: dict[str, Any],
+    protocol_conformance_sha256: dict[str, str],
+) -> dict[str, Any]:
+    if not _conformance_hashes_valid(protocol_conformance_sha256):
+        raise G42HarnessError("PHASE31_PROTOCOL_CONFORMANCE_INVALID")
     models = [
         {
             "model_id": INKLING_MODEL_ID,
@@ -138,6 +159,7 @@ def build_experiment(*, contract: Phase31Contract, release: dict[str, Any]) -> d
             "agent_image_id": release["agent_environment"]["image_id"],
             "bound_source_sha256": release["bound_source_sha256"],
             "provider_runtime_sha256": provider_runtime_hashes(),
+            "protocol_conformance_sha256": protocol_conformance_sha256,
             "action_protocol": {
                 "native_tools": sorted(
                     SHELL_TOOLS | {"read", "write", "edit", "list", "ls"}
@@ -181,6 +203,9 @@ def validate_experiment(*, value: dict[str, Any], contract: Phase31Contract) -> 
         or value.get("positive_control_calibration_sha256") != contract.calibration_sha256
         or value.get("harness", {}).get("provider_runtime_sha256")
         != provider_runtime_hashes()
+        or not _conformance_hashes_valid(
+            value.get("harness", {}).get("protocol_conformance_sha256")
+        )
         or observed_cells != expected_cells
         or value.get("counts", {}).get("trajectories") != len(expected_cells)
     ):
