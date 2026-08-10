@@ -7,10 +7,13 @@ import sys
 from pathlib import Path
 
 import jax.numpy as jnp
+import pytest
 
+from opjax.pallas.g42_harness import G42HarnessError, canonical_sha256
 from opjax.pallas.phase31_benchmark import build_release, validate_release
 from opjax.pallas.phase31_oracle import compare_output, derive_input_case, oracle_contract
 from opjax.pallas.phase31_public import render_dev_check
+from opjax.pallas.phase31_validity import load_runtime_exclusions
 
 
 REPO_ROOT = Path(__file__).parents[2]
@@ -95,3 +98,37 @@ def test_oracle_derives_hidden_values_and_rejects_zero_output() -> None:
     assert exact["correct"] is True
     assert zero["correct"] is False
     assert zero["normalized_max_error"] == 1.0
+
+
+def test_runtime_exclusions_are_explicit_and_hash_bound(tmp_path: Path) -> None:
+    payload = {
+        "schema_version": 1,
+        "kind": "opjax_phase31_oracle_runtime_exclusions",
+        "benchmark_release_sha256": "release",
+        "records": [
+            {
+                "task_id": "large-task",
+                "stage": "baseline_execution",
+                "reason": "candidate-independent HBM exhaustion",
+                "evidence": {"log_sha256": "a" * 64},
+            }
+        ],
+    }
+    value = {**payload, "exclusions_sha256": canonical_sha256(payload)}
+    path = tmp_path / "exclusions.json"
+    path.write_text(json.dumps(value), encoding="utf-8")
+    assert set(
+        load_runtime_exclusions(
+            path=path,
+            release_sha256="release",
+            scoreable={"large-task"},
+        )
+    ) == {"large-task"}
+    value["records"][0]["reason"] = "tampered"
+    path.write_text(json.dumps(value), encoding="utf-8")
+    with pytest.raises(G42HarnessError, match="EXCLUSIONS_INVALID"):
+        load_runtime_exclusions(
+            path=path,
+            release_sha256="release",
+            scoreable={"large-task"},
+        )

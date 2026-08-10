@@ -252,11 +252,13 @@ def grade_on_gcloud(
                 ["gcloud", "compute", "tpus", "tpu-vm", "ssh", worker,
                  f"--zone={zone}", "--command", command], timeout=3600
             )
+            download_parent = root / "download"
+            download_parent.mkdir()
             backend._run(
                 ["gcloud", "compute", "tpus", "tpu-vm", "scp", "--recurse",
-                 f"{worker}:{remote}/output", str(destination.parent), f"--zone={zone}"]
+                 f"{worker}:{remote}/output", str(download_parent), f"--zone={zone}"]
             )
-            downloaded = destination.parent / "output"
+            downloaded = download_parent / "output"
             downloaded.rename(destination)
             response = json.loads((destination / "submission.json").read_text())
     finally:

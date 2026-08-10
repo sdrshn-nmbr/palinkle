@@ -92,11 +92,38 @@ def audit_task(*, release_root: Path, task_id: str, out_path: Path) -> dict[str,
     return result
 
 
+def load_runtime_exclusions(
+    *, path: Path, release_sha256: str, scoreable: set[str]
+) -> dict[str, dict[str, Any]]:
+    exclusions = json.loads(path.read_text())
+    payload = dict(exclusions)
+    observed_sha = payload.pop("exclusions_sha256", None)
+    records = exclusions.get("records", ())
+    excluded = {record.get("task_id"): record for record in records}
+    if (
+        exclusions.get("kind") != "opjax_phase31_oracle_runtime_exclusions"
+        or exclusions.get("benchmark_release_sha256") != release_sha256
+        or canonical_sha256(payload) != observed_sha
+        or None in excluded
+        or len(excluded) != len(records)
+        or set(excluded) - scoreable
+        or any(
+            record.get("stage") != "baseline_execution"
+            or not record.get("reason")
+            or not record.get("evidence")
+            for record in excluded.values()
+        )
+    ):
+        raise G42HarnessError("PHASE31_VALIDITY_EXCLUSIONS_INVALID")
+    return excluded
+
+
 def assemble(
     *,
     release_root: Path,
     scoreability_path: Path,
     evidence_root: Path,
+    exclusions_path: Path,
     out_path: Path,
 ) -> dict[str, Any]:
     release = json.loads((release_root / "manifest.json").read_text())
@@ -106,8 +133,13 @@ def assemble(
         for result in scoreability["results"]
         if result.get("status") == "scoreable"
     )
+    excluded_runtime = load_runtime_exclusions(
+        path=exclusions_path,
+        release_sha256=release["release_sha256"],
+        scoreable=set(scoreable),
+    )
     records = []
-    for task_id in scoreable:
+    for task_id in sorted(set(scoreable) - set(excluded_runtime)):
         path = evidence_root / f"{task_id}.json"
         record = json.loads(path.read_text())
         payload = dict(record)
@@ -135,15 +167,18 @@ def assemble(
         "kind": "opjax_phase31_oracle_validity",
         "benchmark_release_sha256": release["release_sha256"],
         "scoreability_sha256": file_sha256(scoreability_path),
+        "runtime_exclusions_sha256": file_sha256(exclusions_path),
         "valid_task_ids": valid,
         "invalid_oracle_tasks": invalid,
         "candidate_verifier_unavailable": excluded_platform,
+        "baseline_runtime_unavailable": excluded_runtime,
         "counts": {
             "release_tasks": 50,
             "audited": len(records),
             "valid": len(valid),
             "invalid_oracle": len(invalid),
             "candidate_verifier_unavailable": len(excluded_platform),
+            "baseline_runtime_unavailable": len(excluded_runtime),
         },
         "records": records,
     }
@@ -164,6 +199,7 @@ def main(argv: list[str] | None = None) -> int:
     matrix.add_argument("--release-root", type=Path, required=True)
     matrix.add_argument("--scoreability-path", type=Path, required=True)
     matrix.add_argument("--evidence-root", type=Path, required=True)
+    matrix.add_argument("--exclusions-path", type=Path, required=True)
     matrix.add_argument("--out-path", type=Path, required=True)
     args = vars(parser.parse_args(argv))
     command = args.pop("command")

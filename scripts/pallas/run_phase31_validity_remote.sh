@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail
 
 release_root=$1
 evidence_root=$2
 log_path=$3
 worker_hostname=$4
-shift 4
+python_path=$5
+shift 5
 
 mkdir -p "$evidence_root"
 for task_id in "$@"; do
-  env \
+  timeout --kill-after=30 900 env \
     TPU_ACCELERATOR_TYPE=v5litepod-1 \
     TPU_WORKER_ID=0 \
     TPU_WORKER_HOSTNAMES="$worker_hostname" \
@@ -20,9 +21,14 @@ for task_id in "$@"; do
     TPU_SKIP_MDS_QUERY=1 \
     JAX_PLATFORMS=tpu \
     PYTHONPATH=/tmp/opjax-phase31-validity/input \
-    /tmp/opjax-phase2-worker-venv-final12/bin/python \
+    "$python_path" \
       -m opjax.pallas.phase31_validity task \
       --release-root "$release_root" \
       --task-id "$task_id" \
       --out-path "$evidence_root/$task_id.json" >>"$log_path" 2>&1
+  status=$?
+  if [[ $status -ne 0 ]]; then
+    printf 'PHASE31_VALIDITY_TASK_FAILED task=%s exit=%s\n' \
+      "$task_id" "$status" >>"$log_path"
+  fi
 done
