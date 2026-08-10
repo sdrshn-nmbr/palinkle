@@ -16,6 +16,7 @@ from minisweagent.exceptions import FormatError, Submitted
 from opjax.pallas.g42_harness import (
     AGENT_IMAGE,
     G42HarnessError,
+    canonical_sha256,
     file_sha256,
     snapshot_workspace,
     tree_sha256,
@@ -24,9 +25,10 @@ from opjax.pallas.g42_harness import (
 from opjax.pallas.jaxbench_capability import materialize_agent_workspace
 
 SYSTEM_TEMPLATE = """You are a programming agent working in an isolated repository.
-Your response must contain exactly one shell action. Use the action protocol required
-by your model adapter. Inspect the task, implement kernel.py, run public checks, and
-submit only when ready by running `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`.
+Use exactly one native shell, bash, read, write, edit, or list tool call per turn. If
+native tools are unavailable, return exactly one fenced `mswea_bash_command` action.
+Inspect the task, implement kernel.py, run public checks, and submit only when ready
+by running `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`.
 Do not combine submission with another command. Each action runs in a new shell.
 The hidden verifier, inputs, tests, and optimized reference are unavailable.
 """
@@ -120,6 +122,8 @@ def run_jaxbench_agent(
     seed: int,
     turn_limit: int = 6,
     snapshot_turns: tuple[int, ...] = (3, 6),
+    agent_image: str = AGENT_IMAGE,
+    experiment_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     output_dir = output_dir.resolve()
     if output_dir.exists():
@@ -129,7 +133,7 @@ def run_jaxbench_agent(
     workspace = output_dir / "workspace"
     workspace_record = initialize_agent_workspace(task=task, destination=workspace)
     environment = DockerEnvironment(
-        image=AGENT_IMAGE,
+        image=agent_image,
         cwd="/workspace",
         timeout=120,
         run_args=[
@@ -185,7 +189,8 @@ def run_jaxbench_agent(
                     "seed": seed,
                     "turn_limit": turn_limit,
                     "snapshot_turns": list(snapshot_turns),
-                    "agent_image": AGENT_IMAGE,
+                    "agent_image": agent_image,
+                    "experiment_identity": experiment_identity,
                     "submitted": submitted,
                     "workspace": workspace_record,
                     "snapshots": snapshots,
@@ -196,7 +201,7 @@ def run_jaxbench_agent(
         trajectory_path = output_dir / "trajectory.json"
         _write_json(trajectory_path, trajectory)
         manifest = {
-            "schema_version": 1,
+            "schema_version": 2 if experiment_identity else 1,
             "kind": "opjax_phase3_jaxbench_agent_run",
             "task_id": task.task_id,
             "task_sha256": task.task_sha256,
@@ -205,7 +210,11 @@ def run_jaxbench_agent(
             "seed": seed,
             "turn_limit": turn_limit,
             "snapshot_turns": list(snapshot_turns),
-            "agent_image": AGENT_IMAGE,
+            "agent_image": agent_image,
+            "experiment_identity": experiment_identity,
+            "prompt_contract_sha256": canonical_sha256(
+                {"system": SYSTEM_TEMPLATE, "instance": INSTANCE_TEMPLATE}
+            ),
             "submitted": submitted,
             "snapshots": snapshots,
             "trajectory_sha256": file_sha256(trajectory_path),

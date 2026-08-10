@@ -17,7 +17,12 @@ from tinker_cookbook import model_info, renderers
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 
 from opjax.pallas.g42_agent import TinkerMiniSWEModel, _close_service_holder
-from opjax.pallas.g42_harness import G42HarnessError, canonical_sha256, file_sha256
+from opjax.pallas.g42_harness import (
+    AGENT_IMAGE,
+    G42HarnessError,
+    canonical_sha256,
+    file_sha256,
+)
 from opjax.pallas.jaxbench_agent import load_agent_task, run_jaxbench_agent
 from opjax.pallas.phase3_baseline import (
     INKLING_MODEL_ID,
@@ -69,7 +74,9 @@ def cell_run_id(cell: dict[str, Any]) -> str:
     return f"{model}--{cell['task_id']}--seed-{cell['seed']}"
 
 
-def validate_completed_run(*, path: Path, cell: dict[str, Any]) -> dict[str, Any]:
+def validate_completed_run(
+    *, path: Path, cell: dict[str, Any], experiment: dict[str, Any] | None = None
+) -> dict[str, Any]:
     manifest_path = path / "manifest.json"
     trajectory_path = path / "trajectory.json"
     try:
@@ -90,6 +97,14 @@ def validate_completed_run(*, path: Path, cell: dict[str, Any]) -> dict[str, Any
         or manifest.get("trajectory_sha256") != file_sha256(trajectory_path)
     ):
         raise G42HarnessError(f"PHASE3_RUN_MANIFEST_MISMATCH:{path}")
+    if experiment is not None and experiment.get("kind") == "opjax_phase31_base_capability_experiment":
+        identity = manifest.get("experiment_identity")
+        if (
+            not isinstance(identity, dict)
+            or identity.get("experiment_sha256") != experiment.get("experiment_sha256")
+            or manifest.get("agent_image") != experiment.get("harness", {}).get("agent_image")
+        ):
+            raise G42HarnessError(f"PHASE31_RUN_CONTRACT_MISMATCH:{path}")
     snapshots = manifest.get("snapshots", {})
     for turn in (3, 6):
         record = snapshots.get(str(turn), snapshots.get(turn))
@@ -116,7 +131,7 @@ def assemble_sample_manifest(
     for cell in cells:
         run_id = cell_run_id(cell)
         run_root = output_root / "runs" / run_id
-        manifest = validate_completed_run(path=run_root, cell=cell)
+        manifest = validate_completed_run(path=run_root, cell=cell, experiment=experiment)
         records.append(
             {
                 **cell,
@@ -192,7 +207,7 @@ async def sample_tinker_matrix(
     async def run_cell(cell: dict[str, Any]) -> None:
         run_root = output_root / "runs" / cell_run_id(cell)
         if run_root.exists():
-            validate_completed_run(path=run_root, cell=cell)
+            validate_completed_run(path=run_root, cell=cell, experiment=experiment)
             return
         async with semaphore:
             model = TinkerMiniSWEModel(
@@ -228,6 +243,12 @@ async def sample_tinker_matrix(
                     seed=cell["seed"],
                     turn_limit=6,
                     snapshot_turns=(3, 6),
+                    agent_image=experiment.get("harness", {}).get("agent_image", AGENT_IMAGE),
+                    experiment_identity=(
+                        {"experiment_sha256": experiment["experiment_sha256"]}
+                        if experiment.get("kind") == "opjax_phase31_base_capability_experiment"
+                        else None
+                    ),
                 )
             except Exception as exc:
                 failures.append(f"{cell_run_id(cell)}:{type(exc).__name__}:{exc}")
@@ -272,7 +293,7 @@ def sample_sglang_matrix(
     for index, cell in enumerate(cells, start=1):
         run_root = output_root / "runs" / cell_run_id(cell)
         if run_root.exists():
-            validate_completed_run(path=run_root, cell=cell)
+            validate_completed_run(path=run_root, cell=cell, experiment=experiment)
             continue
         model = SGLangMiniSWEModel(
             generate=generate,
@@ -305,6 +326,12 @@ def sample_sglang_matrix(
             seed=cell["seed"],
             turn_limit=6,
             snapshot_turns=(3, 6),
+            agent_image=experiment.get("harness", {}).get("agent_image", AGENT_IMAGE),
+            experiment_identity=(
+                {"experiment_sha256": experiment["experiment_sha256"]}
+                if experiment.get("kind") == "opjax_phase31_base_capability_experiment"
+                else None
+            ),
         )
         print(
             f"PHASE3_SGLANG_SAMPLE completed={index}/{len(cells)} "

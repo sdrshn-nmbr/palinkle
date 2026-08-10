@@ -17,6 +17,15 @@ def test_summarize_model_counts_paired_horizon_transitions(tmp_path: Path) -> No
                 "provider": "tinker",
             }
         ],
+        "cells": [
+            {
+                "model_id": "model",
+                "provider": "tinker",
+                "task_id": f"task-{index}",
+                "seed": 0,
+            }
+            for index in range(141)
+        ],
     }
     records = []
     for index in range(141):

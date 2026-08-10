@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from opjax.pallas.g42_harness import G42HarnessError, canonical_sha256, file_sha256
-from opjax.pallas.phase3_grading import EMPTY_PATCH_SHA256
+from opjax.pallas.phase3_grading import EMPTY_PATCH_SHA256, _validate_sample_manifest
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -34,16 +34,28 @@ def summarize_model(
 ) -> dict[str, Any]:
     grading = _read_json(grading_path)
     _validate_embedded_hash(grading, "result_sha256")
+    expected_kind = (
+        "opjax_phase31_base_capability_result"
+        if experiment.get("kind") == "opjax_phase31_base_capability_experiment"
+        else "opjax_phase3_base_capability_result"
+    )
+    provider = grading.get("provider")
+    expected_keys = {
+        (cell["task_id"], cell["seed"], turn)
+        for cell in experiment["cells"]
+        if cell["provider"] == provider
+        for turn in (3, 6)
+    }
     if (
-        grading.get("kind") != "opjax_phase3_base_capability_result"
+        grading.get("kind") != expected_kind
         or grading.get("experiment_sha256") != experiment.get("experiment_sha256")
-        or grading.get("counts", {}).get("trajectories") != 141
-        or grading.get("counts", {}).get("snapshots") != 282
+        or grading.get("counts", {}).get("trajectories") != len(expected_keys) // 2
+        or grading.get("counts", {}).get("snapshots") != len(expected_keys)
     ):
         raise G42HarnessError("PHASE3_MODEL_RESULT_CONTRACT_INVALID")
     records = grading["records"]
     keys = {(record["task_id"], record["seed"], record["turn"]) for record in records}
-    if len(keys) != 282:
+    if keys != expected_keys or len(records) != len(expected_keys):
         raise G42HarnessError("PHASE3_MODEL_RESULT_CELL_SET_INVALID")
     transitions = {
         "fail_to_pass": 0,
@@ -101,7 +113,7 @@ def summarize_behavior(*, sample_root: Path, provider: str) -> dict[str, Any]:
     manifest = _read_json(sample_root / "manifest.json")
     _validate_embedded_hash(manifest, "release_sha256")
     records = manifest.get("records", [])
-    if manifest.get("provider") != provider or len(records) != 141:
+    if manifest.get("provider") != provider or not records:
         raise G42HarnessError("PHASE3_SAMPLE_BEHAVIOR_CONTRACT_INVALID")
     calls_by_turn = {
         str(turn): {"calls": 0, "valid_actions": 0, "format_errors": 0}
@@ -154,6 +166,8 @@ def build_comparison(
         _read_json(root / "manifest.json")["provider"]: root for root in sample_roots
     }
     summaries = []
+    for root in sample_roots:
+        _validate_sample_manifest(sample_root=root, experiment=experiment)
     for path in grading_paths:
         grading = _read_json(path)
         provider = grading.get("provider")
@@ -169,8 +183,12 @@ def build_comparison(
     if {summary["provider"] for summary in summaries} != {"tinker", "sglang"}:
         raise G42HarnessError("PHASE3_COMPARISON_PROVIDER_SET_INVALID")
     result = {
-        "schema_version": 1,
-        "kind": "opjax_phase3_base_capability_comparison",
+        "schema_version": 2 if experiment.get("phase") == "3.1" else 1,
+        "kind": (
+            "opjax_phase31_base_capability_comparison"
+            if experiment.get("phase") == "3.1"
+            else "opjax_phase3_base_capability_comparison"
+        ),
         "experiment_sha256": experiment["experiment_sha256"],
         "benchmark_release_sha256": experiment["benchmark_release_sha256"],
         "models": sorted(summaries, key=lambda item: item["provider"]),

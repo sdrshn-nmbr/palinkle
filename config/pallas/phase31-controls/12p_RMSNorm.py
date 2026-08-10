@@ -1,0 +1,30 @@
+import jax
+import jax.numpy as jnp
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
+
+
+def _rms_kernel(x_ref, scale_ref, out_ref):
+    x = x_ref[...].astype(jnp.float32)
+    mean_square = jnp.mean(jnp.square(x), axis=1, keepdims=True)
+    normalized = x * jax.lax.rsqrt(mean_square + 1e-5)
+    out_ref[...] = normalized.astype(out_ref.dtype) * scale_ref[...]
+
+
+def workload(x, scale):
+    width = x.shape[-1]
+    rows = x.size // width
+    block_rows = 8
+    flat = x.reshape((rows, width))
+    result = pl.pallas_call(
+        _rms_kernel,
+        out_shape=jax.ShapeDtypeStruct(flat.shape, x.dtype),
+        grid=(rows // block_rows,),
+        in_specs=(
+            pl.BlockSpec((block_rows, width), lambda row: (row, 0)),
+            pl.BlockSpec((width,), lambda row: (0,)),
+        ),
+        out_specs=pl.BlockSpec((block_rows, width), lambda row: (row, 0)),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+    )(flat, scale)
+    return result.reshape(x.shape)

@@ -18,6 +18,7 @@ from opjax.pallas.jaxbench_worker import (
     validate_response,
 )
 from opjax.pallas.phase3_baseline import load_phase3_contract, validate_sample_matrix
+from opjax.pallas.phase31_worker import grade_on_gcloud
 
 EMPTY_PATCH_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
@@ -131,8 +132,37 @@ def _validate_sample_manifest(
     ):
         raise G42HarnessError("PHASE3_SAMPLE_MANIFEST_INVALID")
     records = manifest.get("records", [])
-    if len(records) != manifest.get("counts", {}).get("runs"):
+    expected = {
+        (cell["model_id"], cell["task_id"], cell["seed"])
+        for cell in experiment["cells"]
+        if cell["provider"] == manifest.get("provider")
+    }
+    observed = {
+        (record.get("model_id"), record.get("task_id"), record.get("seed"))
+        for record in records
+    }
+    if (
+        len(records) != manifest.get("counts", {}).get("runs")
+        or observed != expected
+        or len(observed) != len(records)
+    ):
         raise G42HarnessError("PHASE3_SAMPLE_RECORD_COUNT_INVALID")
+    for record in records:
+        run_root = sample_root / record["run_path"]
+        if file_sha256(run_root / "manifest.json") != record.get("run_manifest_sha256"):
+            raise G42HarnessError("PHASE3_SAMPLE_RUN_MANIFEST_HASH_INVALID")
+        if file_sha256(run_root / "trajectory.json") != record.get("trajectory_sha256"):
+            raise G42HarnessError("PHASE3_SAMPLE_TRAJECTORY_HASH_INVALID")
+        for turn in (3, 6):
+            snapshot = record["snapshots"].get(str(turn), record["snapshots"].get(turn))
+            if (
+                not isinstance(snapshot, dict)
+                or file_sha256(run_root / "snapshots" / f"turn-{turn}.patch")
+                != snapshot.get("patch_sha256")
+                or file_sha256(run_root / "snapshots" / f"turn-{turn}-kernel.py")
+                != snapshot.get("kernel_sha256")
+            ):
+                raise G42HarnessError("PHASE3_SAMPLE_SNAPSHOT_HASH_INVALID")
     return manifest, records
 
 
@@ -186,6 +216,7 @@ def grade_sample_matrix(
     service_account: str,
     zone: str,
     max_concurrency: int,
+    phase31: bool = False,
 ) -> dict[str, Any]:
     if max_concurrency < 1:
         raise G42HarnessError("PHASE3_GRADING_CONCURRENCY_INVALID")
@@ -283,15 +314,25 @@ def grade_sample_matrix(
                 response_root=response_root,
                 request=request,
             )
-        backend = GcloudDisposableTPUBackend(
-            release_root=release_root,
-            patch_path=submission_patch_path,
-            service_account=service_account,
-            zone=zone,
-            name_prefix="opjax-p3",
-        )
         unit_root.mkdir(parents=True, exist_ok=False)
-        backend.grade(request, response_root)
+        if phase31:
+            grade_on_gcloud(
+                release_root=release_root,
+                request=request,
+                patch_path=submission_patch_path,
+                destination=response_root,
+                service_account=service_account,
+                zone=zone,
+            )
+        else:
+            backend = GcloudDisposableTPUBackend(
+                release_root=release_root,
+                patch_path=submission_patch_path,
+                service_account=service_account,
+                zone=zone,
+                name_prefix="opjax-p3",
+            )
+            backend.grade(request, response_root)
         return _hardware_record(
             record=sample,
             turn=turn,
@@ -344,8 +385,12 @@ def grade_sample_matrix(
             "beats_xla": sum(record["beats_xla"] is True for record in subset),
         }
     result = {
-        "schema_version": 1,
-        "kind": "opjax_phase3_base_capability_result",
+        "schema_version": 2 if phase31 else 1,
+        "kind": (
+            "opjax_phase31_base_capability_result"
+            if phase31
+            else "opjax_phase3_base_capability_result"
+        ),
         "experiment_sha256": experiment["experiment_sha256"],
         "benchmark_release_sha256": release["release_sha256"],
         "sample_release_sha256": _read_json(sample_root / "manifest.json")[
