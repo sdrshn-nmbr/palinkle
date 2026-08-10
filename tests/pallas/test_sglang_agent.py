@@ -75,6 +75,36 @@ def test_poolside_native_action_is_normalized() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("tool", "key", "value", "command"),
+    [
+        ("shell", "command", "cat instruction.md", "cat instruction.md"),
+        ("shell", "cmd", "python dev_check.py", "python dev_check.py"),
+        ("read", "path", "instruction.md", "cat -- instruction.md"),
+        ("read", "path", "file with spaces", "cat -- 'file with spaces'"),
+    ],
+)
+def test_poolside_native_driver_tools_are_normalized(
+    tool: str, key: str, value: str, command: str
+) -> None:
+    content = (
+        f"Reasoning.</think><tool_call>{tool}<arg_key>{key}</arg_key>"
+        f"<arg_value>{value}</arg_value></tool_call>"
+    )
+
+    assert parse_sglang_action(content) == {"command": command}
+
+
+def test_unknown_poolside_native_tool_is_rejected() -> None:
+    content = (
+        "<tool_call>write<arg_key>path</arg_key>"
+        "<arg_value>kernel.py</arg_value></tool_call>"
+    )
+
+    with pytest.raises(G42HarnessError, match="ACTION_NATIVE_TOOL_UNSUPPORTED"):
+        parse_sglang_action(content)
+
+
 def test_mixed_action_protocol_is_rejected() -> None:
     content = (
         "```mswea_bash_command\nls\n```"

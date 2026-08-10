@@ -8,6 +8,8 @@ from typing import Any
 
 from opjax.pallas.g42_harness import canonical_sha256, file_sha256, load_task_package
 from opjax.pallas.g43_corpus import validate_benchmark_release
+from opjax.pallas.phase3_baseline import load_phase3_contract, validate_sample_matrix
+from opjax.pallas.phase3_sampling import sample_sglang_matrix
 from opjax.pallas.sglang_agent import run_sglang_agent
 from opjax.remote.laguna_sglang import (
     MODEL_ID,
@@ -376,4 +378,45 @@ def baseline(
     }
     manifest["release_sha256"] = canonical_sha256(manifest)
     _write(output_path / "manifest.json", manifest)
+    print(json.dumps(manifest, indent=2, sort_keys=True))
+
+
+@app.local_entrypoint()
+def phase3(
+    release_root: str = "data/pallas/benchmarks/jaxbench-v1",
+    closeout_root: str = "data/pallas/runs/jaxbench-full-v1-closeout",
+    experiment_path: str = "data/pallas/runs/phase3-base-capability/experiment.json",
+    out_dir: str = "data/pallas/runs/phase3-base-capability/laguna-samples",
+    task_ids: str = "",
+    seeds: str = "0,1,2",
+) -> None:
+    release_path = Path(release_root).resolve()
+    closeout_path = Path(closeout_root).resolve()
+    experiment_file = Path(experiment_path).resolve()
+    output_path = Path(out_dir).resolve()
+    contract = load_phase3_contract(
+        release_root=release_path,
+        closeout_root=closeout_path,
+    )
+    validate_sample_matrix(path=experiment_file, contract=contract)
+    experiment = json.loads(experiment_file.read_text(encoding="utf-8"))
+    selected_tasks = {value for value in task_ids.split(",") if value} or None
+    selected_seeds = {int(value) for value in seeds.split(",") if value}
+    engine = LagunaEngine()
+
+    def generate(
+        messages: list[dict[str, str]], sampling: dict[str, Any]
+    ) -> dict[str, Any]:
+        return engine.generate.remote(messages, sampling)
+
+    manifest = sample_sglang_matrix(
+        contract=contract,
+        experiment=experiment,
+        output_root=output_path,
+        generate=generate,
+        runtime_revision=SGLANG_REVISION,
+        precision=PRECISION,
+        task_ids=selected_tasks,
+        seeds=selected_seeds,
+    )
     print(json.dumps(manifest, indent=2, sort_keys=True))

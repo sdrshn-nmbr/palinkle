@@ -95,6 +95,18 @@ def test_tinker_adapter_uses_renderer_parse_response_for_native_action() -> None
     class Renderer:
         parsed = False
 
+        class ToolCall:
+            def model_dump(self, *, mode: str) -> dict[str, object]:
+                assert mode == "json"
+                return {
+                    "type": "function",
+                    "id": "call-1",
+                    "function": {
+                        "name": "mswea_bash_command",
+                        "arguments": {"command": "pwd"},
+                    },
+                }
+
         def build_generation_prompt(self, _: object) -> object:
             return object()
 
@@ -108,16 +120,7 @@ def test_tinker_adapter_uses_renderer_parse_response_for_native_action() -> None
                 {
                     "role": "assistant",
                     "content": "inspection",
-                    "tool_calls": [
-                        {
-                            "type": "function",
-                            "id": "call-1",
-                            "function": {
-                                "name": "mswea_bash_command",
-                                "arguments": {"command": "pwd"},
-                            },
-                        }
-                    ],
+                    "tool_calls": [self.ToolCall()],
                 },
                 tinker_cookbook.ParseTermination.STOP_SEQUENCE,
             )
@@ -142,6 +145,7 @@ def test_tinker_adapter_uses_renderer_parse_response_for_native_action() -> None
 
     assert renderer.parsed is True
     assert message["extra"]["actions"] == [{"command": "pwd"}]
+    assert message["tool_calls"][0]["function"]["name"] == "mswea_bash_command"
 
 
 def test_real_tml_renderer_round_trips_native_shell_action() -> None:

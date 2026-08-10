@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 from html import unescape
 from pathlib import Path
 from typing import Any, Callable
@@ -41,8 +42,8 @@ Start by reading instruction.md, PALLAS_API.md, kernel.py, and dev_check.py.
 
 GenerationFunction = Callable[[list[dict[str, str]], dict[str, Any]], dict[str, Any]]
 POOLSIDE_ACTION_PATTERN = re.compile(
-    r"<tool_call>\s*mswea_bash_command\s*"
-    r"<arg_key>\s*command\s*</arg_key>\s*"
+    r"<tool_call>\s*([^<\s]+)\s*"
+    r"<arg_key>\s*([^<]+?)\s*</arg_key>\s*"
     r"<arg_value>(.*?)</arg_value>\s*</tool_call>",
     re.DOTALL,
 )
@@ -59,12 +60,18 @@ def parse_sglang_action(content: str) -> dict[str, str]:
         if POOLSIDE_ACTION_PATTERN.search(content):
             raise G42HarnessError("ACTION_PROTOCOL_MIXED")
         return fenced
-    native_actions = [unescape(match).strip() for match in POOLSIDE_ACTION_PATTERN.findall(content)]
+    native_actions = POOLSIDE_ACTION_PATTERN.findall(content)
     if len(native_actions) != 1:
         raise fenced_error
-    if not native_actions[0]:
+    tool, key, raw_value = native_actions[0]
+    value = unescape(raw_value).strip()
+    if not value:
         raise G42HarnessError("ACTION_EMPTY: command")
-    return {"command": native_actions[0]}
+    if tool in {"mswea_bash_command", "shell"} and key in {"command", "cmd"}:
+        return {"command": value}
+    if tool == "read" and key == "path":
+        return {"command": f"cat -- {shlex.quote(value)}"}
+    raise G42HarnessError(f"ACTION_NATIVE_TOOL_UNSUPPORTED:{tool}:{key}")
 
 
 class SGLangMiniSWEModel:

@@ -324,15 +324,26 @@ lock. The hash-bound closeout evidence is in
 [`jaxbench-full-v1-closeout`](data/pallas/runs/jaxbench-full-v1-closeout/manifest.json).
 
 Provider-neutral checkpoint storage, Miles resume parity, and SGLang logit
-parity move to Phase 3. The backend mapping remains in
+parity move to Phase 4. The backend mapping remains in
 [`training-backend-migration.md`](docs/training-backend-migration.md).
 
-The JAXBench v5e check found one possible performance task: a corrected
-Megablox grouped matrix multiplication ran at `1.147x` XLA speed across three
-profiled runs. The other seven optimized references did not run as fair
-default-shape comparisons in one shared environment. This result remains
-provisional until the runtime and test setup are frozen. See the
-[`headroom manifest`](data/pallas/runs/jaxbench-v5e-headroom/manifest.json).
+Phase 3 closed the untouched-base capability and benchmark-calibration phase.
+Inkling Small and Laguna XS 2.1 both scored `0/141` at three and six model
+calls on the same frozen 47-task JAXBench denominator. Laguna produced 54
+non-empty six-call patches, but 41 failed TPU compilation and 13 failed normal
+Pallas lowering. Inkling produced two non-empty patches and both failed TPU
+compilation. The three workloads excluded by the single-chip v5e runtime remain
+outside the frozen denominator; a separate compatibility lane proved faithful
+deployment adapters without rewriting the benchmark or changing the primary
+experiment during execution.
+
+The frozen Phase 3 reference calibration found no JAXBench performance task.
+Only `8p_GEMM` passed the complete correctness, provenance, lowering, and
+profiling contract, and it measured `0.99643x` XLA. The other five scoreable
+optimized references exposed pinned API or correctness drift. The earlier
+provisional Megablox number is superseded. A separate real-megakernel lane
+admitted SGLang-JAX's exact 32K variable-length keyed-delta-attention kernel at
+`1.18152x` with a paired 95% interval of `1.18104x` to `1.18359x`.
 
 ## Worklog
 
@@ -371,3 +382,7 @@ result is overturned, a later entry records the correction. The manifests in
 | 2026-08-08 | Closed Phase 2 on the frozen full-JAXBench contract. | The secure patch adapter compiled candidates as `nobody`, transferred only serialized executables into the pristine verifier, and destroyed each disposable TPU. The `8p_GEMM` reference earned reward 1 with normal-lowering and Perfetto proof at 0.99667x XLA; an authentic deliberately wrong Pallas kernel earned reward 0 at full-shape correctness. The original-shape baseline matrix made 47/50 tasks scoreable on v5e. Megablox failed on its pinned dynamic shape, while GQA and Mamba2 exceeded v5e HBM during baseline compilation. All 50 remain packaged; the three candidate-independent failures are excluded only from the v5e scoreable denominator. |
 | 2026-08-08 | Final adversarial review reopened the full-JAXBench closeout because a mixed XLA-result plus live Pallas call could satisfy the old authenticity check and the scoreability matrix did not bind its exact TPU runtime. | The accepted release now requires output-reachable Pallas-owned HLO dataflow and rejects reachable compute outside the Pallas result. Fresh disposable-worker probes gave the reference reward 1 at 0.99638x XLA, the authentic wrong Pallas kernel reward 0 at correctness, and the mixed fallback reward 0 at normal lowering; all three workers were confirmed deleted. A fresh 50-task matrix again scored 47/50 and now binds Python 3.12.11, JAX/JAXlib 0.10.1, libtpu 0.0.41, TPU v5 lite, and the worker lock. Phase 2 is complete on release `d3f9de22…`. |
 | 2026-08-09 | Adversarial review reopened authenticity once more because XLA can itself emit `tpu_custom_call`, so the target name alone is not Pallas provenance. | The accepted verifier now requires Pallas-specific `pallas_call` metadata and kernel metadata in addition to Pallas-owned result dataflow. A real plain-JAX Flash Attention executable contained an output-root XLA TPU custom call but was classified with one TPU call, zero Pallas calls, and reward 0 at normal lowering. Fresh reference, wrong-Pallas, mixed-fallback, and XLA-custom-call workers were all destroyed; the reference measured 0.99643x XLA. The runtime-bound matrix again scored 47/50. Phase 2 is complete on release `4015d3db…`. |
+| 2026-08-09 | Ran a separate compatibility lane for the three candidate-independent Phase 2 platform failures. | Megablox became scoreable after restoring its pinned static-argument JIT contract. Exact-shape GQA and Mamba2 became scoreable on four v5e chips through batch-axis sharding. All three preserve their original global shapes, dtypes, inputs, and semantics; the frozen Phase 2 result and Phase 3 denominator remain unchanged. |
+| 2026-08-09 | Calibrated all six optimized JAXBench references that belong to the frozen 47-task denominator. | Only `8p_GEMM` passed correctness, Pallas provenance, lowering, and profiling on the pinned runtime, and it measured `0.99643x` XLA. The other five exposed pinned API or correctness drift. No JAXBench task met the predeclared `1.05x` lower-confidence-bound headroom rule. |
+| 2026-08-09 | Imported pinned SGLang-JAX and calibrated a real 32K variable-length keyed-delta-attention megakernel against a persistent compiled naïve recurrent XLA baseline. | The four-stage Pallas pipeline passed independent output and final-state checks, measured `1.18152x` with a paired 95% interval of `1.18104x` to `1.18359x`, and produced Perfetto and Pallas-provenance evidence. An initial `4341x` number included repeated baseline compilation and is explicitly superseded. KDA is the first admitted Megakernel-v0 task. |
+| 2026-08-10 | Completed the frozen untouched-base Phase 3 comparison across 47 scoreable JAXBench tasks, three seeds, and matched three-call and six-call snapshots. | Inkling Small and Laguna XS 2.1 both scored `0/141` at both horizons with zero infrastructure failures. Laguna generated 54 non-empty six-call patches, but 41 failed TPU compilation and 13 failed normal lowering; Inkling generated two and both failed compilation. The result rules out untouched-base capability under this harness while preserving Laguna's higher patch-production rate as behavior, not competence. |

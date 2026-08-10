@@ -54,6 +54,18 @@ OBSERVATION_TEMPLATE = """<returncode>{{returncode}}</returncode>
 <output>{{output}}</output>
 {% if exception_info %}<exception>{{exception_info}}</exception>{% endif %}"""
 
+
+def _serialize_tool_call(value: Any) -> dict[str, Any]:
+    if hasattr(value, "model_dump"):
+        serialized = value.model_dump(mode="json")
+    elif isinstance(value, dict):
+        serialized = value
+    else:
+        raise G42HarnessError("ACTION_TOOL_INVALID: unsupported tool-call value")
+    if not isinstance(serialized, dict):
+        raise G42HarnessError("ACTION_TOOL_INVALID: serialized tool call")
+    return serialized
+
 class TinkerMiniSWEModel:
     """mini-swe Model protocol implementation using a pinned Tinker sampler."""
 
@@ -129,7 +141,10 @@ class TinkerMiniSWEModel:
         return {
             "role": "assistant",
             "content": content,
-            "tool_calls": parsed_message.get("tool_calls", []),
+            "tool_calls": [
+                _serialize_tool_call(tool_call)
+                for tool_call in parsed_message.get("tool_calls", []) or ()
+            ],
             "extra": {**sample, "actions": [action]},
         }
 

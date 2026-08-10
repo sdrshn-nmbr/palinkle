@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from opjax.pallas.jaxbench_capability import (
     EXPECTED_WORKLOAD_COUNT,
+    PINNED_JAXBENCH_REVISION,
     JaxBenchCapabilityError,
     build_release,
     file_sha256,
@@ -21,12 +23,12 @@ from opjax.pallas.phase2_contamination import (
 )
 
 
-JAXBENCH = Path("/tmp/opjax-jaxbench.yzbH8p/repo")
+JAXBENCH = Path(__file__).parents[2] / "references/accelerator-agents"
 
 
 @pytest.fixture(scope="module")
 def release(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    if not (JAXBENCH / ".git").is_dir():
+    if not (JAXBENCH / ".git").exists():
         pytest.skip("pinned JAXBench checkout unavailable")
     root = tmp_path_factory.mktemp("jaxbench-capability") / "release"
     build_release(source_root=JAXBENCH, out_dir=root)
@@ -167,7 +169,14 @@ def test_release_validation_rejects_hidden_reference_drift(
 
 def test_source_validation_rejects_untracked_reference(tmp_path: Path) -> None:
     checkout = tmp_path / "jaxbench"
-    shutil.copytree(JAXBENCH, checkout)
+    subprocess.run(
+        ["git", "clone", "--quiet", "--no-hardlinks", str(JAXBENCH), str(checkout)],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "checkout", "--quiet", PINNED_JAXBENCH_REVISION],
+        check=True,
+    )
     untracked = checkout / "JAXBench/benchmark/8p_GEMM/untracked.py"
     untracked.write_text("UNTRACKED = True\n")
 
