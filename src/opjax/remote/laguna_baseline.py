@@ -308,7 +308,7 @@ def baseline(
     engine = LagunaEngine()
 
     def generate(
-        messages: list[dict[str, str]], sampling: dict[str, Any]
+        messages: list[dict[str, Any]], sampling: dict[str, Any]
     ) -> dict[str, Any]:
         return engine.generate.remote(messages, sampling)
 
@@ -406,7 +406,7 @@ def phase3(
     engine = LagunaEngine()
 
     def generate(
-        messages: list[dict[str, str]], sampling: dict[str, Any]
+        messages: list[dict[str, Any]], sampling: dict[str, Any]
     ) -> dict[str, Any]:
         return engine.generate.remote(messages, sampling)
 
@@ -448,7 +448,7 @@ def phase31(
     engine = LagunaEngine()
 
     def generate(
-        messages: list[dict[str, str]], sampling: dict[str, Any]
+        messages: list[dict[str, Any]], sampling: dict[str, Any]
     ) -> dict[str, Any]:
         return engine.generate.remote(messages, sampling)
 

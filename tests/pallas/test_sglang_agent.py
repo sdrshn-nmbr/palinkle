@@ -8,6 +8,7 @@ from minisweagent.exceptions import FormatError
 from opjax.pallas.g42_harness import G42HarnessError, canonical_sha256, file_sha256
 from opjax.pallas.sglang_agent import SGLangMiniSWEModel, parse_sglang_action
 from opjax.remote.laguna_baseline import summarize_baseline
+from opjax.remote.laguna_sglang import render_laguna_prompt
 
 
 def _model(generate):
@@ -51,6 +52,139 @@ def test_sglang_model_records_identity_sampling_and_action() -> None:
     }
     assert model.serialize()["info"]["model"]["provider"] == "sglang"
     assert model.samples[0]["model_revision"] == "model-revision"
+
+
+def test_sglang_model_preserves_native_tool_history_and_linked_result() -> None:
+    calls = []
+
+    def generate(messages, sampling):
+        calls.append((messages, sampling))
+        return {
+            "text": (
+                "Inspecting the task.</think><tool_call>read"
+                "<arg_key>path</arg_key><arg_value>instruction.md</arg_value>"
+                "</tool_call>"
+            )
+        }
+
+    model = _model(generate)
+    message = model.query([{"role": "user", "content": "task"}])
+
+    assert message["content"] == ""
+    assert message["reasoning_content"] == "Inspecting the task."
+    assert message["tool_calls"] == [
+        {
+            "type": "function",
+            "id": "call-1-1",
+            "function": {
+                "name": "read",
+                "arguments": {"path": "instruction.md"},
+            },
+        }
+    ]
+
+    observation = model.format_observation_messages(
+        message,
+        [{"returncode": 0, "output": "task contents", "exception_info": None}],
+    )[0]
+    assert observation == {
+        "role": "tool",
+        "content": "<returncode>0</returncode>\n<output>task contents</output>",
+        "tool_call_id": "call-1-1",
+        "name": "read",
+        "extra": {
+            "returncode": 0,
+            "output": "task contents",
+            "exception_info": None,
+        },
+    }
+
+    model.query(
+        [
+            {"role": "user", "content": "task"},
+            message,
+            observation,
+        ]
+    )
+
+    assert calls[1][0] == [
+        {"role": "user", "content": "task"},
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "Inspecting the task.",
+            "tool_calls": message["tool_calls"],
+        },
+        {
+            "role": "tool",
+            "content": "<returncode>0</returncode>\n<output>task contents</output>",
+            "tool_call_id": "call-1-1",
+            "name": "read",
+        },
+    ]
+
+
+def test_sglang_fenced_action_receives_user_observation() -> None:
+    model = _model(
+        lambda messages, sampling: {"text": "```mswea_bash_command\npwd\n```"}
+    )
+    message = model.query([{"role": "user", "content": "task"}])
+
+    observation = model.format_observation_messages(
+        message,
+        [{"returncode": 0, "output": "/workspace", "exception_info": None}],
+    )[0]
+
+    assert observation["role"] == "user"
+    assert "tool_call_id" not in observation
+    assert "name" not in observation
+
+
+def test_laguna_prompt_declares_tools_and_preserves_native_transcript() -> None:
+    class Tokenizer:
+        def apply_chat_template(self, messages, **kwargs):
+            self.messages = messages
+            self.kwargs = kwargs
+            return "rendered"
+
+    tokenizer = Tokenizer()
+    messages = [
+        {"role": "user", "content": "task"},
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "checking",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "id": "call-1-1",
+                    "function": {
+                        "name": "read",
+                        "arguments": {"path": "instruction.md"},
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "content": "<returncode>0</returncode>\n<output>task</output>",
+            "tool_call_id": "call-1-1",
+            "name": "read",
+        },
+    ]
+
+    assert render_laguna_prompt(tokenizer, messages) == "rendered"
+    assert tokenizer.messages == messages
+    assert tokenizer.kwargs["tokenize"] is False
+    assert tokenizer.kwargs["add_generation_prompt"] is True
+    assert tokenizer.kwargs["enable_thinking"] is True
+    assert {tool["function"]["name"] for tool in tokenizer.kwargs["tools"]} == {
+        "shell",
+        "read",
+        "write",
+        "edit",
+        "list",
+    }
 
 
 def test_sglang_model_counts_format_failure_as_call() -> None:

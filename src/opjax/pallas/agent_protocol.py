@@ -20,6 +20,74 @@ NATIVE_ARGUMENT_PATTERN = re.compile(
     re.DOTALL,
 )
 SHELL_TOOLS = {"bash", "mswea_bash_command", "shell"}
+AGENT_TOOL_SPECS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "shell",
+            "description": "Run one shell command in the isolated task workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read",
+            "description": "Read a UTF-8 text file in the isolated task workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write",
+            "description": "Write a UTF-8 text file in the isolated task workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit",
+            "description": "Replace one exact text occurrence in a workspace file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old_text": {"type": "string"},
+                    "new_text": {"type": "string"},
+                },
+                "required": ["path", "old_text", "new_text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list",
+            "description": "List a directory in the isolated task workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+            },
+        },
+    },
+]
 
 
 class AgentProtocolError(RuntimeError):
@@ -86,7 +154,9 @@ def normalize_native_action(tool: str, arguments: dict[str, Any]) -> dict[str, s
     if tool == "edit":
         path = _workspace_path(_required_text(arguments, "path", "file"))
         old = _required_text(arguments, "old_text", "old_string", "old")
-        new = arguments.get("new_text", arguments.get("new_string", arguments.get("new")))
+        new = arguments.get(
+            "new_text", arguments.get("new_string", arguments.get("new"))
+        )
         if not isinstance(new, str):
             raise AgentProtocolError("ACTION_ARGUMENTS_INVALID:new_text")
         script = (
@@ -158,3 +228,45 @@ def parse_poolside_action(content: str) -> dict[str, str]:
             f"ACTION_COUNT_INVALID:expected=1 observed={len(observed)}"
         )
     return observed[0]
+
+
+def structure_poolside_response(content: str, *, call_id_prefix: str) -> dict[str, Any]:
+    """Convert Poolside's text protocol back into its native chat fields."""
+    reasoning_content = ""
+    response_content = content
+    if "</think>" in response_content:
+        reasoning_content, response_content = response_content.split("</think>", 1)
+
+    matches = list(NATIVE_ACTION_PATTERN.finditer(response_content))
+    visible_parts = []
+    cursor = 0
+    tool_calls = []
+    for index, match in enumerate(matches, start=1):
+        visible_parts.append(response_content[cursor : match.start()])
+        tool, body = match.groups()
+        arguments = {
+            key.strip(): unescape(value)
+            for key, value in NATIVE_ARGUMENT_PATTERN.findall(body)
+        }
+        tool_calls.append(
+            {
+                "type": "function",
+                "id": f"{call_id_prefix}-{index}",
+                "function": {
+                    "name": tool.strip(),
+                    "arguments": arguments,
+                },
+            }
+        )
+        cursor = match.end()
+    visible_parts.append(response_content[cursor:])
+
+    message: dict[str, Any] = {
+        "role": "assistant",
+        "content": "".join(visible_parts).strip(),
+    }
+    if reasoning_content:
+        message["reasoning_content"] = reasoning_content.strip()
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    return message

@@ -10,7 +10,11 @@ from minisweagent.agents.default import DefaultAgent
 from minisweagent.environments.docker import DockerEnvironment
 from minisweagent.exceptions import FormatError, Submitted
 
-from opjax.pallas.agent_protocol import AgentProtocolError, parse_poolside_action
+from opjax.pallas.agent_protocol import (
+    AgentProtocolError,
+    parse_poolside_action,
+    structure_poolside_response,
+)
 from opjax.pallas.g42_harness import (
     AGENT_IMAGE,
     G42HarnessError,
@@ -21,7 +25,9 @@ from opjax.pallas.g42_harness import (
 )
 
 SYSTEM_TEMPLATE = """You are a programming agent working in an isolated repository.
-Your response must contain exactly one shell action in this format:
+Your response must contain exactly one native tool call. Available tools are
+`shell`, `read`, `write`, `edit`, and `list`. If native tools are unavailable,
+use this fallback:
 
 ```mswea_bash_command
 command
@@ -37,7 +43,42 @@ INSTANCE_TEMPLATE = """Repair the Pallas kernel described in instruction.md.
 Start by reading instruction.md, PALLAS_API.md, kernel.py, and dev_check.py.
 """
 
-GenerationFunction = Callable[[list[dict[str, str]], dict[str, Any]], dict[str, Any]]
+GenerationFunction = Callable[[list[dict[str, Any]], dict[str, Any]], dict[str, Any]]
+
+
+def _sglang_prompt_message(message: dict[str, Any]) -> dict[str, Any]:
+    result = {
+        "role": message["role"],
+        "content": message.get("content", ""),
+    }
+    for field in (
+        "reasoning",
+        "reasoning_content",
+        "tool_calls",
+        "tool_call_id",
+        "name",
+    ):
+        if field in message:
+            result[field] = message[field]
+    return result
+
+
+def _native_tool_identity(message: dict[str, Any]) -> tuple[str | None, str | None]:
+    calls = message.get("tool_calls", ()) or ()
+    if len(calls) != 1 or not isinstance(calls[0], dict):
+        return None, None
+    call = calls[0]
+    function = call.get("function")
+    if not isinstance(function, dict):
+        return None, None
+    call_id = call.get("id")
+    name = function.get("name")
+    return (
+        call_id if isinstance(call_id, str) and call_id else None,
+        name if isinstance(name, str) and name else None,
+    )
+
+
 def parse_sglang_action(content: str) -> dict[str, str]:
     """Normalize one Poolside action through the canonical provider-neutral protocol."""
     try:
@@ -79,9 +120,9 @@ class SGLangMiniSWEModel:
 
     def query(self, messages: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
         prompt_messages = [
-            {"role": message["role"], "content": str(message.get("content", ""))}
+            _sglang_prompt_message(message)
             for message in messages
-            if message.get("role") in {"system", "user", "assistant"}
+            if message.get("role") in {"system", "user", "assistant", "tool"}
         ]
         call_seed = self.seed + self.calls * 1_000_000
         sampling = {
@@ -120,7 +161,11 @@ class SGLangMiniSWEModel:
                     "extra": {"interrupt_type": "FormatError"},
                 },
             ) from exc
-        return {"role": "assistant", "content": content, "extra": {**sample, "actions": [action]}}
+        message = structure_poolside_response(
+            content, call_id_prefix=f"call-{self.calls}"
+        )
+        message["extra"] = {**sample, "actions": [action]}
+        return message
 
     def format_message(self, **kwargs: Any) -> dict[str, Any]:
         return dict(kwargs)
@@ -132,6 +177,7 @@ class SGLangMiniSWEModel:
         template_vars: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         observations = []
+        tool_call_id, tool_name = _native_tool_identity(message)
         for output in outputs:
             content = (
                 f"<returncode>{output.get('returncode')}</returncode>\n"
@@ -139,7 +185,12 @@ class SGLangMiniSWEModel:
             )
             if output.get("exception_info"):
                 content += f"\n<exception>{output['exception_info']}</exception>"
-            observations.append({"role": "user", "content": content, "extra": output})
+            observation = {"role": "user", "content": content, "extra": output}
+            if tool_name is not None:
+                observation.update({"role": "tool", "name": tool_name})
+                if tool_call_id is not None:
+                    observation["tool_call_id"] = tool_call_id
+            observations.append(observation)
         return observations
 
     def get_template_vars(self, **kwargs: Any) -> dict[str, Any]:

@@ -9,6 +9,7 @@ from typing import Any
 
 import modal
 
+from opjax.pallas.agent_protocol import AGENT_TOOL_SPECS
 from opjax.remote.config import (
     HF_CACHE_DIR,
     HF_CACHE_VOLUME_NAME,
@@ -23,6 +24,17 @@ MODEL_REVISION = "e9df9a59996d790b94b70f3fef343fe1d9e34bdf"
 SGLANG_IMAGE = "lmsysorg/sglang:v0.5.16"
 SGLANG_REVISION = "v0.5.16"
 PRECISION = "bfloat16"
+
+
+def render_laguna_prompt(tokenizer: Any, messages: list[dict[str, Any]]) -> str:
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=True,
+        tools=AGENT_TOOL_SPECS,
+    )
+
 
 app = modal.App("opjax-laguna-sglang")
 hf_cache_volume = modal.Volume.from_name(
@@ -76,15 +88,10 @@ class LagunaEngine:
     @modal.method()
     def generate(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         sampling: dict[str, Any],
     ) -> dict[str, Any]:
-        prompt = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=True,
-        )
+        prompt = render_laguna_prompt(self.tokenizer, messages)
         started = time.perf_counter()
         response = self.engine.generate(prompt=prompt, sampling_params=sampling)
         latency = time.perf_counter() - started

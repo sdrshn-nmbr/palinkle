@@ -148,6 +148,161 @@ def test_tinker_adapter_uses_renderer_parse_response_for_native_action() -> None
     assert message["tool_calls"][0]["function"]["name"] == "mswea_bash_command"
 
 
+def test_tinker_adapter_preserves_native_tool_history_and_linked_result() -> None:
+    tinker_cookbook = pytest.importorskip("tinker_cookbook.renderers.base")
+    from tml_renderers import chat as tml_chat
+
+    from opjax.pallas.g42_agent import TinkerMiniSWEModel
+
+    class Sequence:
+        tokens = [11, 22]
+        stop_reason = "stop"
+
+    class Response:
+        sequences = [Sequence()]
+
+    class Future:
+        def result(self) -> Response:
+            return Response()
+
+    class Client:
+        def sample(self, **_: object) -> Future:
+            return Future()
+
+    class Renderer:
+        def __init__(self) -> None:
+            self.prompt_messages = None
+
+        def build_generation_prompt(self, messages: object) -> object:
+            self.prompt_messages = messages
+            return object()
+
+        def get_stop_sequences(self) -> list[int]:
+            return []
+
+        def parse_response(self, _: list[int]) -> tuple[dict[str, object], object]:
+            return (
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "id": "call-2",
+                            "function": {
+                                "name": "shell",
+                                "arguments": '{"command":"pwd"}',
+                            },
+                        }
+                    ],
+                },
+                tinker_cookbook.ParseTermination.STOP_SEQUENCE,
+            )
+
+    renderer = Renderer()
+    model = TinkerMiniSWEModel(
+        client=Client(),
+        renderer=renderer,
+        tokenizer=object(),
+        checkpoint=None,
+        seed=0,
+        max_tokens=128,
+        temperature=0.2,
+        top_p=0.95,
+    )
+    prior_assistant = {
+        "role": "assistant",
+        "content": "checking",
+        "tool_calls": [
+            {
+                "type": "function",
+                "id": "call-1",
+                "function": {
+                    "name": "shell",
+                    "arguments": '{"command":"cat instruction.md"}',
+                },
+            }
+        ],
+        "extra": {"actions": [{"command": "cat instruction.md"}]},
+    }
+    observation = model.format_observation_messages(
+        prior_assistant,
+        [{"returncode": 0, "output": "task contents", "exception_info": None}],
+    )[0]
+
+    assert observation == {
+        "role": "tool",
+        "content": "<returncode>0</returncode>\n<output>task contents</output>",
+        "tool_call_id": "call-1",
+        "name": "shell",
+        "extra": {
+            "returncode": 0,
+            "output": "task contents",
+            "exception_info": None,
+        },
+    }
+
+    model.query(
+        [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "task"},
+            prior_assistant,
+            observation,
+        ]
+    )
+
+    rendered_messages = tml_chat.MessageList(renderer.prompt_messages).to_oss_messages()
+    assert rendered_messages[0] == {
+        "role": "system",
+        "content": [
+            {"type": "text", "text": "system"},
+            {"type": "unknown"},
+        ],
+    }
+    assert rendered_messages[1] == {"role": "user", "content": "task"}
+    assert rendered_messages[2]["role"] == "assistant"
+    assert rendered_messages[2]["content"] == "checking"
+    assert rendered_messages[2]["tool_calls"][0]["id"] == "call-1"
+    assert rendered_messages[2]["tool_calls"][0]["function"]["name"] == "shell"
+    assert json.loads(
+        rendered_messages[2]["tool_calls"][0]["function"]["arguments"]
+    ) == {"command": "cat instruction.md"}
+    assert rendered_messages[3] == {
+        "role": "tool",
+        "content": "<returncode>0</returncode>\n<output>task contents</output>",
+        "tool_call_id": "call-1",
+        "name": "shell",
+    }
+
+
+def test_tinker_fenced_action_receives_user_observation() -> None:
+    from opjax.pallas.g42_agent import TinkerMiniSWEModel
+
+    model = TinkerMiniSWEModel(
+        client=object(),
+        renderer=object(),
+        tokenizer=object(),
+        checkpoint=None,
+        seed=0,
+        max_tokens=128,
+        temperature=0.2,
+        top_p=0.95,
+    )
+
+    observation = model.format_observation_messages(
+        {
+            "role": "assistant",
+            "content": "```mswea_bash_command\npwd\n```",
+            "extra": {"actions": [{"command": "pwd"}]},
+        },
+        [{"returncode": 0, "output": "/workspace", "exception_info": None}],
+    )[0]
+
+    assert observation["role"] == "user"
+    assert "tool_call_id" not in observation
+    assert "name" not in observation
+
+
 def test_real_tml_renderer_round_trips_native_shell_action() -> None:
     base = pytest.importorskip("tinker_cookbook.renderers.base")
     from tinker_cookbook import model_info, renderers
@@ -188,6 +343,60 @@ def test_real_tml_renderer_round_trips_native_shell_action() -> None:
 
     assert termination is base.ParseTermination.STOP_SEQUENCE
     assert parse_model_action(dict(message)) == {"command": "pwd"}
+
+
+def test_real_tml_renderer_preserves_linked_tool_result() -> None:
+    pytest.importorskip("tinker_cookbook.renderers.base")
+    from tinker_cookbook import model_info, renderers
+    from tinker_cookbook.tokenizer_utils import get_tokenizer
+
+    model_id = "thinkingmachines/Inkling-Small"
+    tokenizer = get_tokenizer(model_id)
+    renderer = renderers.get_renderer(
+        model_info.get_recommended_renderer_name(model_id),
+        tokenizer,
+        model_name=model_id,
+    )
+    from opjax.pallas.g42_agent import _tinker_render_input
+
+    prompt = renderer.build_generation_prompt(
+        _tinker_render_input(
+            [
+            {"role": "user", "content": "inspect"},
+            {
+                "role": "assistant",
+                "content": "checking",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "id": "call-1",
+                        "function": {
+                            "name": "shell",
+                            "arguments": '{"command":"pwd"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "content": "<returncode>0</returncode>\n<output>/workspace</output>",
+                "tool_call_id": "call-1",
+                "name": "shell",
+            },
+            ]
+        )
+    )
+    rendered = tokenizer.decode(prompt.to_ints())
+
+    assert "<|content_xml|>" in rendered
+    assert '"name":"shell"' in rendered
+    assert '"name":"read"' in rendered
+    assert (
+        '<|content_invoke_tool_json|>{"name":"shell","args":{"command":"pwd"}}'
+        in rendered
+    )
+    assert "<|message_tool|>shell<|content_text|><returncode>0</returncode>" in rendered
+    assert "<output>/workspace</output>" in rendered
 
 
 @pytest.mark.parametrize(

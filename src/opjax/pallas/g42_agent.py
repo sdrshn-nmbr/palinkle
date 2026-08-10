@@ -18,7 +18,9 @@ from tinker import types
 from tinker_cookbook import model_info, renderers
 from tinker_cookbook.renderers.base import ParseTermination
 from tinker_cookbook.tokenizer_utils import get_tokenizer
+from tml_renderers import chat as tml_chat
 
+from opjax.pallas.agent_protocol import AGENT_TOOL_SPECS
 from opjax.pallas.contracts import load_contracts
 from opjax.pallas.g42_harness import (
     AGENT_IMAGE,
@@ -33,8 +35,8 @@ from opjax.pallas.g42_harness import (
 from opjax.pallas.sampling import _sampling_client
 
 SYSTEM_TEMPLATE = """You are a programming agent working in an isolated repository.
-Your response must contain exactly one shell action. Prefer the native
-`mswea_bash_command` tool. If native tools are unavailable, use this fallback:
+Your response must contain exactly one action. Use one native `shell`, `bash`, or
+`mswea_bash_command` tool call. If native tools are unavailable, use this fallback:
 
 ```mswea_bash_command
 command
@@ -66,6 +68,70 @@ def _serialize_tool_call(value: Any) -> dict[str, Any]:
         raise G42HarnessError("ACTION_TOOL_INVALID: serialized tool call")
     return serialized
 
+
+def _tinker_prompt_message(message: dict[str, Any]) -> dict[str, Any]:
+    result = {
+        "role": message["role"],
+        "content": message.get("content", ""),
+    }
+    for field in (
+        "tool_calls",
+        "unparsed_tool_calls",
+        "tool_call_id",
+        "name",
+    ):
+        if field in message:
+            value = message[field]
+            if field in {"tool_calls", "unparsed_tool_calls"}:
+                value = [_serialize_tool_call(item) for item in value or ()]
+            result[field] = value
+    return result
+
+
+def _native_tool_identity(message: dict[str, Any]) -> tuple[str | None, str | None]:
+    calls = message.get("tool_calls", ()) or ()
+    if len(calls) != 1:
+        return None, None
+    call = _serialize_tool_call(calls[0])
+    function = call.get("function")
+    if not isinstance(function, dict):
+        return None, None
+    call_id = call.get("id")
+    name = function.get("name")
+    return (
+        call_id if isinstance(call_id, str) and call_id else None,
+        name if isinstance(name, str) and name else None,
+    )
+
+
+def _tinker_render_input(messages: list[dict[str, Any]]) -> list[Any]:
+    openai_messages = tml_chat.OpenAIMessage.from_oss_messages(messages)
+    native_messages = []
+    for message in openai_messages:
+        native_messages.extend(message.to_messages())
+    tool_specs = [
+        tml_chat.ToolSpecJson(
+            tool["type"],
+            tool["function"]["name"],
+            tool["function"]["description"],
+            tool["function"]["parameters"],
+        )
+        for tool in AGENT_TOOL_SPECS
+    ]
+    declaration = tml_chat.Message(
+        tml_chat.ToolDeclareJson(tool_specs),
+        tml_chat.Author(tml_chat.AuthorKind.System),
+    )
+    insertion_index = 0
+    while (
+        insertion_index < len(native_messages)
+        and native_messages[insertion_index].author.kind == tml_chat.AuthorKind.System
+    ):
+        insertion_index += 1
+    native_messages.insert(insertion_index, declaration)
+    return native_messages
+
+
 class TinkerMiniSWEModel:
     """mini-swe Model protocol implementation using a pinned Tinker sampler."""
 
@@ -95,11 +161,13 @@ class TinkerMiniSWEModel:
 
     def query(self, messages: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
         prompt_messages = [
-            {"role": message["role"], "content": str(message.get("content", ""))}
+            _tinker_prompt_message(message)
             for message in messages
-            if message.get("role") in {"system", "user", "assistant"}
+            if message.get("role") in {"system", "user", "assistant", "tool"}
         ]
-        prompt = self.renderer.build_generation_prompt(prompt_messages)
+        prompt = self.renderer.build_generation_prompt(
+            _tinker_render_input(prompt_messages)
+        )
         response = self.client.sample(
             prompt=prompt,
             num_samples=1,
@@ -158,6 +226,7 @@ class TinkerMiniSWEModel:
         template_vars: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         observations = []
+        tool_call_id, tool_name = _native_tool_identity(message)
         for output in outputs:
             content = (
                 f"<returncode>{output.get('returncode')}</returncode>\n"
@@ -165,7 +234,12 @@ class TinkerMiniSWEModel:
             )
             if output.get("exception_info"):
                 content += f"\n<exception>{output['exception_info']}</exception>"
-            observations.append({"role": "user", "content": content, "extra": output})
+            observation = {"role": "user", "content": content, "extra": output}
+            if tool_name is not None:
+                observation.update({"role": "tool", "name": tool_name})
+                if tool_call_id is not None:
+                    observation["tool_call_id"] = tool_call_id
+            observations.append(observation)
         return observations
 
     def get_template_vars(self, **kwargs: Any) -> dict[str, Any]:
