@@ -77,6 +77,7 @@ def serve() -> None:
         "0.85",
         "--context-length",
         "32768",
+        "--disable-prefill-cuda-graph",
         "--trust-remote-code",
         "--mamba-radix-cache-strategy",
         "extra_buffer",
