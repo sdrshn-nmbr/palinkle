@@ -129,8 +129,10 @@ def test_sglang_sampling_runs_independent_cells_concurrently(
     result = phase3_sampling.sample_sglang_matrix(
         contract=contract,
         experiment=experiment,
+        provider="sglang",
         output_root=tmp_path,
-        generate=lambda messages, sampling: {},
+        base_url="https://example.invalid",
+        api_key="EMPTY",
         runtime_revision="runtime",
         precision="bfloat16",
         task_ids={"8p_GEMM"},

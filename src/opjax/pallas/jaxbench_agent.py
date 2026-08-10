@@ -25,8 +25,7 @@ from opjax.pallas.g42_harness import (
 from opjax.pallas.jaxbench_capability import materialize_agent_workspace
 
 SYSTEM_TEMPLATE = """You are a programming agent working in an isolated repository.
-Use exactly one native shell, bash, read, write, edit, or list tool call per turn. If
-native tools are unavailable, return exactly one fenced `mswea_bash_command` action.
+Use exactly one native `bash` tool call per turn.
 Inspect the task, implement kernel.py, run public checks, and submit only when ready
 by running `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`.
 Do not combine submission with another command. Each action runs in a new shell.

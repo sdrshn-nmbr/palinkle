@@ -7,7 +7,6 @@ import asyncio
 import concurrent.futures
 import json
 import sys
-from collections.abc import Callable
 from importlib.metadata import version
 from pathlib import Path
 from typing import Any
@@ -32,10 +31,7 @@ from opjax.pallas.phase3_baseline import (
     validate_sample_matrix,
 )
 from opjax.pallas.sampling import _sampling_client
-from opjax.pallas.sglang_agent import SGLangMiniSWEModel
-
-GenerationFunction = Callable[[list[dict[str, str]], dict[str, Any]], dict[str, Any]]
-
+from opjax.pallas.sglang_agent import SGLangEndpointModel
 
 def select_cells(
     *,
@@ -98,7 +94,10 @@ def validate_completed_run(
         or manifest.get("trajectory_sha256") != file_sha256(trajectory_path)
     ):
         raise G42HarnessError(f"PHASE3_RUN_MANIFEST_MISMATCH:{path}")
-    if experiment is not None and experiment.get("kind") == "opjax_phase31_base_capability_experiment":
+    if experiment is not None and experiment.get("kind") in {
+        "opjax_phase31_base_capability_experiment",
+        "opjax_phase32_base_capability_experiment",
+    }:
         identity = manifest.get("experiment_identity")
         if (
             not isinstance(identity, dict)
@@ -277,17 +276,22 @@ def sample_sglang_matrix(
     *,
     contract: Phase3Contract,
     experiment: dict[str, Any],
+    provider: str,
     output_root: Path,
-    generate: GenerationFunction,
+    base_url: str,
+    api_key: str,
     runtime_revision: str,
     precision: str,
     task_ids: set[str] | None,
     seeds: set[int] | None,
     max_concurrency: int = 1,
+    proxy_headers: dict[str, str] | None = None,
+    reasoning_effort: str | None = None,
+    chat_template_kwargs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     cells = select_cells(
         experiment=experiment,
-        provider="sglang",
+        provider=provider,
         task_ids=task_ids,
         seeds=seeds,
     )
@@ -300,8 +304,9 @@ def sample_sglang_matrix(
         if run_root.exists():
             validate_completed_run(path=run_root, cell=cell, experiment=experiment)
             return
-        model = SGLangMiniSWEModel(
-            generate=generate,
+        model = SGLangEndpointModel(
+            base_url=base_url,
+            api_key=api_key,
             model_id=cell["model_id"],
             model_revision=cell["model_revision"],
             runtime_revision=runtime_revision,
@@ -310,6 +315,9 @@ def sample_sglang_matrix(
             max_tokens=experiment["sampling"]["max_tokens"],
             temperature=experiment["sampling"]["temperature"],
             top_p=experiment["sampling"]["top_p"],
+            proxy_headers=proxy_headers,
+            reasoning_effort=reasoning_effort,
+            chat_template_kwargs=chat_template_kwargs,
         )
         task = load_agent_task(
             release_root=contract.release_root,
@@ -318,7 +326,9 @@ def sample_sglang_matrix(
         identity = {
             "model_id": cell["model_id"],
             "model_revision": cell["model_revision"],
-            "provider": "sglang",
+            "provider": provider,
+            "transport": "openai_chat_completions",
+            "endpoint": base_url,
             "runtime_revision": runtime_revision,
             "precision": precision,
             "weight_identity": "exact_hugging_face_revision",
@@ -334,7 +344,11 @@ def sample_sglang_matrix(
             agent_image=experiment.get("harness", {}).get("agent_image", AGENT_IMAGE),
             experiment_identity=(
                 {"experiment_sha256": experiment["experiment_sha256"]}
-                if experiment.get("kind") == "opjax_phase31_base_capability_experiment"
+                if experiment.get("kind")
+                in {
+                    "opjax_phase31_base_capability_experiment",
+                    "opjax_phase32_base_capability_experiment",
+                }
                 else None
             ),
         )

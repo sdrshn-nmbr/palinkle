@@ -6,21 +6,21 @@ import json
 from pathlib import Path
 from typing import Any
 
-from opjax.pallas.g42_harness import canonical_sha256, file_sha256, load_task_package
-from opjax.pallas.g43_corpus import validate_benchmark_release
-from opjax.pallas.phase3_baseline import load_phase3_contract, validate_sample_matrix
+from opjax.pallas.g42_harness import canonical_sha256, file_sha256
 from opjax.pallas.phase3_sampling import sample_sglang_matrix
-from opjax.pallas.phase31_experiment import load_contract, validate_experiment
+from opjax.pallas.phase31_experiment import load_contract
 from opjax.pallas.phase31_conformance import run_two_turn_conformance
-from opjax.pallas.sglang_agent import SGLangMiniSWEModel, run_sglang_agent
+from opjax.pallas.phase32_experiment import validate_experiment
+from opjax.pallas.sglang_agent import SGLangEndpointModel
 from opjax.remote.laguna_sglang import (
     MODEL_ID,
     MODEL_REVISION,
     PRECISION,
     SGLANG_REVISION,
-    LagunaEngine,
     app,
+    serve,
 )
+from opjax.remote.config import modal_proxy_headers
 
 
 def _write(path: Path, value: Any) -> None:
@@ -272,30 +272,18 @@ def summarize_baseline(
     return result
 
 
-@app.local_entrypoint()
-def canary() -> None:
-    engine = LagunaEngine()
-    print(json.dumps(engine.smoke.remote(), indent=2, sort_keys=True))
-    response = engine.generate.remote(
-        [{"role": "user", "content": "Return exactly: READY"}],
-        {"max_new_tokens": 32, "temperature": 0.0, "top_p": 1.0, "sampling_seed": 0},
-    )
-    print(json.dumps(response, indent=2, sort_keys=True))
+def _endpoint() -> tuple[str, dict[str, str]]:
+    return serve.get_web_url(), modal_proxy_headers()
 
 
 @app.local_entrypoint()
 def protocol_canary(
-    out_path: str = "data/pallas/runs/phase31-provider-conformance/sglang.json",
+    out_path: str = "data/pallas/runs/phase32-provider-conformance/laguna.json",
 ) -> None:
-    engine = LagunaEngine()
-
-    def generate(
-        messages: list[dict[str, Any]], sampling: dict[str, Any]
-    ) -> dict[str, Any]:
-        return engine.generate.remote(messages, sampling)
-
-    model = SGLangMiniSWEModel(
-        generate=generate,
+    base_url, proxy_headers = _endpoint()
+    model = SGLangEndpointModel(
+        base_url=base_url,
+        api_key="EMPTY",
         model_id=MODEL_ID,
         model_revision=MODEL_REVISION,
         runtime_revision=SGLANG_REVISION,
@@ -304,15 +292,19 @@ def protocol_canary(
         max_tokens=512,
         temperature=0.2,
         top_p=0.95,
+        proxy_headers=proxy_headers,
+        chat_template_kwargs={"enable_thinking": True},
     )
     result = run_two_turn_conformance(
         model=model,
-        provider="sglang",
+        provider="sglang_openai",
         model_identity={
             "model_id": MODEL_ID,
             "model_revision": MODEL_REVISION,
             "runtime_revision": SGLANG_REVISION,
             "precision": PRECISION,
+            "endpoint": base_url,
+            "transport": "openai_chat_completions",
         },
     )
     _write(Path(out_path).resolve(), result)
@@ -320,185 +312,40 @@ def protocol_canary(
 
 
 @app.local_entrypoint()
-def baseline(
-    benchmark_root: str = "data/pallas/runs/g43-benchmark-release",
-    out_dir: str = "data/pallas/runs/laguna-xs-21-baseline-samples",
-    limit: int = 0,
-    turn_limit: int = 3,
-) -> None:
-    benchmark_path = Path(benchmark_root).resolve()
-    output_path = Path(out_dir).resolve()
-    if output_path.exists():
-        raise RuntimeError(f"LAGUNA_BASELINE_OUTPUT_EXISTS: {output_path}")
-    if turn_limit not in {3, 6}:
-        raise RuntimeError(f"LAGUNA_BASELINE_TURN_LIMIT_INVALID: {turn_limit}")
-    snapshot_turns = (3,) if turn_limit == 3 else (3, 6)
-    validation = validate_benchmark_release(benchmark_path)
-    benchmark = json.loads(
-        (benchmark_path / "manifest.json").read_text(encoding="utf-8")
-    )
-    tasks = [
-        load_task_package(benchmark_path / relative) for relative in benchmark["tasks"]
-    ]
-    if limit > 0:
-        tasks = tasks[:limit]
-    engine = LagunaEngine()
-
-    def generate(
-        messages: list[dict[str, Any]], sampling: dict[str, Any]
-    ) -> dict[str, Any]:
-        return engine.generate.remote(messages, sampling)
-
-    records = []
-    for index, task in enumerate(tasks, start=1):
-        run_id = f"laguna-xs-21-base--{task.task_id}--seed-0"
-        run_root = output_path / "runs" / run_id
-        run_sglang_agent(
-            task_dir=task.root,
-            output_dir=run_root,
-            generate=generate,
-            model_id=MODEL_ID,
-            model_revision=MODEL_REVISION,
-            runtime_revision=SGLANG_REVISION,
-            precision=PRECISION,
-            seed=0,
-            max_tokens=8192,
-            temperature=0.2,
-            top_p=0.95,
-            turn_limit=turn_limit,
-            snapshot_turns=snapshot_turns,
-        )
-        records.append(
-            {
-                "model_id": "laguna-xs-21-base",
-                "checkpoint": MODEL_ID,
-                "group": "external_baseline",
-                "trajectory_count": None,
-                "training_seed": None,
-                "seed": 0,
-                "task_id": task.task_id,
-                "task_sha256": task.task_sha256,
-                "family": task.family,
-                "run_path": f"runs/{run_id}",
-                "trajectory_sha256": file_sha256(run_root / "trajectory.json"),
-            }
-        )
-        print(
-            f"LAGUNA_BASELINE_SAMPLE completed={index}/{len(tasks)} task={task.task_id}",
-            flush=True,
-        )
-    manifest = {
-        "schema_version": 1,
-        "kind": "pallas_g43_sample_matrix",
-        "evaluation_config_sha256": None,
-        "benchmark_release_sha256": validation["release_sha256"],
-        "model": {
-            "model_id": MODEL_ID,
-            "model_revision": MODEL_REVISION,
-            "runtime": "sglang",
-            "runtime_revision": SGLANG_REVISION,
-            "precision": PRECISION,
-        },
-        "sampling": {
-            "turn_limit": turn_limit,
-            "seed": 0,
-            "max_tokens": 8192,
-            "temperature": 0.2,
-            "top_p": 0.95,
-            "thinking": True,
-        },
-        "snapshot_turns": list(snapshot_turns),
-        "counts": {
-            "runs": len(records),
-            "snapshots": len(records) * len(snapshot_turns),
-        },
-        "records": records,
-    }
-    manifest["release_sha256"] = canonical_sha256(manifest)
-    _write(output_path / "manifest.json", manifest)
-    print(json.dumps(manifest, indent=2, sort_keys=True))
-
-
-@app.local_entrypoint()
-def phase3(
-    release_root: str = "data/pallas/benchmarks/jaxbench-v1",
-    closeout_root: str = "data/pallas/runs/jaxbench-full-v1-closeout",
-    experiment_path: str = "data/pallas/runs/phase3-base-capability/experiment.json",
-    out_dir: str = "data/pallas/runs/phase3-base-capability/laguna-samples",
-    task_ids: str = "",
-    seeds: str = "0,1,2",
-) -> None:
-    release_path = Path(release_root).resolve()
-    closeout_path = Path(closeout_root).resolve()
-    experiment_file = Path(experiment_path).resolve()
-    output_path = Path(out_dir).resolve()
-    contract = load_phase3_contract(
-        release_root=release_path,
-        closeout_root=closeout_path,
-    )
-    validate_sample_matrix(path=experiment_file, contract=contract)
-    experiment = json.loads(experiment_file.read_text(encoding="utf-8"))
-    selected_tasks = {value for value in task_ids.split(",") if value} or None
-    selected_seeds = {int(value) for value in seeds.split(",") if value}
-    engine = LagunaEngine()
-
-    def generate(
-        messages: list[dict[str, Any]], sampling: dict[str, Any]
-    ) -> dict[str, Any]:
-        return engine.generate.remote(messages, sampling)
-
-    manifest = sample_sglang_matrix(
-        contract=contract,
-        experiment=experiment,
-        output_root=output_path,
-        generate=generate,
-        runtime_revision=SGLANG_REVISION,
-        precision=PRECISION,
-        task_ids=selected_tasks,
-        seeds=selected_seeds,
-    )
-    print(json.dumps(manifest, indent=2, sort_keys=True))
-
-
-@app.local_entrypoint()
-def phase31(
+def phase32(
     release_root: str = "data/pallas/benchmarks/jaxbench-phase31",
     validity_path: str = "data/pallas/runs/phase31-oracle-validity/manifest.json",
     calibration_path: str = "data/pallas/runs/phase31-positive-control-calibration/manifest.json",
-    experiment_path: str = "data/pallas/runs/phase31-base-capability/experiment.json",
-    out_dir: str = "data/pallas/runs/phase31-base-capability/laguna-samples",
+    experiment_path: str = "data/pallas/runs/phase32-base-capability/experiment.json",
+    out_dir: str = "data/pallas/runs/phase32-base-capability/laguna-samples",
     task_ids: str = "",
     seeds: str = "0,1,2",
     max_concurrency: int = 4,
 ) -> None:
-    release_path = Path(release_root).resolve()
-    experiment_file = Path(experiment_path).resolve()
-    output_path = Path(out_dir).resolve()
     contract = load_contract(
-        release_root=release_path,
+        release_root=Path(release_root).resolve(),
         validity_path=Path(validity_path).resolve(),
         calibration_path=Path(calibration_path).resolve(),
     )
-    experiment = json.loads(experiment_file.read_text(encoding="utf-8"))
-    validate_experiment(value=experiment, contract=contract)
-    selected_tasks = {value for value in task_ids.split(",") if value} or None
-    selected_seeds = {int(value) for value in seeds.split(",") if value}
-    engine = LagunaEngine()
-
-    def generate(
-        messages: list[dict[str, Any]], sampling: dict[str, Any]
-    ) -> dict[str, Any]:
-        return engine.generate.remote(messages, sampling)
-
+    experiment_file = Path(experiment_path).resolve()
+    experiment = validate_experiment(
+        value=json.loads(experiment_file.read_text(encoding="utf-8")),
+        contract=contract,
+    )
+    base_url, proxy_headers = _endpoint()
     manifest = sample_sglang_matrix(
         contract=contract,
         experiment=experiment,
-        output_root=output_path,
-        generate=generate,
+        provider="sglang_openai_laguna",
+        output_root=Path(out_dir).resolve(),
+        base_url=base_url,
+        api_key="EMPTY",
         runtime_revision=SGLANG_REVISION,
         precision=PRECISION,
-        task_ids=selected_tasks,
-        seeds=selected_seeds,
+        task_ids={value for value in task_ids.split(",") if value} or None,
+        seeds={int(value) for value in seeds.split(",") if value},
         max_concurrency=max_concurrency,
+        proxy_headers=proxy_headers,
+        chat_template_kwargs={"enable_thinking": True},
     )
     print(json.dumps(manifest, indent=2, sort_keys=True))

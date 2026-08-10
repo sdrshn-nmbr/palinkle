@@ -1,4 +1,4 @@
-"""Modal-hosted OpenAI-compatible SGLang server for Laguna XS 2.1."""
+"""Modal-hosted OpenAI-compatible SGLang server for Inkling Small."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import subprocess
 
 import modal
 
+from opjax.pallas.phase3_baseline import INKLING_HF_REVISION, INKLING_MODEL_ID
 from opjax.remote.config import (
     HF_CACHE_DIR,
     HF_CACHE_VOLUME_NAME,
@@ -15,16 +16,16 @@ from opjax.remote.config import (
     REMOTE_ENV,
 )
 
-MODEL_ID = "poolside/Laguna-XS-2.1"
-MODEL_REVISION = "e9df9a59996d790b94b70f3fef343fe1d9e34bdf"
+MODEL_ID = INKLING_MODEL_ID
+MODEL_REVISION = INKLING_HF_REVISION
 SGLANG_IMAGE = (
-    "lmsysorg/sglang@sha256:984699c298a95b73c469b2191403ddc85fd780506e13c39c4afff3845e27bc6c"
+    "lmsysorg/sglang@sha256:b90c0d760a65bc4dbbe4520bea966c437cc40391dcb7cca2a74922985dc1abeb"
 )
-SGLANG_REVISION = "v0.5.16"
+SGLANG_REVISION = "b7252cc6b0c78b25ecea7ee5efa91a6ae37d0f19"
 PRECISION = "bfloat16"
 PORT = 8000
 
-app = modal.App("opjax-laguna-openai")
+app = modal.App("opjax-inkling-small-openai")
 hf_cache_volume = modal.Volume.from_name(
     HF_CACHE_VOLUME_NAME,
     environment_name=MODAL_ENVIRONMENT,
@@ -35,12 +36,14 @@ opjax_secret = modal.Secret.from_name(
     MODAL_SECRET_NAME,
     environment_name=MODAL_ENVIRONMENT,
 )
-image = modal.Image.from_registry(SGLANG_IMAGE).env(REMOTE_ENV)
+image = modal.Image.from_registry(SGLANG_IMAGE).env(
+    {**REMOTE_ENV, "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"}
+)
 
 
 @app.function(
     image=image,
-    gpu="H200",
+    gpu="H200:8",
     volumes={HF_CACHE_DIR: hf_cache_volume},
     secrets=[opjax_secret],
     timeout=3600,
@@ -68,16 +71,22 @@ def serve() -> None:
         "--port",
         str(PORT),
         "--tp",
-        "1",
+        "8",
         "--mem-fraction-static",
-        "0.72",
+        "0.85",
         "--context-length",
         "32768",
         "--trust-remote-code",
+        "--mamba-radix-cache-strategy",
+        "extra_buffer",
+        "--swa-full-tokens-ratio",
+        "0.1",
+        "--mamba-full-memory-ratio",
+        "0.1",
         "--reasoning-parser",
-        "poolside_v1",
+        "inkling",
         "--tool-call-parser",
-        "poolside_v1",
+        "inkling",
         "--dtype",
         PRECISION,
         "--random-seed",

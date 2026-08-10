@@ -30,6 +30,14 @@ CHECKPOINT_DIR = "/mnt/checkpoints"
 
 EXPECTED_SECRET_KEYS = ("HF_TOKEN", "ANTHROPIC_API_KEY", "WANDB_API_KEY")
 
+
+def modal_proxy_headers() -> dict[str, str]:
+    token_id = os.environ.get("MODAL_PROXY_TOKEN_ID", "")
+    token_secret = os.environ.get("MODAL_PROXY_TOKEN_SECRET", "")
+    if not token_id.startswith("wk-") or not token_secret.startswith("ws-"):
+        raise RuntimeError("MODAL_PROXY_TOKEN_MISSING")
+    return {"Modal-Key": token_id, "Modal-Secret": token_secret}
+
 REMOTE_IMAGE_PACKAGES = (
     "anthropic==0.97.0",
     "chex==0.1.91",

@@ -9,7 +9,7 @@ from opjax.pallas.g42_harness import G42HarnessError, canonical_sha256
 
 
 SYSTEM_PROMPT = (
-    "You are a protocol conformance agent. Make exactly one native shell tool "
+    "You are a protocol conformance agent. Make exactly one native bash tool "
     "call per turn and no prose."
 )
 USER_PROMPT = (
@@ -28,11 +28,7 @@ def _action(message: dict[str, Any], *, expected: str) -> dict[str, str]:
         or actions[0].get("command") != expected
         or len(calls) != 1
         or not calls[0].get("id")
-        or calls[0].get("function", {}).get("name") not in {
-            "bash",
-            "mswea_bash_command",
-            "shell",
-        }
+        or calls[0].get("function", {}).get("name") != "bash"
     ):
         raise G42HarnessError(f"PHASE31_PROTOCOL_ACTION_INVALID:{expected}")
     return actions[0]
@@ -74,7 +70,6 @@ def run_two_turn_conformance(
     if (
         observation.get("role") != "tool"
         or observation.get("tool_call_id") != first_call["id"]
-        or observation.get("name") != first_call["function"]["name"]
     ):
         raise G42HarnessError("PHASE31_PROTOCOL_OBSERVATION_LINK_INVALID")
     second = model.query([*messages, first, observation])

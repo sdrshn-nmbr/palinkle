@@ -1,20 +1,51 @@
 from __future__ import annotations
 
 import json
+import threading
+from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
-import pytest
-from minisweagent.exceptions import FormatError
+from litellm import ModelResponse
 
-from opjax.pallas.g42_harness import G42HarnessError, canonical_sha256, file_sha256
+from opjax.pallas.g42_harness import canonical_sha256, file_sha256
 from opjax.pallas.phase31_conformance import run_two_turn_conformance
-from opjax.pallas.sglang_agent import SGLangMiniSWEModel, parse_sglang_action
+from opjax.pallas.sglang_agent import SGLangEndpointModel
 from opjax.remote.laguna_baseline import summarize_baseline
-from opjax.remote.laguna_sglang import render_laguna_prompt
 
 
-def _model(generate):
-    return SGLangMiniSWEModel(
-        generate=generate,
+def _response(command: str, call_id: str) -> ModelResponse:
+    return ModelResponse(
+        model="test-model",
+        choices=[
+            {
+                "index": 0,
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": "bash",
+                                "arguments": json.dumps({"command": command}),
+                            },
+                        }
+                    ],
+                },
+            }
+        ],
+        usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    )
+
+
+def _model() -> SGLangEndpointModel:
+    return SGLangEndpointModel(
+        base_url="https://example.invalid",
+        api_key="secret-key",
+        proxy_headers={"Modal-Secret": "secret-proxy"},
         model_id="poolside/Laguna-XS-2.1",
         model_revision="model-revision",
         runtime_revision="runtime-revision",
@@ -23,258 +54,147 @@ def _model(generate):
         max_tokens=1024,
         temperature=0.2,
         top_p=0.95,
+        chat_template_kwargs={"enable_thinking": True},
     )
 
 
-def test_two_turn_conformance_requires_linked_native_observation() -> None:
-    responses = iter(
-        [
-            "<tool_call>shell<arg_key>command</arg_key>"
-            "<arg_value>printf PROTOCOL_ONE</arg_value></tool_call>",
-            "<tool_call>shell<arg_key>command</arg_key>"
-            "<arg_value>printf PROTOCOL_TWO</arg_value></tool_call>",
-        ]
+def _stub_responses(
+    model: SGLangEndpointModel, responses: Iterator[ModelResponse]
+) -> list[list[dict]]:
+    calls: list[list[dict]] = []
+
+    def query(messages: list[dict], **_: object) -> ModelResponse:
+        calls.append(messages)
+        return next(responses)
+
+    model._query = query
+    return calls
+
+
+def test_stock_model_preserves_tool_call_and_linked_observation() -> None:
+    model = _model()
+    calls = _stub_responses(model, iter([_response("pwd", "call-1")]))
+
+    message = model.query([{"role": "user", "content": "task"}])
+    observation = model.format_observation_messages(
+        message,
+        [{"returncode": 0, "output": "/workspace", "exception_info": ""}],
+    )[0]
+
+    assert calls == [[{"role": "user", "content": "task"}]]
+    assert message["tool_calls"][0]["function"]["name"] == "bash"
+    assert json.loads(message["tool_calls"][0]["function"]["arguments"]) == {
+        "command": "pwd"
+    }
+    assert message["extra"]["actions"] == [
+        {"command": "pwd", "tool_call_id": "call-1"}
+    ]
+    assert observation["role"] == "tool"
+    assert observation["tool_call_id"] == "call-1"
+    assert observation["extra"]["returncode"] == 0
+
+
+def test_stock_model_sends_complete_native_history_unchanged() -> None:
+    model = _model()
+    calls = _stub_responses(
+        model,
+        iter(
+            [
+                _response("printf PROTOCOL_ONE", "call-1"),
+                _response("printf PROTOCOL_TWO", "call-2"),
+            ]
+        ),
     )
-    model = _model(lambda messages, sampling: {"text": next(responses)})
 
     result = run_two_turn_conformance(
         model=model,
-        provider="sglang",
+        provider="sglang_openai",
         model_identity={"model_id": "test", "model_revision": "revision"},
     )
 
     assert result["passed"] is True
-    assert result["model_calls"] == 2
-    assert result["messages"][1]["role"] == "tool"
-    assert result["messages"][1]["tool_call_id"] == "call-1-1"
+    second_request = calls[1]
+    assert second_request[2]["role"] == "assistant"
+    assert second_request[2]["tool_calls"][0]["id"] == "call-1"
+    assert second_request[3]["role"] == "tool"
+    assert second_request[3]["tool_call_id"] == "call-1"
+    assert "PROTOCOL_ONE" in second_request[3]["content"]
 
 
-def test_sglang_model_records_identity_sampling_and_action() -> None:
-    calls = []
-
-    def generate(messages, sampling):
-        calls.append((messages, sampling))
-        return {
-            "text": "```mswea_bash_command\npython dev_check.py\n```",
-            "prompt_tokens": 12,
-            "completion_tokens": 9,
-            "stop_reason": "stop",
-            "latency_seconds": 0.25,
-        }
-
-    model = _model(generate)
-    result = model.query(
-        [{"role": "system", "content": "system"}, {"role": "user", "content": "task"}]
-    )
-
-    assert result["extra"]["actions"] == [{"command": "python dev_check.py"}]
-    assert calls[0][1] == {
-        "max_new_tokens": 1024,
-        "temperature": 0.2,
-        "top_p": 0.95,
-        "sampling_seed": 7,
-    }
-    assert model.serialize()["info"]["model"]["provider"] == "sglang"
-    assert model.samples[0]["model_revision"] == "model-revision"
-
-
-def test_sglang_model_preserves_native_tool_history_and_linked_result() -> None:
-    calls = []
-
-    def generate(messages, sampling):
-        calls.append((messages, sampling))
-        return {
-            "text": (
-                "Inspecting the task.</think><tool_call>read"
-                "<arg_key>path</arg_key><arg_value>instruction.md</arg_value>"
-                "</tool_call>"
-            )
-        }
-
-    model = _model(generate)
-    message = model.query([{"role": "user", "content": "task"}])
-
-    assert message["content"] == ""
-    assert message["reasoning_content"] == "Inspecting the task."
-    assert message["tool_calls"] == [
-        {
-            "type": "function",
-            "id": "call-1-1",
-            "function": {
-                "name": "read",
-                "arguments": {"path": "instruction.md"},
-            },
-        }
-    ]
-
-    observation = model.format_observation_messages(
-        message,
-        [{"returncode": 0, "output": "task contents", "exception_info": None}],
-    )[0]
-    assert observation == {
-        "role": "tool",
-        "content": "<returncode>0</returncode>\n<output>task contents</output>",
-        "tool_call_id": "call-1-1",
-        "name": "read",
-        "extra": {
-            "returncode": 0,
-            "output": "task contents",
-            "exception_info": None,
-        },
-    }
-
-    model.query(
+def test_litellm_openai_transport_declares_tool_and_round_trips_history() -> None:
+    requests: list[dict] = []
+    responses = iter(
         [
-            {"role": "user", "content": "task"},
-            message,
-            observation,
+            _response("printf PROTOCOL_ONE", "call-1").model_dump(mode="json"),
+            _response("printf PROTOCOL_TWO", "call-2").model_dump(mode="json"),
         ]
     )
 
-    assert calls[1][0] == [
-        {"role": "user", "content": "task"},
-        {
-            "role": "assistant",
-            "content": "",
-            "reasoning_content": "Inspecting the task.",
-            "tool_calls": message["tool_calls"],
-        },
-        {
-            "role": "tool",
-            "content": "<returncode>0</returncode>\n<output>task contents</output>",
-            "tool_call_id": "call-1-1",
-            "name": "read",
-        },
-    ]
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            length = int(self.headers["Content-Length"])
+            requests.append(json.loads(self.rfile.read(length)))
+            body = json.dumps(next(responses)).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        model = SGLangEndpointModel(
+            base_url=f"http://127.0.0.1:{server.server_port}",
+            api_key="EMPTY",
+            model_id="test-model",
+            model_revision="revision",
+            runtime_revision="runtime",
+            precision="bfloat16",
+            seed=0,
+            max_tokens=512,
+            temperature=0.2,
+            top_p=0.95,
+        )
+        result = run_two_turn_conformance(
+            model=model,
+            provider="sglang_openai",
+            model_identity={"model_id": "test-model"},
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert result["passed"] is True
+    assert requests[0]["tools"][0]["function"]["name"] == "bash"
+    assert requests[1]["messages"][2]["tool_calls"][0]["id"] == "call-1"
+    assert requests[1]["messages"][3]["role"] == "tool"
+    assert requests[1]["messages"][3]["tool_call_id"] == "call-1"
 
 
-def test_sglang_fenced_action_receives_user_observation() -> None:
-    model = _model(
-        lambda messages, sampling: {"text": "```mswea_bash_command\npwd\n```"}
-    )
-    message = model.query([{"role": "user", "content": "task"}])
+def test_endpoint_configuration_uses_litellm_without_serializing_credentials() -> None:
+    model = _model()
 
-    observation = model.format_observation_messages(
-        message,
-        [{"returncode": 0, "output": "/workspace", "exception_info": None}],
-    )[0]
-
-    assert observation["role"] == "user"
-    assert "tool_call_id" not in observation
-    assert "name" not in observation
-
-
-def test_laguna_prompt_declares_tools_and_preserves_native_transcript() -> None:
-    class Tokenizer:
-        def apply_chat_template(self, messages, **kwargs):
-            self.messages = messages
-            self.kwargs = kwargs
-            return "rendered"
-
-    tokenizer = Tokenizer()
-    messages = [
-        {"role": "user", "content": "task"},
-        {
-            "role": "assistant",
-            "content": "",
-            "reasoning_content": "checking",
-            "tool_calls": [
-                {
-                    "type": "function",
-                    "id": "call-1-1",
-                    "function": {
-                        "name": "read",
-                        "arguments": {"path": "instruction.md"},
-                    },
-                }
-            ],
-        },
-        {
-            "role": "tool",
-            "content": "<returncode>0</returncode>\n<output>task</output>",
-            "tool_call_id": "call-1-1",
-            "name": "read",
-        },
-    ]
-
-    assert render_laguna_prompt(tokenizer, messages) == "rendered"
-    assert tokenizer.messages == messages
-    assert tokenizer.kwargs["tokenize"] is False
-    assert tokenizer.kwargs["add_generation_prompt"] is True
-    assert tokenizer.kwargs["enable_thinking"] is True
-    assert {tool["function"]["name"] for tool in tokenizer.kwargs["tools"]} == {
-        "shell",
-        "read",
-        "write",
-        "edit",
-        "list",
+    assert model.config.model_name == "openai/poolside/Laguna-XS-2.1"
+    assert model.config.model_kwargs["api_base"] == "https://example.invalid/v1"
+    assert model.config.model_kwargs["seed"] == 7
+    assert model.config.model_kwargs["extra_body"] == {
+        "chat_template_kwargs": {"enable_thinking": True}
     }
+    serialized = json.dumps(model.serialize())
+    assert "sglang_openai" in serialized
+    assert "secret-key" not in serialized
+    assert "secret-proxy" not in serialized
 
 
-def test_sglang_model_counts_format_failure_as_call() -> None:
-    model = _model(lambda messages, sampling: {"text": "not an action"})
-
-    with pytest.raises(FormatError):
-        model.query([{"role": "user", "content": "task"}])
-
-    assert model.calls == 1
-    assert model.samples[0]["content"] == "not an action"
-
-
-def test_poolside_native_action_is_normalized() -> None:
-    content = (
-        "Inspecting.</think><tool_call>mswea_bash_command"
-        "<arg_key>command</arg_key><arg_value>sed -n '1,80p' instruction.md &amp;&amp; "
-        "python dev_check.py</arg_value></tool_call>"
-    )
-
-    assert parse_sglang_action(content) == {
-        "command": "sed -n '1,80p' instruction.md && python dev_check.py"
-    }
-
-
-@pytest.mark.parametrize(
-    ("tool", "key", "value", "command"),
-    [
-        ("shell", "command", "cat instruction.md", "cat instruction.md"),
-        ("shell", "cmd", "python dev_check.py", "python dev_check.py"),
-        ("read", "path", "instruction.md", "sed -n '1,240p' -- instruction.md"),
-        ("read", "path", "file with spaces", "sed -n '1,240p' -- 'file with spaces'"),
-    ],
-)
-def test_poolside_native_driver_tools_are_normalized(
-    tool: str, key: str, value: str, command: str
+def test_laguna_baseline_summary_validates_authoritative_evidence(
+    tmp_path: Path,
 ) -> None:
-    content = (
-        f"Reasoning.</think><tool_call>{tool}<arg_key>{key}</arg_key>"
-        f"<arg_value>{value}</arg_value></tool_call>"
-    )
-
-    assert parse_sglang_action(content) == {"command": command}
-
-
-def test_poolside_write_requires_content() -> None:
-    content = (
-        "<tool_call>write<arg_key>path</arg_key>"
-        "<arg_value>kernel.py</arg_value></tool_call>"
-    )
-
-    with pytest.raises(G42HarnessError, match="ACTION_ARGUMENTS_INVALID:content"):
-        parse_sglang_action(content)
-
-
-def test_mixed_action_protocol_is_rejected() -> None:
-    content = (
-        "```mswea_bash_command\nls\n```"
-        "<tool_call>mswea_bash_command<arg_key>command</arg_key>"
-        "<arg_value>pwd</arg_value></tool_call>"
-    )
-
-    with pytest.raises(G42HarnessError, match="ACTION_PROTOCOL_MIXED"):
-        parse_sglang_action(content)
-
-
-def test_laguna_baseline_summary_validates_authoritative_evidence(tmp_path) -> None:
     unit_id = "laguna--task--seed-0--turn-3"
     result_dir = tmp_path / "results" / unit_id
     result_dir.mkdir(parents=True)
@@ -360,5 +280,6 @@ def test_laguna_baseline_summary_validates_authoritative_evidence(tmp_path) -> N
     }
     assert result["failure_stages"] == {"artifact_contract": 1}
     assert (
-        json.loads(output_path.read_text())["result_sha256"] == result["result_sha256"]
+        json.loads(output_path.read_text())["result_sha256"]
+        == result["result_sha256"]
     )
