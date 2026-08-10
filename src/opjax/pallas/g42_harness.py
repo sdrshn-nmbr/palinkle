@@ -14,6 +14,7 @@ from typing import Any, Protocol
 
 import tomli
 
+from opjax.pallas.agent_protocol import AgentProtocolError, parse_tinker_action
 from opjax.pallas.environment import verify_static
 from opjax.pallas.task_semantics import operation_specification, render_task_instruction
 
@@ -116,34 +117,11 @@ def _tool_call_value(tool_call: Any) -> dict[str, Any]:
 
 
 def parse_model_action(message: dict[str, Any]) -> dict[str, str]:
-    """Normalize one native TML tool call or one legacy fenced shell action."""
-    text = model_message_text(message)
-    fenced = [match.strip() for match in ACTION_PATTERN.findall(text)]
-    native: list[dict[str, str]] = []
-    for raw in message.get("tool_calls", ()) or ():
-        tool_call = _tool_call_value(raw)
-        function = tool_call.get("function")
-        if not isinstance(function, dict):
-            raise G42HarnessError("ACTION_TOOL_INVALID: function")
-        if function.get("name") != "mswea_bash_command":
-            raise G42HarnessError(
-                f"ACTION_TOOL_INVALID: name={function.get('name')!r}"
-            )
-        arguments = function.get("arguments")
-        if isinstance(arguments, str):
-            try:
-                arguments = json.loads(arguments)
-            except json.JSONDecodeError as exc:
-                raise G42HarnessError("ACTION_ARGUMENTS_INVALID: malformed JSON") from exc
-        if not isinstance(arguments, dict) or not isinstance(arguments.get("command"), str):
-            raise G42HarnessError("ACTION_ARGUMENTS_INVALID: command")
-        native.append({"command": arguments["command"].strip()})
-    observed = len(fenced) + len(native)
-    if observed != 1:
-        raise G42HarnessError(f"ACTION_COUNT_INVALID: expected=1 observed={observed}")
-    action = native[0] if native else {"command": fenced[0]}
-    _require(bool(action["command"]), "ACTION_EMPTY", "command")
-    return action
+    """Normalize one Tinker action through the canonical provider-neutral protocol."""
+    try:
+        return parse_tinker_action(message, model_message_text(message))
+    except AgentProtocolError as exc:
+        raise G42HarnessError(str(exc)) from exc
 
 
 def model_message_text(message: dict[str, Any]) -> str:

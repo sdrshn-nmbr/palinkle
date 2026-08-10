@@ -3,9 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
-import shlex
-from html import unescape
 from pathlib import Path
 from typing import Any, Callable
 
@@ -13,12 +10,12 @@ from minisweagent.agents.default import DefaultAgent
 from minisweagent.environments.docker import DockerEnvironment
 from minisweagent.exceptions import FormatError, Submitted
 
+from opjax.pallas.agent_protocol import AgentProtocolError, parse_poolside_action
 from opjax.pallas.g42_harness import (
     AGENT_IMAGE,
     G42HarnessError,
     create_agent_workspace,
     load_task_package,
-    parse_action,
     snapshot_workspace,
     validate_horizon_contract,
 )
@@ -41,37 +38,12 @@ Start by reading instruction.md, PALLAS_API.md, kernel.py, and dev_check.py.
 """
 
 GenerationFunction = Callable[[list[dict[str, str]], dict[str, Any]], dict[str, Any]]
-POOLSIDE_ACTION_PATTERN = re.compile(
-    r"<tool_call>\s*([^<\s]+)\s*"
-    r"<arg_key>\s*([^<]+?)\s*</arg_key>\s*"
-    r"<arg_value>(.*?)</arg_value>\s*</tool_call>",
-    re.DOTALL,
-)
-
-
 def parse_sglang_action(content: str) -> dict[str, str]:
-    """Normalize exactly one fenced or Poolside-native shell action."""
-    fenced_error: G42HarnessError | None = None
+    """Normalize one Poolside action through the canonical provider-neutral protocol."""
     try:
-        fenced = parse_action(content)
-    except G42HarnessError as exc:
-        fenced_error = exc
-    else:
-        if POOLSIDE_ACTION_PATTERN.search(content):
-            raise G42HarnessError("ACTION_PROTOCOL_MIXED")
-        return fenced
-    native_actions = POOLSIDE_ACTION_PATTERN.findall(content)
-    if len(native_actions) != 1:
-        raise fenced_error
-    tool, key, raw_value = native_actions[0]
-    value = unescape(raw_value).strip()
-    if not value:
-        raise G42HarnessError("ACTION_EMPTY: command")
-    if tool in {"mswea_bash_command", "shell"} and key in {"command", "cmd"}:
-        return {"command": value}
-    if tool == "read" and key == "path":
-        return {"command": f"cat -- {shlex.quote(value)}"}
-    raise G42HarnessError(f"ACTION_NATIVE_TOOL_UNSUPPORTED:{tool}:{key}")
+        return parse_poolside_action(content)
+    except AgentProtocolError as exc:
+        raise G42HarnessError(str(exc)) from exc
 
 
 class SGLangMiniSWEModel:
