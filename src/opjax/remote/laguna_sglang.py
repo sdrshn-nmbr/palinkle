@@ -49,6 +49,7 @@ image = (
     scaledown_window=300,
     max_containers=1,
 )
+@modal.concurrent(max_inputs=4, target_inputs=2)
 class LagunaEngine:
     @modal.enter()
     def load(self) -> None:

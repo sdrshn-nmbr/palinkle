@@ -18,6 +18,28 @@ from opjax.pallas.phase3_baseline import (
 )
 
 
+PROVIDER_RUNTIME_FILES = (
+    "pyproject.toml",
+    "uv.lock",
+    "src/opjax/pallas/g42_agent.py",
+    "src/opjax/pallas/jaxbench_agent.py",
+    "src/opjax/pallas/phase31_experiment.py",
+    "src/opjax/pallas/phase31_grading.py",
+    "src/opjax/pallas/phase31_sampling.py",
+    "src/opjax/pallas/phase3_grading.py",
+    "src/opjax/pallas/phase3_results.py",
+    "src/opjax/pallas/phase3_sampling.py",
+    "src/opjax/pallas/sglang_agent.py",
+    "src/opjax/remote/laguna_baseline.py",
+    "src/opjax/remote/laguna_sglang.py",
+)
+
+
+def provider_runtime_hashes() -> dict[str, str]:
+    repo_root = Path(__file__).parents[3]
+    return {path: file_sha256(repo_root / path) for path in PROVIDER_RUNTIME_FILES}
+
+
 @dataclass(frozen=True)
 class Phase31Contract:
     release_root: Path
@@ -113,6 +135,7 @@ def build_experiment(*, contract: Phase31Contract, release: dict[str, Any]) -> d
             "agent_image": release["agent_environment"]["image"],
             "agent_image_id": release["agent_environment"]["image_id"],
             "bound_source_sha256": release["bound_source_sha256"],
+            "provider_runtime_sha256": provider_runtime_hashes(),
             "action_protocol": release["action_protocol"],
         },
         "counts": {
@@ -147,6 +170,8 @@ def validate_experiment(*, value: dict[str, Any], contract: Phase31Contract) -> 
         or value.get("benchmark_release_sha256") != contract.release_sha256
         or value.get("oracle_validity_sha256") != contract.validity_sha256
         or value.get("positive_control_calibration_sha256") != contract.calibration_sha256
+        or value.get("harness", {}).get("provider_runtime_sha256")
+        != provider_runtime_hashes()
         or observed_cells != expected_cells
         or value.get("counts", {}).get("trajectories") != len(expected_cells)
     ):

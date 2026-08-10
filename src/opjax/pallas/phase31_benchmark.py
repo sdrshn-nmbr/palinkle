@@ -28,26 +28,18 @@ class Phase31BenchmarkError(RuntimeError):
 
 
 BOUND_SOURCES = (
+    "benchmarking.py",
     "agent_protocol.py",
-    "g42_agent.py",
-    "jaxbench_agent.py",
     "jaxbench_executable.py",
     "jaxbench_verifier.py",
     "jaxbench_worker.py",
     "phase31_benchmark.py",
-    "phase31_experiment.py",
     "phase31_controls.py",
-    "phase31_grading.py",
     "phase31_oracle.py",
     "phase31_public.py",
-    "phase31_sampling.py",
     "phase31_validity.py",
     "phase31_verifier.py",
     "phase31_worker.py",
-    "phase3_sampling.py",
-    "phase3_grading.py",
-    "phase3_results.py",
-    "sglang_agent.py",
 )
 
 
