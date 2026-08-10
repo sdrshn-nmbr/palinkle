@@ -9,7 +9,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from opjax.pallas.agent_protocol import SHELL_TOOLS
 from opjax.pallas.g42_harness import canonical_sha256, file_sha256
 from opjax.pallas.jaxbench_capability import (
     _contamination_signatures,
@@ -29,7 +28,6 @@ class Phase31BenchmarkError(RuntimeError):
 
 BOUND_SOURCES = (
     "benchmarking.py",
-    "agent_protocol.py",
     "jaxbench_executable.py",
     "jaxbench_verifier.py",
     "jaxbench_worker.py",
@@ -140,10 +138,6 @@ def build_release(
         "jaxbench_revision": source_manifest["jaxbench_revision"],
         "shape_policy": "original_unmodified",
         "task_count": len(task_records),
-        "action_protocol": {
-            "native_tools": sorted(SHELL_TOOLS | {"read", "write", "edit", "list", "ls"}),
-            "source_sha256": file_sha256(root / "agent_protocol.py"),
-        },
         "agent_environment": {
             "image": agent_image,
             "image_id": agent_image_id,
@@ -186,11 +180,6 @@ def validate_release(*, root: Path, source_release: Path) -> dict[str, Any]:
         or manifest.get("shape_policy") != "original_unmodified"
         or manifest.get("bound_source_sha256")
         != {name: file_sha256(source_root / name) for name in BOUND_SOURCES}
-        or manifest.get("action_protocol")
-        != {
-            "native_tools": sorted(SHELL_TOOLS | {"read", "write", "edit", "list", "ls"}),
-            "source_sha256": file_sha256(source_root / "agent_protocol.py"),
-        }
         or manifest.get("positive_control_source_sha256")
         != {
             task_id: file_sha256(control_root / f"{task_id}.py")

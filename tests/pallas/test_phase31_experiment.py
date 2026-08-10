@@ -30,7 +30,6 @@ def test_experiment_binds_provider_runtime_files() -> None:
         release={
             "agent_environment": {"image": "image", "image_id": "image-id"},
             "bound_source_sha256": {"verifier": "hash"},
-            "action_protocol": {"source_sha256": "protocol"},
         },
     )
     validate_experiment(value=experiment, contract=contract)

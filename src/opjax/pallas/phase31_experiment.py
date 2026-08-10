@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from opjax.pallas.agent_protocol import SHELL_TOOLS
 from opjax.pallas.g42_harness import G42HarnessError, canonical_sha256, file_sha256
 from opjax.pallas.phase3_baseline import (
     INKLING_HF_REVISION,
@@ -22,6 +23,7 @@ PROVIDER_RUNTIME_FILES = (
     "pyproject.toml",
     "uv.lock",
     "src/opjax/pallas/g42_agent.py",
+    "src/opjax/pallas/agent_protocol.py",
     "src/opjax/pallas/jaxbench_agent.py",
     "src/opjax/pallas/phase31_experiment.py",
     "src/opjax/pallas/phase31_grading.py",
@@ -136,7 +138,14 @@ def build_experiment(*, contract: Phase31Contract, release: dict[str, Any]) -> d
             "agent_image_id": release["agent_environment"]["image_id"],
             "bound_source_sha256": release["bound_source_sha256"],
             "provider_runtime_sha256": provider_runtime_hashes(),
-            "action_protocol": release["action_protocol"],
+            "action_protocol": {
+                "native_tools": sorted(
+                    SHELL_TOOLS | {"read", "write", "edit", "list", "ls"}
+                ),
+                "source_sha256": provider_runtime_hashes()[
+                    "src/opjax/pallas/agent_protocol.py"
+                ],
+            },
         },
         "counts": {
             "models": len(models),

@@ -36,13 +36,6 @@ def test_phase31_release_preserves_all_tasks_and_binds_new_public_contract(
     assert manifest["source_release_sha256"] == json.loads(
         (SOURCE_RELEASE / "manifest.json").read_text()
     )["release_sha256"]
-    assert set(manifest["action_protocol"]["native_tools"]) >= {
-        "bash",
-        "shell",
-        "read",
-        "write",
-        "edit",
-    }
     assert validate_release(root=release, source_release=SOURCE_RELEASE)["task_count"] == 50
     task = json.loads((release / "tasks/8p_GEMM/tests/task.json").read_text())
     assert task["oracle_contract"]["input_cases"] == [
