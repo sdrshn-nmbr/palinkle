@@ -59,6 +59,7 @@ def write_config(
     accumulation_steps: int = 32,
     moe_backend: str = "flashinfer_trtllm_routed",
     attention_backend: str = "fa4",
+    server_mem_fraction: float = 0.60,
 ) -> Path:
     student_path = Path("/artifacts/students") / student
     config = f"""
@@ -72,7 +73,7 @@ model:
   embedding_key: model.llm.embed.weight
   lm_head_key: model.llm.unembed.weight
   sglang_attention_backend: {attention_backend}
-  sglang_mem_fraction_static: 0.60
+  sglang_mem_fraction_static: {server_mem_fraction}
   sglang_disable_radix_cache: false
   sglang_context_length: 4096
   sglang_moe_runner_backend: {moe_backend}
@@ -137,6 +138,7 @@ def launch_rank(
     accumulation_steps: int,
     server_backend_args: str,
     attention_backend: str,
+    server_mem_fraction: float = 0.60,
 ) -> subprocess.Popen:
     environment = os.environ.copy()
     environment.update(
@@ -152,7 +154,7 @@ def launch_rank(
             "TARGET_MODEL_PATH": TARGET_MODEL,
             "SERVER_GPUS": server_gpus,
             "SERVER_TP": str(server_tp),
-            "SERVER_MEM_FRACTION": "0.60",
+            "SERVER_MEM_FRACTION": str(server_mem_fraction),
             "CAPTURE_LAYER_IDS": "6 23 39",
             "TRAINER_GPUS": trainer_gpus,
             "TRAINER_NPROC": str(trainer_nproc),
@@ -249,6 +251,7 @@ def run_training(
     moe_backend: str,
     server_backend_args: str,
     attention_backend: str = "fa4",
+    server_mem_fraction: float = 0.60,
 ) -> dict[str, object]:
     if student not in {"dspark-500m", "dspark-250m"}:
         raise ValueError(f"unknown student: {student}")
@@ -267,6 +270,7 @@ def run_training(
         accumulation_steps=accumulation_steps,
         moe_backend=moe_backend,
         attention_backend=attention_backend,
+        server_mem_fraction=server_mem_fraction,
     )
     rank0 = launch_rank(
         rank=0,
@@ -279,6 +283,7 @@ def run_training(
         accumulation_steps=accumulation_steps,
         server_backend_args=server_backend_args,
         attention_backend=attention_backend,
+        server_mem_fraction=server_mem_fraction,
     )
     rank1 = None
     try:
@@ -294,6 +299,7 @@ def run_training(
             accumulation_steps=accumulation_steps,
             server_backend_args=server_backend_args,
             attention_backend=attention_backend,
+            server_mem_fraction=server_mem_fraction,
         )
         processes = [rank0, rank1]
         while any(process.poll() is None for process in processes):
@@ -380,6 +386,7 @@ def train_h200(student: str, max_steps: int = 1) -> dict[str, object]:
         server_backend_args=(
             " --fp4-gemm-backend marlin --moe-runner-backend marlin"
         ),
+        server_mem_fraction=0.70,
     )
 
 
@@ -518,4 +525,3 @@ def train_canary_l40s(student: str, max_steps: int = 1) -> dict[str, object]:
         ),
         attention_backend="flashinfer",
     )
-
