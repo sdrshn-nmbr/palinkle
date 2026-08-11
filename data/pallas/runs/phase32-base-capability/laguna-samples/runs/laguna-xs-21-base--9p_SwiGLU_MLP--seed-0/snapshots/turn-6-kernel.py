@@ -1,0 +1,100 @@
+import jax
+import jax.numpy as jnp
+import pallas as pl
+import pallas.lib as pllib
+import pytpu
+
+def _swiglu_mlp_kernel(ref_arr, gate_kernel_ref, up_kernel_ref, down_kernel_ref):
+    """Pallas kernel for SwiGLU MLP operation."""
+    # Get program indices
+    batch_idx = pl.program_id(0)
+    seq_idx = pl.program_id(1)
+    
+    # Get the slice of inputs for this block
+    x_block = ref_arr[batch_idx, seq_idx, :]  # shape [8192]
+    
+    # Compute x @ gate_kernel -> [28672]
+    # We need to do a matmul: x_block (8192,) @ gate_kernel_ref (8192, 28672)
+    # Result is [28672]
+    
+    # For simplicity, let's compute the full matmuls
+    # x @ gate_kernel -> [2, 4096, 28672]
+    # x @ up_kernel -> [2, 4096, 28672]
+    # (gate * up) @ down_kernel -> [2, 4096, 8192]
+    
+    # Actually, let's think about this differently
+    # We need to tile the computation properly for TPU
+    
+    # Let's just do the computation for one element at a time
+    # and let Pallas handle the tiling
+    
+    pass
+
+def workload(x, gate_kernel, up_kernel, down_kernel):
+    """SwiGLU MLP workload for TPU Pallas."""
+    
+    # Define block sizes for TPU (multiples of 8 for bf16, 128 for vectors)
+    BLOCK_BATCH = 1
+    BLOCK_SEQ = 128
+    BLOCK_EMB = 128
+    BLOCK_GATE = 128
+    
+    def kernel(ref_arr, gate_kernel_ref, up_kernel_ref, down_kernel_ref):
+        # Get program indices
+        b = pl.program_id(0)
+        s = pl.program_id(1)
+        
+        # Extract x block: [BLOCK_SEQ, BLOCK_EMB]
+        x_block = ref_arr[b, s, :]  # shape [BLOCK_SEQ * BLOCK_EMB]
+        
+        # Reshape for computation
+        x_reshaped = x_block.reshape(BLOCK_SEQ, BLOCK_EMB)
+        
+        # Compute x @ gate_kernel -> [BLOCK_SEQ, 28672]
+        # We need to do matmul along the embedding dimension
+        # x_reshaped: [BLOCK_SEQ, BLOCK_EMB]
+        # gate_kernel_ref: [BLOCK_EMB, mlp_dim]
+        
+        # For each position in the block, compute the matmuls
+        # This is getting complex, let me simplify
+        
+        # Actually, let's just use a simpler approach
+        # Compute the full intermediate results
+        
+        # x @ gate_kernel
+        gate_out = jnp.dot(x_reshaped, gate_kernel_ref)
+        # Apply SiLU
+        gate_silu = jax.nn.silu(gate_out)
+        
+        # x @ up_kernel
+        up_out = jnp.dot(x_reshaped, up_kernel_ref)
+        
+        # gate * up
+        fused = gate_silu * up_out
+        
+        # (gate * up) @ down_kernel
+        result = jnp.dot(fused, down_kernel_ref)
+        
+        # Write result back
+        ref_arr[b, s, :] = result.reshape(-)
+    
+    # Grid dimensions based on input/output shapes
+    # x: [2, 4096, 8192], output: [2, 4096, 8192]
+    # We tile along batch and sequence dimensions
+    grid = (x.shape[0], x.shape[1] // BLOCK_SEQ)
+    
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((x.shape[0], x.shape[1], x.shape[2]), x.dtype),
+        grid=grid,
+        in_specs=(
+            pl.BlockSpec((BLOCK_SEQ, BLOCK_EMB), lambda i: (i,)),
+            pl.BlockSpec((8192, 28672), lambda i: (0,)),
+            pl.BlockSpec((8192, 28672), lambda i: (0,)),
+            pl.BlockSpec((28672, 8192), lambda i: (0,)),
+        ),
+        out_specs=pl.BlockSpec((BLOCK_SEQ, BLOCK_EMB), lambda b, s: (b, s * BLOCK_SEQ, 0)),
+        compiler_params=pytpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel")
+        ),
+    )(x, gate_kernel, up_kernel, down_kernel)

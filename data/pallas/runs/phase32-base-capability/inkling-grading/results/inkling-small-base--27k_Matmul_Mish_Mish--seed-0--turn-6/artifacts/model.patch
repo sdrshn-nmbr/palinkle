@@ -1,0 +1,76 @@
+diff --git a/__pycache__/kernel.cpython-312.pyc b/__pycache__/kernel.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..a9697186e224a7869682dc8a132729f15dc2d71e
+GIT binary patch
+literal 2795
+zcmb_ePe>eB7=JUfvorh0b=A0QP14muZMPLuH8d8)HnC7hMOr*{FEY-|>W;I!lbJEA
+z%Sb%rprsH41q}p}g@B4V=qcuwo_oo%1?5#CrM=`PHK(5Xz4^B`F|{OpFz@@`d*A!M
+z-+cdOer{+8BN(bwR(=a0^gCI2gLavtE5NKE2}zWSG7hEkbcUfEK9FZKtj*JEFwbRp
+zn`hKeKAedFAGnD!(K#y3J|_xC(-aPBf~pDzaEz(Vh>UB9kSIK4eY8W_MyZ=<o}rNm
+zD`zMkEN=s-#h9$ORDvE?rxsH9`pV;A*M50#?a)nE|H*eG`W+CHm@-JcMj}v`$kNAf
+zlQ(;5NURjRi9Cy^$Z`_@pJhW*xGtMzPSG5ZqIGGr(F3W(J+4lrhKI3DHx>^YH(g&_
+z$f7KI(~aX8O2<b<$R>Xfu@-oa-UYX<fa4^JI7#t?>PsTi53h1ugDc>fo)1{mTkBv=
+zKk-gXnt;W6p_va_^jq8Gtf0k};Y~nW@R;orQq%MkQ#m1R6hB0Dzga=gHy$lRNzC&W
+z|G!(}JqsSSErqPmDe*iZojeT|BT<9!GIJ<RkM^WPI4BtAoF-#NDQK9>szt%<@578#
+zG;zQb3R7?(%woDwz`Rk+nwmOeV1B}u>-{tx#_a64E@v@Ya>#^DxZ;dyGtBIG7BeL>
+z38ILZ3E<d#&Y0?TNS{Ic-{FtH&Ri%J^=U&BMESzBtQTapN1MYzhb^~}Lx3pt45~#@
+zP>rD;=Y&Mocns45dKPP09$r#*W2tH^^?+H6R3f!l_ad|Rn*IG))2+#+$z^f1zZOd^
+zGOxei1bTBI5O4WWT$#E(b=SCe{m%7!H}2e6H)^T=TH<0gesPg~7H_@F+~e=?4_ej|
+zmBd=AlG<vmbzZ8q4OHU;i|k(V+=_MEdN8~;QW>cwdl$K7=KJUofJZv1$>$4XA{Cpa
+z_49;B9SDhjxxx<N?J_5kcFLTjhD2v+=n2fIea%+3fi`GN<uIif<Wfh6-VOxwgQ}39
+zkc6Rf`>QVX&d!3QL8@W_ZC&1Bw!hl>c6(4i2O9t^1;jS<4`8Iuj{%b?=pHnI<^dxh
+z9CV$8dk?1L!1VWF<KHk5>prHfYdihhB@YwzDjeTWF}MbPf>vgOp~k>1u9w~n2Z@WF
+zy9;Rj+E)KYX+!ZmLylgB;(I3HK!MIop!kp=aQcVj=9}Rm;V_zDT0lEZJ7bTNPdcB7
+zKYdUgxaz{fye8=IGa#$_M<51&1T9i7FBgnlu`q7Pd7)tDL?g}O5UE{bN`RganACF;
+z=5rvR$)e#N*=(a&%xgJS*2jt3yaAnr)>IsE{x`;<HdURZ4vvozRbP@GGiK^DqKR2Y
+zIV;(HCv*iWd3p?#Vpdb(Ck4lbUDe+>ngf`c#le!Co1B84G?5bw-Ofz%)gq0<&1f%=
+zb<*BAc-(&QCmm(`4$noR!5{i=4J{4r@v;5p*4^f=YIE29Yip%SX^VQqZF9BefxTFx
+z-3o*yWpx<3$Ni?YWF@)YRB2x~s-1mL8~Xo<#%_%)jjW!nc70xpezAY@GEwaus6{_J
+z<O0p%7h%-Wy3&2Sd$nBs_-d{B>;1O#yKUXow(h5wzx$;v^P&}y9VQURFD91H93>;s
+z<ROZ%NhfR#juS)BgL?`yd1!^KO?1-mFh{mkXwM9p;$$VyYO+q^Y6_}Oa!&6hlF66P
+zdYnM%#EJSPG7+~q$wz9;YZLjRG^5Hx`Y`NK@EGKG;*g;z>Q@v#K*<BtdVtag=#!&B
+IJLQ1>8)Kz0X8-^I
+
+literal 0
+HcmV?d00001
+
+diff --git a/kernel.py b/kernel.py
+index a877f2f..54b95ae 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,33 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.lax as lax
++from jax.experimental import pallas as pl
++from jax.experimental.pallas import tpu as pltpu
++
++def workload(x, weight, bias):
++    def kernel(x_ref, w_ref, b_ref, out_ref):
++        # Matmul in float32
++        x_f = x_ref[...].astype(jnp.float32)
++        w_f = w_ref[...].astype(jnp.float32)
++        acc = jnp.dot(x_f, w_f)
++        # Add bias
++        b_f = b_ref[...].astype(jnp.float32)
++        acc = acc + b_f
++        # Mish 1: x * tanh(softplus(x))
++        mish1 = acc * jnp.tanh(jax.nn.softplus(acc))
++        # Mish 2
++        mish2 = mish1 * jnp.tanh(jax.nn.softplus(mish1))
++        out_ref[...] = mish2.astype(jnp.bfloat16)
++
++    return pl.pallas_call(
++        kernel,
++        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
++        grid=(x.shape[0] // 128, x.shape[1] // 128),
++        in_specs=(
++            pl.BlockSpec((128, 8192), lambda i, j: (i * 128, 0)),
++            pl.BlockSpec((8192, 128), lambda i, j: (0, j * 128)),
++            pl.BlockSpec((128,), lambda i, j: (j * 128,)),
++        ),
++        out_specs=pl.BlockSpec((128, 128), lambda i, j: (i * 128, j * 128)),
++        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel")),
++    )(x, weight, bias)

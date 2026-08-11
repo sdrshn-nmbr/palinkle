@@ -1,0 +1,117 @@
+diff --git a/__pycache__/kernel.cpython-312.pyc b/__pycache__/kernel.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..e13d96ee4190e55f00c36110ac2bedd4f33a387f
+GIT binary patch
+literal 2512
+zcmd5-O>7fK6rT0|+0L$i<JdF_kPuY4iGnDopa?~xv_h5IP!v=NtCHDx7h`AFc6J?N
+zM`MWthjoRN<P`T*BUOSb9KxYedus2!U?ozbDF`IEa7&vUs`k=1>vb>`sCw&@J@d_b
+zZ{ECl@7vv9WZ92E?rV$rzq|-NrHhVuT(Eluz$#La%IGN7o*BcFVwpDP3_is>*rOvu
+zNC~c9G`txPgA8BF?`nEF8b>dsWYDuWQ7TYnlH7B8+*Fbwf~geLqLC4(!W9W-7XG`p
+z7$+CzCaMW#z-`HQa_uN!Ry`Qyxh{nZ*IeJ4=s{(%W6#6wUllB1QDw{fdE}j1z3lb>
+zv|bhdB`>*ii+rGiUd$?Yk6&|Zdrw$%?~f5?um`i4!+b|KjgsP2X1|CKf;vaxzuOCC
+zUPTy4a{!h#5i>6GVvmb_n01jKb1v$^yo;o_w-<}p`?mIC-y%I%#&UkYfuL~ZOUSMk
+zs0CF|Eu^xwFnIYowih!F;1CYt&?0!RQTl<@B3*gCh7dTSaw-pH>-a~z{3(rJk$?F2
+z;s}l|LgcP}uW1tQ#bJ8GPNNokAh#Hfz2P3gecFQ$_Al}X;U1?#v95DMuOtUc98<-Y
+z?$d|+UUvp~i8!E&Ywjag13xS|C&Y0a3o3I4qE%7SJ2jp|P|)me*Phzn|M6_{IV{kn
+zq=#@yC1(-utfrOJoMAnu6ioUEn=h0Is}{?IxkPyDno`n;XliZ18Jbcc>~+N?oHb{b
+z32WpE$pqmmX;ZsO{0mwxd#&u?pq?veikY6tDVC#<vxRh*y$6>2Ht#+Xi}UUM5c0aB
+z6J~*U^cmvG!knEU4E(BunIg<N!kj0pR<ek{3h|x%R5J*dFlk+hP)!$#ra|~>8ghi!
+zoMz4IWh();!*7s3dyg#?%~`9YWVB<mnpx2F@lurtZMc}AM!l%0<7f0@M$xUw@wSC>
+z*&2oV-9S%5vE|H)-{!ZazGbU^!DhDQfyQ)89<n{#@;i+aE%^{diAJ;~4+4^Um#6EW
+z+00%5$)Tn5_4CUgH;#XE;_DL|(xK*XOB%769RY>HOAGadI%hNX@ogyxQ3Da11w&ta
+z_43N)#$0o#dGYSh?JqWBW43<}Hbj>y^-9BkH@tpnGdN*$4+G()Y(2Z2Z_cfs+zgy{
+zc1H&r<yPd#x7MA??aDg4p1JSacz2=|p0EXo9Z9SnTshcen#VW7M_o;0c%{E#w!%ZU
+z0H=g|SH%^vAv7<p_ilzhuzA=O?pu{t<c87=H_tZbHbO~98;Li<D+g@hNqo>2m)WnR
+zU8osKawe@^4jrZgw9Q$5hv2j1Eh(m=>zWQY3jEXxR<2k`TbiL1%DIe{<cW_`#pPwz
+z%&Eki1Ba59v0Re_gPEdH%ITV!rV$M*=>>`_6%v}J)c&YkEoswbb3Rihyh<0uQ_@LK
+z3C;%ILYH+S7mDc_==iJ?obV;RT$(3=b8g(vJ7Jj$5!wVNJzeA{zJ1~o(Iq|MDB;cb
+z;PU1%7%cid?6A^I!h(1^Y%@QECAC|3V7P&P_l)xg_pUHd{jJbQD>U-p=&2vVKgEBH
+zZ-ma?_+*C*NW!i6mnQ3z+up!-q<>ouK9d4l(m+cZc=%tyjx0v}dm$8!ZAFG#k>Q7l
+z!L7ttD>3%-;AY~&UO$|(Gk`>|-M8G|$lZ;vkL(Txq|-Ynz@IipA=hNkJP8x=LA}Qd
+z^9DRiyfc~fO-@9r)}a+F3?_YnlQ>mrm6B%Cj+Yg9{+vb-sar{ew$?mF_w>JE&p7Q8
+z3xhcUZcY`=F^XtvZjH|vMRi`+Ce2SlM_+)}5g2w@hGBk1{zoYO2*n<uzQ<_f0UCLX
+PMmNytE_aq;+V}e#FlRt#
+
+literal 0
+HcmV?d00001
+
+diff --git a/kernel.py b/kernel.py
+index a877f2f..c9ee84f 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,73 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.lax as lax
++from jax import random
++import jax.experimental.pallas as pl
++import jax.experimental.pallas.tpu as pltpu
++
++def workload(x, weight, linear_bias, gn_weight, gn_bias, bias):
++    def kernel(x_ref, weight_ref, linear_bias_ref, gn_weight_ref, gn_bias_ref, bias_ref, out_ref):
++        # Load inputs
++        x_val = x_ref[...]
++        w = weight_ref[...]
++        lb = linear_bias_ref[...]
++        gw = gn_weight_ref[...]
++        gb = gn_bias_ref[...]
++        b = bias_ref[...]
++        
++        # Matmul + linear bias
++        # x: (4096, 8192), w: (8192, 8192) -> x @ w.T = (4096, 8192)
++        # Actually weight is (8192, 8192), and we need x @ weight.T
++        # But in JAX, jnp.dot(x, weight.T) or x @ weight.T
++        # Since weight is square, weight.T = weight, but let's be precise
++        y = jnp.dot(x_val, w.T) + lb
++        
++        # GroupNorm
++        N, C = y.shape
++        G = 512
++        eps = 1e-5
++        
++        # Reshape to (N, G, C//G)
++        y_reshaped = y.reshape(N, G, C // G)
++        
++        # Mean and var over axis=2
++        mean = jnp.mean(y_reshaped, axis=2, keepdims=True)
++        var = jnp.var(y_reshaped, axis=2, keepdims=True)
++        
++        # Normalize
++        y_norm = (y_reshaped - mean) / jnp.sqrt(var + eps)
++        
++        # Reshape back
++        y_norm = y_norm.reshape(N, C)
++        
++        # Scale and shift
++        y_norm = y_norm * gw + gb
++        
++        # Min over axis=1 keepdims=True
++        y_min = jnp.min(y_norm, axis=1, keepdims=True)
++        
++        # Reshape to (1, 1, N, 1)
++        y_min = y_min.reshape(1, 1, N, 1)
++        
++        # Add bias (broadcasts to (1, 8192, 4096, 1))
++        result = y_min + b
++        
++        out_ref[...] = result
++    
++    out_shape = jax.ShapeDtypeStruct((1, 8192, 4096, 1), x.dtype)
++    
++    return pl.pallas_call(
++        kernel,
++        out_shape=out_shape,
++        grid=(),
++        in_specs=(
++            pl.no_block_spec,
++            pl.no_block_spec,
++            pl.no_block_spec,
++            pl.no_block_spec,
++            pl.no_block_spec,
++            pl.no_block_spec,
++        ),
++        out_specs=pl.no_block_spec,
++        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
++    )(x, weight, linear_bias, gn_weight, gn_bias, bias)

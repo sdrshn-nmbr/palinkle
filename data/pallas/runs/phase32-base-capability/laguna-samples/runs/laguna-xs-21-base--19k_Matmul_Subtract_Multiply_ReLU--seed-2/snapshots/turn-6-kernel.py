@@ -1,0 +1,170 @@
+import jax
+import jax.numpy as jnp
+import pallas as pl
+import pl as pallas_lib
+import jax.pallas as pl_module
+from jax import pallas as pl
+from jax.pallas import BlockSpec
+import jax.dtypes as jax_dtypes
+
+# Try to import TPU-specific modules
+try:
+    import jax.pallas.tpu as pltpu
+except ImportError:
+    pltpu = None
+
+def workload(x: jax.Array, weight: jax.Array, bias: jax.Array):
+    """
+    TPU Pallas kernel for Matmul + Subtract + Multiply + ReLU.
+    
+    Operations:
+    1. y = x @ weight + bias
+    2. y = y - 2.0
+    3. y = y * 1.5
+    4. y = relu(y)
+    """
+    
+    # Define block size for TPU (must be multiple of 8 for bf16)
+    BLOCK_SIZE = 128
+    
+    # Grid dimensions
+    M = x.shape[0]  # 4096
+    N = weight.shape[1]  # 8192
+    
+    def kernel(matmul_out, x_ref, weight_ref, bias_ref):
+        # matmul_out is the accumulator in float32
+        # Compute: matmul_out = x @ weight + bias
+        # Then: matmul_out = (matmul_out - 2.0) * 1.5
+        # Finally: apply relu
+        
+        # Get the indices for this block
+        i = pl.program_id(0)  # row block index
+        j = pl.program_id(1)  # col block index
+        
+        # Compute the starting positions
+        row_start = i * BLOCK_SIZE
+        col_start = j * BLOCK_SIZE
+        
+        # Compute the actual ranges (handle boundaries)
+        row_end = min(row_start + BLOCK_SIZE, M)
+        col_end = min(col_start + BLOCK_SIZE, N)
+        
+        # For each element in the output block
+        for mi in range(row_end - row_start):
+            for mj in range(col_end - col_start):
+                # Compute the output element
+                # y = x[row_start + mi, :] @ weight[:, col_start + mj] + bias[col_start + mj]
+                # But we need to do the full matmul first
+                
+                # Accumulate the matmul result
+                acc = 0.0
+                for k in range(x.shape[1]):
+                    acc += x[row_start + mi, k] * weight[k, col_start + mj]
+                
+                # Add bias
+                acc += bias[col_start + mj]
+                
+                # Subtract 2.0
+                acc = acc - 2.0
+                
+                # Multiply by 1.5
+                acc = acc * 1.5
+                
+                # Apply ReLU
+                acc = max(0.0, acc)
+                
+                # Store the result
+                matmul_out[mi, mj] = acc
+    
+    # Define grid
+    grid = (M // BLOCK_SIZE, N // BLOCK_SIZE)
+    
+    # Define specs for inputs and outputs
+    # x: shape [M, BLOCK_SIZE] for each block along k dimension
+    # weight: shape [BLOCK_SIZE, N] for each block
+    # bias: shape [N]
+    
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((M, N), jnp.float32),
+        grid=grid,
+        in_specs=(
+            # x: we need to read the entire row for each output element
+            # This is tricky - we need to handle the matmul differently
+            # Let's use a simpler approach with explicit matmul
+        ),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel")
+        ) if pltpu else None,
+    )(x, weight, bias)
+
+# Let me rewrite with a cleaner approach
+def workload(x: jax.Array, weight: jax.Array, bias: jax.Array):
+    """
+    TPU Pallas kernel for Matmul + Subtract + Multiply + ReLU.
+    """
+    
+    BLOCK_SIZE_M = 128
+    BLOCK_SIZE_N = 128
+    BLOCK_SIZE_K = 8  # For vectorized operations on TPU
+    
+    M = x.shape[0]  # 4096
+    K = x.shape[1]  # 8192
+    N = weight.shape[1]  # 8192
+    
+    def matmul_kernel(ref_out, ref_x, ref_weight, ref_bias):
+        # Compute matmul: out = x @ weight + bias
+        # Then: out = (out - 2.0) * 1.5
+        # Then: out = relu(out)
+        
+        # Get block indices
+        i = pl.program_id(0)
+        j = pl.program_id(1)
+        
+        # Compute the starting positions
+        row_start = i * BLOCK_SIZE_M
+        col_start = j * BLOCK_SIZE_N
+        
+        # Initialize output to zero (in float32 for accumulation)
+        ref_out[...] = 0.0
+        
+        # Perform the matmul with accumulation
+        # We need to iterate over k dimension
+        for k in range(0, K, BLOCK_SIZE_K):
+            # Load x block and weight block
+            x_block = ref_x[row_start, k:k+BLOCK_SIZE_K]
+            w_block = ref_weight[k:k+BLOCK_SIZE_K, col_start:col_start+BLOCK_SIZE_N]
+            
+            # Accumulate
+            ref_out[row_start, col_start] += jnp.sum(x_block * w_block)
+        
+        # Add bias
+        ref_out[row_start, col_start] += ref_bias[col_start]
+        
+        # Apply the transformations: subtract, multiply, relu
+        result = ref_out[row_start, col_start]
+        result = result - 2.0
+        result = result * 1.5
+        result = jnp.maximum(0.0, result)
+        
+        ref_out[row_start, col_start] = result
+    
+    # Grid dimensions
+    grid = (M // BLOCK_SIZE_M, N // BLOCK_SIZE_N)
+    
+    # Output spec: float32 for accumulation, then convert to bf16
+    return pl.pallas_call(
+        matmul_kernel,
+        out_shape=jax.ShapeDtypeStruct((M, N), jnp.float32),
+        grid=grid,
+        in_specs=(
+            # x spec: tile along M and K
+            pl.BlockSpec((BLOCK_SIZE_M, BLOCK_SIZE_K), lambda i, j: (i * BLOCK_SIZE_M, j * BLOCK_SIZE_K)),
+            # weight spec: tile along K and N
+            pl.BlockSpec((BLOCK_SIZE_K, BLOCK_SIZE_N), lambda i, j: (i * BLOCK_SIZE_K, j * BLOCK_SIZE_N)),
+            # bias spec: single value per block
+            pl.BlockSpec((BLOCK_SIZE_N,), lambda i, j: (j * BLOCK_SIZE_N,)),
+        ),
+        out_specs=pl.BlockSpec((BLOCK_SIZE_M, BLOCK_SIZE_N), lambda i, j: (i * BLOCK_SIZE_M, j * BLOCK_SIZE_N)),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel")) if pltpu else None,
+    )(x, weight, bias)

@@ -1,0 +1,50 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..167585c 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,43 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++from jax.experimental import pallas as pl
++from jax.experimental.pallas import tpu as pltpu
++
++def workload(q, k, v):
++    H_q = q.shape[0]
++    H_kv = k.shape[0]
++    num_q_per_kv = H_q // H_kv
++    k = jnp.repeat(k, num_q_per_kv, axis=0)
++    v = jnp.repeat(v, num_q_per_kv, axis=0)
++
++    def kernel(q_ref, k_ref, v_ref, out_ref):
++        q = q_ref[...]
++        k = k_ref[...]
++        v = v_ref[...]
++        scores = jnp.dot(q, jnp.swapaxes(k, -1, -2))
++        sq = q.shape[1]
++        sk = k.shape[1]
++        s = pl.program_id(1)
++        q_start = s * sq
++        q_idx = jnp.arange(sq) + q_start
++        k_idx = jnp.arange(sk)
++        mask = k_idx[None, :] <= q_idx[:, None]
++        scores = jnp.where(mask, scores, jnp.array(-1e30, dtype=scores.dtype))
++        attn = jax.nn.softmax(scores, axis=-1)
++        out = jnp.dot(attn, v)
++        out_ref[...] = out
++
++    out_shape = jax.ShapeDtypeStruct(q.shape, q.dtype)
++    grid = (8, 32)
++    return pl.pallas_call(
++        kernel,
++        out_shape=out_shape,
++        grid=grid,
++        in_specs=(
++            pl.BlockSpec((8, 128, 128), lambda h, s: (h * 8, s * 128, 0)),
++            pl.BlockSpec((8, 4096, 128), lambda h, s: (h * 8, 0, 0)),
++            pl.BlockSpec((8, 4096, 128), lambda h, s: (h * 8, 0, 0)),
++        ),
++        out_specs=pl.BlockSpec((8, 128, 128), lambda h, s: (h * 8, s * 128, 0)),
++        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel")),
++    )(q, k, v)

@@ -1,0 +1,77 @@
+diff --git a/__pycache__/kernel.cpython-312.pyc b/__pycache__/kernel.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..0290ec11c9d15c20716ee76b7ea1acacd4633adf
+GIT binary patch
+literal 1481
+zcmah}&1)M+6ra_8XeD`tojN!zEnU(ibg7**A><%Tz;)f)#7Rm^9gs20S~Hba8O<)U
+zt7sEs(4iMy>hu&JeJ##^(o=AuVnU$MlWqn3luP?&SCSP-lZW)a=I!sjH}CEKZdpYH
+zRH;8{eyk((w=~9-8!0EZL3xHS!U{#zOe(EhRaG)wtLku;qo`$6jnt>oe9NpBK-Ydo
+z)#78t(T5W3o}&nrdI<<Cp`J^Un6StXSWO+}k|Ga(X`kFwWZoEfM$K_WV+Y7CRCP4+
+z@2T&JRd8++tHsc7MonX^oyo4+)v$^+tUou7Mv;5^6ux;DJJz~6oS)zuUA=2Ofup^A
+zJPtt3^tLBvsx+-PZE1D$N29Ly%&DB^w?vxQd|sGjEp!V%AgAcvg~wL|_UHz-zp%eu
+z+x$@q8ti&><x%~+AfWa`!Wp4gi#AZoR(L(Cq?&Xk6?=n)?bwzR3b-BoWJe7zB=+{M
+z7uOn#w$I#J!()IEE!qv@*BkMo-SKhU*qMNIQg_9cl?1dM!=&xZ7fk^M?RX064cx3q
+z7t)Qi&KdZw??n~+E8zcwm4&9od{5#wXH)InZ^!RyZn~rl#?gjyB15@qL%E$?YL3R`
+zwsN@)Ty9b3&1JfD2z_g1bK`4A723V^2dhF`f3R_%%QXO3x#Ke&blfQBJ|>aKhaSd0
+ztBX18x3V|GW$o53;Spp?@h5EfFOW0JB#VHTO7jvwa!jE%SttrI_gEAL5#h34F<*lz
+zxOKt^_o$0~>cs?$JSXW~MUF9{)d_72twlWM6orxqBb%1c<Yfyrabsa*lMqJYN<d-B
+zBX@*?g`T+3gFH>Kz=XSuWWRE&GI~9KtrPHvQRvmkwb34ikA*3nH1IJ048mng(J#Py
+z==1_AmG_tWO9#rq@^SI=-s-7=%5(cW{hfnbhs(#-m%VRN&!5)i7uMy0SsIw-!NMnl
+z*@eMJH%?1N*?@p^==_CecYeKds2#SB=Wq7z4rb0h-FY!{vA34NZS}YIxBJ@%=Z~#V
+zQ$TBWf4#r{bnEcSA2UvG?XS{oZ}S8yLQV;;*h@qK*i{%16tAa(&%voMLXT3ouUts8
+zt1rtq`N6AEpRkx~GD;6A>|omKZ-`$47r!X|=5i~*ZAxzQB{1dEMIQqDM^zN%B`Ur`
+T3op?JujKFgiFQeuOCS9Y?bdI^
+
+literal 0
+HcmV?d00001
+
+diff --git a/kernel.py b/kernel.py
+index a877f2f..68a00c3 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,43 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import pallas as pl
++from jax import lax
++from jax.xla_client import xla_extension as pltpu
++
++def workload(x, weight, bias):
++    """Conv2d + GELU + GlobalAvgPool kernel.
++
++    Args:
++        x: Input tensor of shape [batch, in_channels, height, width]
++        weight: Convolution weights of shape [out_channels, in_channels, kernel_h, kernel_w]
++        bias: Bias of shape [out_channels]
++
++    Returns:
++        Output tensor of shape [batch, out_channels]
++    """
++    # Transpose x from NHWC to HWCN format
++    x_t = jnp.transpose(x, (1, 2, 3, 0))  # [in_channels, height, width, batch]
++
++    # Transpose weight from HWIO to IOHW format
++    kernel = jnp.transpose(weight, (2, 3, 1, 0))  # [kernel_h, kernel_w, in_channels, out_channels]
++
++    # Conv2D with VALID padding
++    x_conv = lax.conv_general_dilated(
++        x_t,
++        kernel,
++        window_strides=(1, 1),
++        padding='VALID',
++        dimension_numbers=('NHWC', 'HWIO', 'NHWC')
++    )
++
++    # Add bias (reshaped for broadcasting)
++    bias_reshaped = jnp.reshape(bias, (1, 1, 1, -1))
++    x_add = x_conv + bias_reshaped
++
++    # Apply GELU
++    x_gelu = jnp.nn.gelu(x_add)
++
++    # Global average pooling over spatial dimensions
++    x_out = jnp.mean(x_gelu, axis=(1, 2))
++
++    return x_out

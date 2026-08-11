@@ -1,0 +1,44 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..589c936 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,37 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import pallas as pl
++import pallas_core as pcore
++from pallas_core import lib as plib
++
++def workload(x, weight, bias):
++    """Matmul + Divide + GELU kernel."""
++    # Output shape after matmul: (batch_size, output_size) = (4096, 8192)
++    out_shape = jax.ShapeDtypeStruct((4096, 8192), jnp.bfloat16)
++    
++    # Block size for TPU - use 128 for vectorized dimensions
++    block_size = 128
++    
++    def kernel(matmul_ref, div_ref, out_ref):
++        # Read the matmul result
++        val = matmul_ref[:]
++        # Divide by 10.0
++        val = val / 10.0
++        # Apply GELU
++        val = jax.nn.gelu(val)
++        # Write output
++        out_ref[:] = val.astype(jnp.bfloat16)
++    
++    # Grid dimensions - 4096 / 128 = 32 blocks in batch dimension
++    grid = (32, 64)  # (4096 // 128, 8192 // 128)
++    
++    return pl.pallas_call(
++        kernel,
++        out_shape=out_shape,
++        grid=grid,
++        in_specs=(
++            pl.BlockSpec((block_size, block_size), lambda i, j: (i * block_size, j * block_size)),
++        ),
++        out_specs=pl.BlockSpec((block_size, block_size), lambda i, j: (i * block_size, j * block_size)),
++        compiler_params=plib.CompilerParams(dimension_semantics=("parallel", "parallel")),
++    )(x, weight, bias)

@@ -187,6 +187,9 @@ def build_comparison(
         "experiment_sha256": experiment["experiment_sha256"],
         "benchmark_release_sha256": experiment["benchmark_release_sha256"],
         "orchestration_sha256": {
+            "phase32_adjudication.py": file_sha256(
+                Path(__file__).with_name("phase32_adjudication.py")
+            ),
             "phase32_grading.py": file_sha256(Path(__file__).with_name("phase32_grading.py")),
             "phase32_results.py": file_sha256(Path(__file__)),
         },

@@ -1,0 +1,74 @@
+diff --git a/__pycache__/kernel.cpython-312.pyc b/__pycache__/kernel.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..0107596d9d025c63a1ec4ef692639bc197ff2c6e
+GIT binary patch
+literal 2616
+zcmbVN-D@0G6u<MeUzttQP13ckrm3c})26AhSPX_mOx0T3loFw^6qd=(B-vzkcf2z(
+zA8arWdDv8;EeJ_KFhRkV^g(<O1;IbSmn{3x<=WB*ec88Q3W6_s&V1}{+B6X_>^bM2
+zbMO4l=iOhU(FlR{mo_(XS0v<j-1v+4gzb+&SSA|LID;fz&Sm+ez`3%Rm6DPt2eQF5
+z&yj2>8TK?0U*qVTk}~M|MUsrpa*9wzh@rILAt96Dhx_dW=b&<nWM1Hj4Lf&D_<s2c
+z;03{!{Ov@*m+D;O?U28la3c11F5mFJsR<1@=*d${6E$g(_^0<d8_<IP`D{oF*Uygb
+z=LN4t>Zk8FZFsR4NP#Qx8(ubti6RfBp{TVL2B{T(+dnv|ZE%0LltQ@=!(om0!<`rR
+zxxsligxU>h@3Iucf`lp60{4S{5c6W85vNwRS`?(fdpIE<XAX={-P@(e4c_lo+Hixt
+zxsK*b1#!b`K}7RqpU*)FcI0Ol{Q4JmoZKz<q89OE!?+59#ti`KEK!<<dKHP{ovK5y
+z*i|fY6}<x!_5#Hbpg|;<Kj*k2xU!=_q6qhR$Kn!f4vIt(m^5_Z;`Ko$0sY`A#ZW-m
+zJe|pD`RSBp(~PEDENH5lmdTB=gIXr5=d4UVm&#3LM|5g|8#S1^RQ(5*v-Kiq@UZ5!
+z5@Nzc&SYVmsyWNdTRIaAb%wR2^SMt_V|q@fs*%z%hHC2?3sT)0S52LXwwfD<lld_w
+z=rg7gVA4#A>Z44WcG-x_@($x>7&mQUk~*FBciY+NJe{;mHLahW)M-vPdd*oDaK*V7
+z&}igUt#`o4r&YsB^tu)d()u3A0(mGOxOHXe%F2l~VfEBnzAT?Fa?jB{kh@B9S4EB%
+zKdv0@s<ib~I{Kf4rD&wcZOJ6s{DrXGbf;<M-L+R%FKwQDv)s~OlKYDsTmVbxPUy?l
+zui~rmwS(Ube|vrX`rT_^C)Yd5hhHnV^p)g37xm)O#oO0D`>^i9@s(6rJ_8?VKU9>8
+z>6?*l@EY2s+5)WlHj)k`2_Uo!$UW?(<EZLHRX38CeUb)Y$8ug3?80R-%iZIL`~qW(
+zHuRXYJ%KuhbfSc?EHq%K*%3`m%pG|)*S_sVIB6ls0{QM!+6e-{I6gVvIXzz^d%H+a
+z!fn@yot{ty40}2864-qwuDVWejuU$WDv%S-&BQM8?~95_@=))J4(i@;|3ALYI?|6R
+zH$IVt^HX-p8?-T)eiq8)QkJQwEzg9a5@ft-uqIPA4An}(oER|5FuE<nIHDKqSyLaj
+z=~UXL*mNv3G72+g_nl|qcVMh0hv6fNNU_Q+Fs*0C#%(5!WK@eD^L@f$^%}-+6WR|(
+zeCe#4Ko-cKd{l~WbwuRA=da&NEF~(T=7+KN2eIx_tb6m-w|*Y}<;G7p%CSq8=z%}v
+z=3AGSE^i(_Q#$)zS$_Yazdu##87#{ey!}f1x(u_k6%=EUClS)xzT9)CXY<&((i@k{
+zu`5qn0cxv_1VhC`x7)VcBXWF;M5MTzx@LL~ykcQULod9I@TN!(b2AV`H9T%KhKJ&~
+zgSShk_?+4*JV8z-ncS#k0ar`=@Xpca-08K=DJCG1OaqvcrDumOo7bicJwXTITln{3
+jVWzhPj^lnKkw+x{h_pW@U7MuqF*#i(r?<r;oEzA`xmyg7
+
+literal 0
+HcmV?d00001
+
+diff --git a/kernel.py b/kernel.py
+index a877f2f..465ba9a 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,33 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.lax as lax
++import jax.experimental.pallas as pl
++import jax.experimental.pallas.tpu as pltpu
++
++def workload(x, weight, bias):
++    def kernel(x_ref, w_ref, b_ref, o_ref):
++        x = jnp.transpose(x_ref[...], (0, 2, 3, 4, 1))
++        w = jnp.transpose(w_ref[...], (2, 3, 4, 1, 0))
++        x = lax.conv_general_dilated(
++            x, w,
++            window_strides=(1, 1, 1),
++            padding=((0, 0), (0, 0), (0, 0)),
++            dimension_numbers=("NDHWC", "DHWIO", "NDHWC")
++        )
++        x = x + jnp.reshape(b_ref[...], (1, 1, 1, 1, -1))
++        x = x * jnp.tanh(jnp.log(1 + jnp.exp(x)))
++        x = jnp.tanh(x)
++        x = jnp.transpose(x, (0, 4, 1, 2, 3))
++        o_ref[...] = x
++
++    return pl.pallas_call(
++        kernel,
++        out_shape=jax.ShapeDtypeStruct((16, 64, 30, 62, 62), jnp.bfloat16),
++        grid=(),
++        in_specs=(
++            pl.BlockSpec((16, 32, 32, 64, 64), lambda: (0, 0, 0, 0, 0)),
++            pl.BlockSpec((64, 32, 3, 3, 3), lambda: (0, 0, 0, 0, 0)),
++            pl.BlockSpec((64,), lambda: (0,)),
++        ),
++        out_specs=pl.BlockSpec((16, 64, 30, 62, 62), lambda: (0, 0, 0, 0, 0)),
++    )(x, weight, bias)

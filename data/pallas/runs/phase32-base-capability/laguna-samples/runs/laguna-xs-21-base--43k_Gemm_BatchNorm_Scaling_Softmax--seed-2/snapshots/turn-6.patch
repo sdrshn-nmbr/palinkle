@@ -1,0 +1,94 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..0ce373a 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,87 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import pallas as pl
++import triton.pallas as pltpu
++
++def kernel(
++    x_ref,
++    weight_ref,
++    bias_ref,
++    bn_scale_ref,
++    bn_bias_ref,
++    bn_mean_ref,
++    bn_var_ref,
++    scale_ref,
++    out_ref,
++):
++    # Get block indices
++    m = pl.program_id(0)  # batch dimension (4096 / block_size_m)
++    n = pl.program_id(1)  # output feature dimension (8192 / block_size_n)
++    
++    # Block sizes - use multiples of 128 for vectorized dimensions
++    block_size_m = 128
++    block_size_n = 128
++    block_size_k = 8  # for weight matrix reduction
++    
++    # Initialize accumulator for GEMM result in float32
++    acc = jnp.zeros((block_size_m, block_size_n), dtype=jnp.float32)
++    
++    # GEMM: x @ weight + bias
++    # x_ref has shape [4096, 8192], weight_ref has shape [8192, 8192]
++    for k in range(0, 8192, block_size_k):
++        # Load x block [block_size_m, block_size_k]
++        x_block = x_ref[m * block_size_m : (m + 1) * block_size_m, k : k + block_size_k]
++        # Load weight block [block_size_k, block_size_n]
++        w_block = weight_ref[k : k + block_size_k, n * block_size_n : (n + 1) * block_size_n]
++        # Accumulate
++        acc = acc + jnp.dot(x_block.astype(jnp.float32), w_block.astype(jnp.float32))
++    
++    # Add bias
++    bias_block = bias_ref[n * block_size_n : (n + 1) * block_size_n]
++    acc = acc + bias_block[None, :]
++    
++    # Store intermediate result
++    x_gemm = acc
++    
++    # BatchNorm: (x - bn_mean) / sqrt(bn_var + eps)
++    bn_mean_block = bn_mean_ref[n * block_size_n : (n + 1) * block_size_n]
++    bn_var_block = bn_var_ref[n * block_size_n : (n + 1) * block_size_n]
++    bn_scale_block = bn_scale_ref[n * block_size_n : (n + 1) * block_size_n]
++    bn_bias_block = bn_bias_ref[n * block_size_n : (n + 1) * block_size_n]
++    
++    eps = 1e-5
++    x_normalized = (x_gemm - bn_mean_block[None, :]) / jnp.sqrt(bn_var_block + eps)
++    
++    # Scale: bn_scale * x_normalized + bn_bias
++    x_scaled = bn_scale_block * x_normalized + bn_bias_block
++    
++    # Final scale: scale * x
++    scale_val = scale_ref[0]
++    x_final = scale_val * x_scaled
++    
++    # Store to output
++    out_ref[m * block_size_m : (m + 1) * block_size_m, n * block_size_n : (n + 1) * block_size_n] = x_final.astype(x_ref.dtype)
++
++
++def workload(x, weight, bias, bn_scale, bn_bias, bn_mean, bn_var, scale):
++    # Grid dimensions
++    grid_m = x.shape[0] // 128
++    grid_n = x.shape[1] // 128
++    
++    return pl.pallas_call(
++        kernel,
++        out_shape=jax.ShapeDtypeStruct((4096, 8192), x.dtype),
++        grid=(grid_m, grid_n),
++        in_specs=(
++            pl.BlockSpec((128, 8192), lambda b: (b[0], slice(None))),  # x
++            pl.BlockSpec((8192, 128), lambda b: (slice(None), b[1])),  # weight
++            pl.BlockSpec((8192,), lambda b: b[1]),  # bias
++            pl.BlockSpec((8192,), lambda b: b[1]),  # bn_scale
++            pl.BlockSpec((8192,), lambda b: b[1]),  # bn_bias
++            pl.BlockSpec((8192,), lambda b: b[1]),  # bn_mean
++            pl.BlockSpec((8192,), lambda b: b[1]),  # bn_var
++            pl.BlockSpec((1,), lambda b: (0,)),  # scale
++        ),
++        out_specs=pl.BlockSpec((128, 128), lambda b: (b[0], b[1])),
++        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel")),
++    )(x, weight, bias, bn_scale, bn_bias, bn_mean, bn_var, scale)

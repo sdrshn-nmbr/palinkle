@@ -1,0 +1,86 @@
+diff --git a/__pycache__/kernel.cpython-312.pyc b/__pycache__/kernel.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..0a81c14c17febc9c6ed711703f99e3881c9b1ad3
+GIT binary patch
+literal 2887
+zcmcH*OK2Nc@V%8*tItYt)^S(P2b$W%QEik;DW!+hkj9N64sMAGB~HMswW~zR>XY3S
+zvcx+0kb_+cwog`1wIPrM=g>kS$t{IKp}knBAoJpoLVL;0)S-u-I&VLgiWBGH_JQ8a
+zo0&H=Z+@#^!r>r-MdVuUA&b!O^x!VWLAI{~vW#RTV--!<5a*c*54LfyMPpQyXD3*P
+z=F4+w2BW-xBH&PhF2$mUCU~HGZlj5C700|UsHyQ7CLUFqPJ<&mD+HJae%l+EI$@&R
+z4y%pGxEBsHtjx^#sL~mZK?c2Lt(@1z+R)?-&OPP)F4l%7o56+^8cNIYZH|krIpHx`
+z(^mr=<l7b_u2dVEzSsEfrM_nvnZ1o%orW8Fl<R71aIyc7n_=Jdh76W{9e#GZKIIO%
+zSR2aR1OFOijjjiQHJ^={$iyaNdQ9({ljjtQ1;;h|<QKEBr5!;_oTiQ%*?t6kntnUg
+zIY+G}<7^#ac}2oqM`nB`-nS0UWcIDYZ+iBvBVc;>ts~fx^3KRRQH8SQUezFOsha*8
+zNX~@zZkF7E&P>_38QRH7=nX!E%)p*L1T7!<4j*38HaTIp54oP*G?SN^2Ojr*Z>Y4l
+zcHehjWwJ6p1MDh_dB@`~XvM;S^GefMJ;oECq#M<eLOi)biEtUUC>f`d#3L6Cf<FhU
+zG)<U7fpB{ETE3W-39F~Gr7E0DN;)g4B%l_r>E*mKT_XM|>w4mYSeUTWlbVttzDmM|
+zQx2>oowE(OV%e|=-1Ov>T1?*{9Nfs1Rh4jX#YW(cLvav%o#3h-hKIb}x&A(Ms#4T$
+z=p`wwoVuZC1x1a6t3Dg8MJW^BC&$l#B}vtX<2Hv5RsAp6X3=kgSobWw+Y<U3Lf@Tp
+zcgI%8n!<Z?+=dXXcP|aLg#L!me<yYK%IcM-kofQDFMTN7wJ<tAx;R?@;+xA~UvBaP
+z_XZk#Vh(Te2NurHpI;cCAFn5x{INOQ7CyUJS*|WsoBZ*W(FQ+gv7$#PsU@Clh$mZO
+zvLPnFO*~4hi^-<=QA-?Yh$BCye!BX@)uwo9j$8D6$#28Ukw(8l>CS0J=b$z5=-0=d
+zco_ypBx8@r`{+I<IIGhuZ)@+sPW)$7DL*Ak!?nY^L+$eVKvJh4x>@w-=9A-(Gg?0!
+z{$-h}v@BCGYB__!E*{rTz*!rBt;4DogY#YnDPN}p1q>d4e8@5f_3tl9nxv|V3V64i
+z%_{{xTP#fKN?s}$*|Z*GNq`ooeqDm@@LtoP_WfB9fV$TmmW3Wj7xSg8s%Vo`V_uJi
+zphv7rOi3l75*U&6NvJnfqhDjvm7>fM+H@&HE2j;O23VutEfV;c_CN~sl5nADcZ6k;
+zuqD+fl}Y5BW9&2AmY-ng&q{(YQ}C-K0VYXsN;1;dC-rPiAt4*LdQ01hz1uZT-rQ_y
+zXTb>?bp2=8X3@q$VOd-f>j#$(&tBLNdS=J|^mef+ywxA(eP1OPhUbSj{E<zerzM<d
+z2q*3ZS7yFXKUBX{o5Hz`NVGoIhzzWUV}J0Gg^TkS>w_yd?^aeT_inD%)_aqU_eYxi
+zC!2hv#UE|(NB2OsLOvn*GJ?8$mWP&xRzme#_ir_Y;mzo=R&=Nl9eQ%?*XXA&d%>rz
+z!-(_G33Hbgg~dzTN5XvX77DYycFrSq`~xu3;)QY^CIf2$EB@plC0nyC?u<5#{*59c
+zrNeYnG+HBu1S7@DDB(Ma#Aj2r)AY`f*W8KI6nbFOJ_Io<+ICIT7I1qgUzE$LGOS$y
+p8tnv~_STjMWBe2apCR!niatZ#&r$z6>VJ*~n`m&`+lTEp{sUVdQD6W7
+
+literal 0
+HcmV?d00001
+
+diff --git a/kernel.py b/kernel.py
+index a877f2f..a1b70c6 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,43 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.scipy.special
++from jax import lax
++import jax.experimental.pallas as pl
++import jax.experimental.pallas.tpu as pltpu
++
++def workload(x, w1, b1, w2, b2):
++    batch_size = x.shape[0]
++    batch_block = 128
++
++    def kernel(x_ref, w1_ref, b1_ref, w2_ref, b2_ref, out_ref):
++        # Load block of x
++        x_block = x_ref[...].astype(jnp.float32)
++        w1_full = w1_ref[...].astype(jnp.float32)
++        b1_full = b1_ref[...].astype(jnp.float32)
++        w2_full = w2_ref[...].astype(jnp.float32)
++        b2_full = b2_ref[...].astype(jnp.float32)
++
++        # First gemm + bias
++        h = jnp.dot(x_block, w1_full.T) + b1_full
++        h = jax.nn.sigmoid(h)
++
++        # Second gemm + bias
++        y = jnp.dot(h, w2_full.T) + b2_full
++
++        # Logsumexp over axis=1
++        out_ref[...] = jax.scipy.special.logsumexp(y, axis=1).astype(jnp.bfloat16)
++
++    return pl.pallas_call(
++        kernel,
++        out_shape=jax.ShapeDtypeStruct((batch_size,), jnp.bfloat16),
++        grid=(batch_size // batch_block,),
++        in_specs=(
++            pl.BlockSpec((batch_block, x.shape[1]), lambda i: (i, 0)),
++            pl.no_block_spec,
++            pl.no_block_spec,
++            pl.no_block_spec,
++            pl.no_block_spec,
++        ),
++        out_specs=pl.BlockSpec((batch_block,), lambda i: (i,)),
++        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
++    )(x, w1, b1, w2, b2)

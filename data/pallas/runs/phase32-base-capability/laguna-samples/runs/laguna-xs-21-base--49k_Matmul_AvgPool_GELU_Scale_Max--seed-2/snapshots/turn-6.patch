@@ -1,0 +1,70 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..db61376 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,63 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as pl
++from jax import lax
++from jax.pallas import TPUCompilerParams as tpcp
++
++def workload(x, weight, bias):
++    """Fused kernel: Matmul -> AvgPool -> GELU -> Scale -> Max"""
++    batch_size, in_features = x.shape
++    _, out_features = weight.shape
++    pool_kernel_size = 16
++    scale_factor = 2.0
++    
++    # Compute matmul result in float32 for accumulation
++    def compute_matmul(x_bf16, w_bf16, b_bf16):
++        # Convert to float32 for accumulation
++        x_f32 = x_bf16.astype(jnp.float32)
++        w_f32 = w_bf16.astype(jnp.float32)
++        b_f32 = b_bf16.astype(jnp.float32)
++        
++        # Matmul: (batch, in) @ (in, out) -> (batch, out)
++        result = jnp.dot(x_f32, w_f32) + b_f32[None, :]
++        return result
++    
++    # Compute intermediate result
++    intermediate = compute_matmul(x, weight, bias)  # (batch, out_features)
++    
++    # Expand dims: (batch, out) -> (batch, 1, out)
++    expanded = jnp.expand_dims(intermediate, axis=1)  # (batch, 1, out)
++    
++    # Avg pool using reduce_window
++    # Window dimensions: (1, 1, pool_kernel_size)
++    # Strides: (1, 1, pool_kernel_size)
++    # Padding: VALID
++    def avg_pool(x_val):
++        # reduce_window with sum, then divide by kernel_size
++        pooled = lax.reduce_window(
++            x_val,
++            init_value=0.0,
++            computation=lax.add,
++            window_dimensions=(1, 1, pool_kernel_size),
++            window_strides=(1, 1, pool_kernel_size),
++            padding="VALID"
++        )
++        return pooled / pool_kernel_size
++    
++    # Apply avg pool
++    pooled = avg_pool(expanded)  # (batch, 1, out // pool_kernel_size)
++    
++    # Squeeze: (batch, 1, out // pool) -> (batch, out // pool)
++    squeezed = jnp.squeeze(pooled, axis=1)  # (batch, out // pool)
++    
++    # Apply GELU
++    gelu_out = jax.nn.gelu(squeezed)
++    
++    # Scale
++    scaled = gelu_out * scale_factor
++    
++    # Max along axis 1
++    result = jnp.max(scaled, axis=1)  # (batch,)
++    
++    return result.astype(jnp.bfloat16)

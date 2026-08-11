@@ -1,0 +1,73 @@
+diff --git a/__pycache__/kernel.cpython-312.pyc b/__pycache__/kernel.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..88a48c2a215785a03c740f98f41f33f3eaa7558f
+GIT binary patch
+literal 2056
+zcmbtU&r2Lv9Dnn3f6cDCu3aT+Q)^NtNjEixK&eO|9&C%2umxcWEaT3oyP2IC-i-AJ
+zE6pK?wJpRzL4`t;7HTku9-C6=AJB`-9$a1xIkcC(N!L>^?f1=(RjI9qKG^T?_r5<q
+z-`QW{@hF1RQddeP9--f;5**eSTAzThfmEb2I?8#RDYH3_@npU%<OE+9%b^0xpmI1D
+z@h#E7;@V?53GD16l#4GjGS{RjrV5;&iLwa%sNND8H!Jf9t#T}KK=V#1s4Fl4uW*hK
+zs3kFwPPocC;Xo_79S54n_xv|i&S^VJQd?{b|HnIf!Q0RIJ->$vsxTFH&!0*b$--0t
+zz-b>kqHg%Leso84!Ds-sJ_uIXpvhJKf*Xu~gKOUq{(HO?z9Oi+DyZV~P|(DgEbZa9
+zdq5S|&k}BD5#b$i1wvN&%IO-<0qj%<=fI>!PWcljIRmM}@A>OQvjuX%R{(}H)t{69
+z<b^Yl=dC8MM%x`iUlmSeMj`7ml4DaDS-|v8(<Kz}CIz}ls{<F^2Ta!)hbW;_bi-xN
+zlU)NPGWU#iJszP8f+>+XB20}>Oy4B}&<{Swv=uNW7K?^zF6M0q7gfzBAxlx!qA^Fh
+z)M8mP?4oJpjfL`zhHWULo#sSp{sqTX{SHo5*sfX*6Ru=fB;sJjur1Tp2&XGcBvmkt
+zPxEt{p<zYOt3_RLG?j#~X3r~@MtDat<{{FYBb>Hm$sr;v<*_zPqKjH_Zr*X_@Jvy$
+zT`6QPcqV3vhz~SuXgZ1eUiU%OrqjFZoj+4I7ft-Ywv>W)(~Hhn%Xk1HR(h#NHx)HA
+zs+$Exx5qMG1Ra3=1CWR4Q0jO*xi-0ZWt-c&wr$p>+g0YUE44B3WMFe;_sy-(zVE1a
+z-KmNYcOVVdq~V4XZ%E0;rQt^EMq}{3<CqwaR+-}j>g#_R+lp;Z>}Gc+_usu+?;Wo~
+zWPCkdlLo2`NMCUq;V0p*yPu}F(%W6%X1|->ncltkO>Sqf-uF(ubEGDXKyIjKVr^pm
+z-WMNv3N7x9&3s*Y8y-pbRzvID=TZx5hlOf(0&Cu(WRQ|EAb1$aGbHmQLI>$XFb8`<
+z!bKx*TUx>PT~q`#SW71{OVM=z0H&k^$N*|*mV!6#EL&RE!3zZk(_|z(GYb=SMsAb1
+zVdiIGt`FQdWghoazvy8~c#4<{gH68x3Ko9deINh@-vX5)X<I-ZqCeOUq3>uYDv4j-
+zdOWr^)(9sKlRXE?tF`3S{kPu#Df{#N7x(MQ4;%50-=)NX)L)bO5C0(?h4^IjIEuRA
+z=1?s;bleRO9;HwyTzzdl)#`~#=_3>s()cnYl@s^|FcN`=Gw^*_%S3RQ*K3HHVZm{d
+z2BoP6`>SF4NjZw1@n%M((?%kCR(y@#x%4l0GLE%CI7$Rd2j<QKUx6!bUH+s-%ci=Z
+sYh#%HztF!Bn@;eEV;JUF6n%-(FHz4cG`x?7U!m)DbiKv*GhSnV10Wf$H~;_u
+
+literal 0
+HcmV?d00001
+
+diff --git a/kernel.py b/kernel.py
+index a877f2f..7f6a37c 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,35 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.lax as lax
++import jax.experimental.pallas as pl
++import jax.experimental.pallas.tpu as pltpu
++
++def workload(x, weight, bias):
++    def kernel(x_ref, weight_ref, bias_ref, out_ref):
++        x = jnp.transpose(x_ref[...], (0, 2, 3, 4, 1))
++        kernel = jnp.transpose(weight_ref[...], (2, 3, 4, 1, 0))
++        x = lax.conv_general_dilated(
++            x,
++            kernel,
++            window_strides=(1, 1, 1),
++            padding=((0, 0), (0, 0), (0, 0)),
++            dimension_numbers=("NDHWC", "DHWIO", "NDHWC"),
++        )
++        bias_reshaped = jnp.reshape(bias_ref[...], (1, 1, 1, 1, -1))
++        x = x + bias_reshaped
++        x = x * jnp.tanh(jnp.log(1 + jnp.exp(x)))
++        x = jnp.tanh(x)
++        x = jnp.transpose(x, (0, 4, 1, 2, 3))
++        out_ref[...] = x
++
++    return pl.pallas_call(
++        kernel,
++        out_shape=jax.ShapeDtypeStruct((16, 64, 30, 62, 62), jnp.bfloat16),
++        grid=(),
++        in_specs=(
++            pl.no_block_spec,
++            pl.no_block_spec,
++            pl.no_block_spec,
++        ),
++        out_specs=pl.no_block_spec,
++    )(x, weight, bias)

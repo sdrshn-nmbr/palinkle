@@ -1,0 +1,60 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..175a407 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,53 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import pallas as pl
++import pallas.lib as pllib
++
++def workload(x, weights):
++    """Grouped matmul kernel for Mixtral MoE.
++
++    Performs batched matrix multiplication: output[g, m, n] = x[g, m, k] @ weights[g, k, n]
++    """
++    # Grid dimensions: 8 groups, 1024 rows / 128 = 8 tiles per group
++    GROUP_SIZE = 8
++    M_TILES = 8  # 1024 / 128
++    N_TILES = 112  # 14336 / 128
++
++    BLOCK_M = 128
++    BLOCK_N = 128
++    BLOCK_K = 128
++
++    def grouped_matmul_kernel(ref_ref, x_ref, w_ref):
++        # ref_ref is used for initialization
++        # x_ref: [GROUP_SIZE, 1024, 4096]
++        # w_ref: [GROUP_SIZE, 4096, 14336]
++
++        # Get the group and tile indices
++        g = pl.program_id(0)  # group index (0-7)
++        m = pl.program_id(1)  # row tile index within group
++        n = pl.program_id(2)  # column tile index within group
++
++        # Accumulator for the result
++        acc = jnp.zeros((BLOCK_M, BLOCK_N), dtype=jnp.float32)
++
++        # K dimension tiles: 4096 / 128 = 32 tiles
++        for k in range(32):
++            # Load blocks from x and weights
++            x_block = x_ref[g, m, k * BLOCK_K:(m + 1) * BLOCK_M, k * BLOCK_K:(k + 1) * BLOCK_K]
++            w_block = w_ref[g, k * BLOCK_K:(k + 1) * BLOCK_K, n * BLOCK_N:(n + 1) * BLOCK_N]
++
++            # Accumulate the dot product
++            acc = acc + jnp.dot(x_block, w_block, precision=jax.lax.Precision.DEFAULT)
++
++        # Store the result back
++        ref_ref[g, m, n] = acc.astype(jnp.bfloat16)
++
++    # Actually, let me reconsider the approach. The input shapes are:
++    # x: [8, 1024, 4096] - 8 groups, 1024 rows, 4096 cols
++    # weights: [8, 4096, 14336] - 8 groups, 4096 rows, 14336 cols
++    # output: [8, 1024, 14336] - 8 groups, 1024 rows, 14336 cols
++
++    # The kernel should compute: for each group g, output[g] = x[g] @ weights[g]
++    pass
++
++# Let me rewrite with a simpler approach

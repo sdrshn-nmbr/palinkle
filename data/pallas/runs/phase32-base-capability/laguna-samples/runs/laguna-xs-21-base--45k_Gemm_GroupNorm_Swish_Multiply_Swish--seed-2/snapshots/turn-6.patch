@@ -1,0 +1,80 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..19beffe 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,73 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import pallas as pl
++import pytensor as pltpu
++
++BATCH_SIZE = 4096
++IN_FEATURES = 8192
++OUT_FEATURES = 8192
++NUM_GROUPS = 256
++GROUP_SIZE = OUT_FEATURES // NUM_GROUPS  # 32
++
++BLOCK_SIZE = 128  # Block size for Pallas kernel
++
++def kernel(
++    x_ref,
++    gemm_weight_ref,
++    gemm_bias_ref,
++    gn_weight_ref,
++    gn_bias_ref,
++    multiply_weight_ref,
++    y_ref,
++):
++    # Get program IDs
++    m = pl.program_id(0)  # batch dimension
++    n = pl.program_id(1)  # output feature dimension
++    
++    # Compute matmul result for this block
++    # x[m, :] @ gemm_weight[:, n] + gemm_bias[n]
++    acc = 0.0
++    for k in range(0, IN_FEATURES, BLOCK_SIZE):
++        x_block = x_ref[m, k : k + BLOCK_SIZE]
++        w_block = gemm_weight_ref[k : k + BLOCK_SIZE, n]
++        acc += jnp.sum(x_block * w_block)
++    
++    # Add bias
++    result = acc + gemm_bias_ref[n]
++    
++    # Store intermediate result
++    y_ref[m, n] = result
++
++
++def workload(x, gemm_weight, gemm_bias, gn_weight, gn_bias, multiply_weight):
++    # Step 1: Matmul
++    x = jnp.matmul(x, gemm_weight) + gemm_bias
++    
++    # Step 2: GroupNorm
++    batch_size = x.shape[0]
++    group_size = x.shape[1] // NUM_GROUPS
++    
++    # Reshape for group norm: [batch, num_groups, group_size]
++    x_grouped = x.reshape(batch_size, NUM_GROUPS, group_size)
++    
++    # Compute mean and variance along the last axis
++    mean = jnp.mean(x_grouped, axis=-1, keepdims=True)
++    var = jnp.var(x_grouped, axis=-1, keepdims=True)
++    
++    # Normalize
++    x_normalized = (x_grouped - mean) / jnp.sqrt(var + 1e-5)
++    
++    # Reshape back and apply scale/shift
++    x = x_normalized.reshape(batch_size, -1)
++    x = x * gn_weight + gn_bias
++    
++    # Step 3: Swish
++    x = x * jnp.sigmoid(x)
++    
++    # Step 4: Multiply
++    x = x * multiply_weight
++    
++    # Step 5: Swish
++    x = x * jnp.sigmoid(x)
++    
++    return x

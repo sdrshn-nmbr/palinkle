@@ -1,0 +1,208 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..ec2db90 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,201 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.random as jrandom
++import jax.scipy as jscipy
++import jax.nn as nn
++import jax as lax
++import jax.numpy as jnp
++import pallas as pl
++import pytensor as pltpu
++
++# Configuration from the problem
++CONFIG = {
++    "head_dim": 128,
++    "max_seq_len": 4096,
++    "model": "Llama-3.1-70B",
++    "name": "llama3_70b_paged_attention",
++    "num_kv_heads": 8,
++    "num_query_heads": 64,
++    "num_seqs": 64,
++    "operator": "paged_attention",
++    "page_size": 16,
++    "pages_per_seq": 256
++}
++
++def workload(queries, k_pages, v_pages, kv_lens, page_indices, cu_q_lens):
++    """Paged attention kernel for TPU using Pallas."""
++
++    # Extract configuration values
++    num_seqs = CONFIG["num_seqs"]
++    num_q_heads = CONFIG["num_query_heads"]
++    num_kv_heads = CONFIG["num_kv_heads"]
++    head_dim = CONFIG["head_dim"]
++    page_size = CONFIG["page_size"]
++    pages_per_seq = CONFIG["pages_per_seq"]
++
++    # Compute derived values
++    max_seq_len = pages_per_seq * page_size  # 256 * 16 = 4096
++    num_q_per_kv = num_q_heads // num_kv_heads  # 64 // 8 = 8
++    sm_scale = head_dim ** -0.5  # 1 / sqrt(128)
++
++    def attend_one_seq(seq_idx):
++        """Attend for a single sequence."""
++        # Get query range for this sequence
++        q_start = cu_q_lens[seq_idx]
++        q_end = cu_q_lens[seq_idx + 1]
++
++        # Dynamic slice to get queries for this sequence
++        q = lax.dynamic_slice(queries, (q_start, 0, 0), (q_end - q_start, num_q_heads, head_dim))
++        # q shape: [seq_len, num_q_heads, head_dim]
++
++        # Get page indices for this sequence
++        seq_pages = page_indices[seq_idx]  # shape: [pages_per_seq]
++
++        # Gather K and V pages
++        k = k_pages[seq_pages]  # shape: [pages_per_seq, page_size, num_kv_heads, head_dim]
++        v = v_pages[seq_pages]  # shape: [pages_per_seq, page_size, num_kv_heads, head_dim]
++
++        # Reshape to full sequence length
++        k = k.reshape(max_seq_len, num_kv_heads, head_dim)
++        v = v.reshape(max_seq_len, num_kv_heads, head_dim)
++
++        # Repeat for GQA
++        k = jnp.repeat(k, num_q_per_kv, axis=1)  # [max_seq_len, num_q_heads, head_dim]
++        v = jnp.repeat(v, num_q_per_kv, axis=1)  # [max_seq_len, num_q_heads, head_dim]
++
++        # Get KV length for this sequence
++        kv_len = kv_lens[seq_idx]
++
++        # Compute attention scores
++        attn = jnp.einsum("qhd,khd->hqk", q, k) * sm_scale
++        # attn shape: [num_q_heads, seq_len, kv_len]
++
++        # Create causal mask
++        mask = jnp.arange(max_seq_len) < kv_len
++        # mask shape: [kv_len]
++
++        # Apply mask (fill with -inf where mask is False)
++        attn = jnp.where(mask[None, None, :], attn, -1e30)
++
++        # Softmax
++        attn = nn.softmax(attn, axis=-1)
++
++        # Compute output
++        out = jnp.einsum("hqk,khd->qhd", attn, v)
++
++        # Squeeze to remove extra dimension
++        return jnp.squeeze(out, axis=0)
++
++    # Vectorize over sequences
++    outputs = jnp.vectorize(attend_one_seq, signature="()->(n,q,d)")(jnp.arange(num_seqs))
++
++    return outputs
++
++# Pallas kernel implementation
++def _attend_kernel(
++    queries_ref,
++    k_pages_ref,
++    v_pages_ref,
++    kv_lens_ref,
++    page_indices_ref,
++    cu_q_lens_ref,
++    output_ref,
++):
++    """Pallas kernel for paged attention."""
++
++    # Configuration
++    num_seqs = 64
++    num_q_heads = 64
++    num_kv_heads = 8
++    head_dim = 128
++    page_size = 16
++    pages_per_seq = 256
++    max_seq_len = pages_per_seq * page_size
++    num_q_per_kv = num_q_heads // num_kv_heads
++    sm_scale = head_dim ** -0.5
++
++    # Get sequence index from program id
++    seq_idx = pl.program_id(0)
++
++    # Get query range for this sequence
++    q_start = cu_q_lens_ref[seq_idx]
++    q_end = cu_q_lens_ref[seq_idx + 1]
++    seq_len = q_end - q_start
++
++    # Get page indices for this sequence
++    seq_pages = page_indices_ref[seq_idx]  # [pages_per_seq]
++
++    # Get KV length
++    kv_len = kv_lens_ref[seq_idx]
++
++    # Slice queries for this sequence
++    # queries shape: [num_seqs, num_q_heads, head_dim]
++    q = queries_ref[seq_idx]  # [num_q_heads, head_dim]
++
++    # Gather and reshape K pages
++    # k_pages shape: [total_pages, page_size, num_kv_heads, head_dim]
++    k = k_pages_ref[seq_pages]  # [pages_per_seq, page_size, num_kv_heads, head_dim]
++    k = k.reshape(max_seq_len, num_kv_heads, head_dim)
++
++    # Gather and reshape V pages
++    v = v_pages_ref[seq_pages]  # [pages_per_seq, page_size, num_kv_heads, head_dim]
++    v = v.reshape(max_seq_len, num_kv_heads, head_dim)
++
++    # Repeat for GQA
++    k = jnp.repeat(k, num_q_per_kv, axis=1)  # [max_seq_len, num_q_heads, head_dim]
++    v = jnp.repeat(v, num_q_per_kv, axis=1)  # [max_seq_len, num_q_heads, head_dim]
++
++    # Compute attention: Q @ K^T
++    attn = jnp.einsum("qhd,khd->hqk", q, k) * sm_scale
++
++    # Create mask for causal attention
++    positions = jnp.arange(max_seq_len)
++    mask = positions < kv_len
++
++    # Apply mask
++    attn = jnp.where(mask[None, None, :], attn, -1e30)
++
++    # Softmax
++    attn = nn.softmax(attn, axis=-1)
++
++    # Compute output: attn @ V
++    out = jnp.einsum("hqk,khd->qhd", attn, v)
++
++    # Store output
++    output_ref[seq_idx] = out
++
++def workload(queries, k_pages, v_pages, kv_lens, page_indices, cu_q_lens):
++    """Paged attention workload using Pallas."""
++
++    # Grid spec: one program per sequence
++    grid_spec = pl.GridSpec((64,), (1,))
++
++    # Block spec for each input
++    queries_spec = pl.BlockSpec((64, 128), lambda _: (0, 0))
++    k_pages_spec = pl.BlockSpec((16, 8, 128), lambda _: (0, 0, 0))
++    v_pages_spec = pl.BlockSpec((16, 8, 128), lambda _: (0, 0, 0))
++    kv_lens_spec = pl.BlockSpec((64,), lambda _: 0)
++    page_indices_spec = pl.BlockSpec((64, 256), lambda _: (0, 0))
++    cu_q_lens_spec = pl.BlockSpec((65,), lambda _: 0)
++
++    # Output spec
++    output_spec = pl.BlockSpec((64, 128), lambda seq_idx: (seq_idx, 0))
++
++    # Call the kernel
++    return pl.pallas_call(
++        _attend_kernel,
++        out_shape=jax.ShapeDtypeStruct((64, 64, 128), queries.dtype),
++        grid=grid_spec,
++        in_specs=(
++            queries_spec,
++            k_pages_spec,
++            v_pages_spec,
++            kv_lens_spec,
++            page_indices_spec,
++            cu_q_lens_spec,
++        ),
++        out_specs=output_spec,
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel",)
++        ),
++    )(queries, k_pages, v_pages, kv_lens, page_indices, cu_q_lens)

@@ -1,0 +1,73 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..73bd0bf 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,66 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as plp
++from jax import lax
++from jax.sharding import Shard
++
++# Constants from the config
++BATCH = 2
++SEQ_LEN = 4096
++EMB_DIM = 4096
++NUM_EXPERTS = 8
++MLP_DIM = 14336
++NUM_EXPERTS_PER_TOK = 2
++
++def workload(x, router_weights, expert_gate_kernels, expert_up_kernels, expert_down_kernels):
++    """Sparse MoE kernel implemented with Pallas."""
++    
++    # Extract shapes
++    B, S, E = x.shape  # B=2, S=4096, E=4096
++    N = router_weights.shape[1]  # N=8
++    K = NUM_EXPERTS_PER_TOK  # K=2
++    
++    # Step 1: Compute logits = x @ router_weights
++    # x: [B, S, E], router_weights: [S, N] -> logits: [B, S, N]
++    logits = jnp.einsum('bse,sn->bsn', x, router_weights)
++    
++    # Step 2: Get top_k logits and indices
++    top_k_logits, top_k_indices = lax.top_k(logits, K)
++    
++    # Step 3: Compute router_probs = softmax(top_k_logits)
++    router_probs = jnp.nn.softmax(top_k_logits, axis=-1)
++    
++    # Step 4: Compute gate_out = silu(x @ expert_gate_kernels)
++    # x: [B, S, E], expert_gate_kernels: [N, E, M] -> gate_out: [B, S, N, M]
++    gate_out = jnp.einsum('bse,nem->bsnm', x, expert_gate_kernels)
++    gate_out = jnp.nn.silu(gate_out)
++    
++    # Step 5: Compute up_out = x @ expert_up_kernels
++    # x: [B, S, E], expert_up_kernels: [N, E, M] -> up_out: [B, S, N, M]
++    up_out = jnp.einsum('bse,nem->bsnm', x, expert_up_kernels)
++    
++    # Step 6: Compute hidden = gate_out * up_out
++    hidden = gate_out * up_out
++    
++    # Step 7: Compute expert_outputs = hidden @ expert_down_kernels
++    # hidden: [B, S, N, M], expert_down_kernels: [N, M, E] -> expert_outputs: [B, S, N, E]
++    expert_outputs = jnp.einsum('bsnm,nme->bsne', hidden, expert_down_kernels)
++    
++    # Step 8: Create one_hot from top_k_indices
++    # top_k_indices: [B, S, K], N=8 -> one_hot: [B, S, K, N]
++    one_hot = jnp.nn.one_hot(top_k_indices, N)
++    
++    # Step 9: Compute weighted = one_hot * router_probs
++    # router_probs: [B, S, K], one_hot: [B, S, K, N] -> weighted: [B, S, K, N]
++    weighted = one_hot * router_probs[..., None]
++    
++    # Step 10: Compute expert_weights = sum(weighted, axis=2)
++    # weighted: [B, S, K, N] -> expert_weights: [B, S, N]
++    expert_weights = jnp.sum(weighted, axis=2)
++    
++    # Step 11: Compute output = expert_outputs @ expert_weights
++    # expert_outputs: [B, S, N, E], expert_weights: [B, S, N] -> output: [B, S, E]
++    output = jnp.einsum('bsne,bsn->bse', expert_outputs, expert_weights)
++    
++    return output

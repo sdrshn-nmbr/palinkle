@@ -1,0 +1,69 @@
+diff --git a/__pycache__/kernel.cpython-312.pyc b/__pycache__/kernel.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..bce9ec4ac0a6df4bc09fc1c9fe2d68a13b68de99
+GIT binary patch
+literal 1281
+zcmZuw&2Q646d&7TCr;uvfuOWV)s|h5Fky?-!*Zz*RTn5yft6NUs&I(h%#b=vY%_L9
+zS~*e<95$zx6FK(4fmQiW_Oexxhz3=Qw5Q%Gg%hWpv7J&XUX=IodtdY3jQ=)_4B#|X
+z-)h{10Q@J6G0BNC+ThA-fB=#RsKiog$`wV5by!g&pVmxO(g~(FVI`C3*=DXLOMoLV
+zLS$laT}`~>O3F)6nb?#}cqH0BG$p2a79o~jQ<8HCk>Y=0j}|0xrVuo^JWEJIGExxS
+z;}Z$$Dxvh<xF`xqCvh+s&kPz#Zd@Ve4blA!g-QsKiZqmZm)=ujXIBm7hJGfHn+Qff
+z{iL53s-d>UJ>Ar)&e4s0o82(JwS^U?_LAAV>0ol~Z{)|?R~e>J=3RC#nXRjb`tQKZ
+zZCzP%ofq?Hwmf_9&dMJ`5O>`oi!bWGxh|P~hN*+e92IFt5fh6)5<N|sid966sjG`C
+z_kT4N1|KdzUSe?h@%=|sOwXZ-w(TIdUG)QMBkZ%3XCY)ebyh%j6Fa``I#s9DT*uTu
+zx_zp!SR{V|(CXN}sWUyGmg9S_kD1c2I!qy)6>I$X)jD=CwMZ4&#0oHCDT@6K%fn1|
+z90u!{w0Mf+G1$bGV`iAtVOks8^^JhRb=&fp(y0bai-%?DsHWQrm?50iq!?mqr^-*x
+zv<`2`OKRNFB7rZiYW9S_6mPU$`poyN8orUN&)Z~a0TS0j^fC_@DgGPIdf-?C+1z%y
+zU*53>g~8(B`9bDVZ;7K5#Sg~JzA-bfb_=_UyUz~{vv>Ei2J+{(+x_;3$@2bWd6>@r
+zxjHP(4D+So#rb0$<gbr_n%8>E$9ZsJ`t{1Il{oqBj|at{dk==W;!bxzce!_m7n&$+
+zul85BpY)#$E*uy?M8!F_)?eFsy8Fv}<67_Tr);73V8qV}%t>0{g6VwqbNsgWNNOZ#
+ziNjR93MPAmW#jL4uI5tAV8j)V)L2I3#XiP?7ApzBb^=U2iaGbk-rQ-B<<Evi`}+&f
+zE28aBqHTJi>7o|Fx9B`K#nbeK^H`B2=_AM-g3?ED{t!$bf~kMO)qlX%Ltt`n1TRYG
+HqB8#j#jQH$
+
+literal 0
+HcmV?d00001
+
+diff --git a/kernel.py b/kernel.py
+index a877f2f..4caf5e7 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,36 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import pallas as pl
++import pallas.core as plc
++import jax.pallas as plu
++import jax.interpreters.pallas as pallas
++from jax.interpreters import pallas as pl
++import jax.numpy as jnp
++
++def workload(x, weight, bias):
++    """Conv2d + GELU + GlobalAvgPool kernel."""
++    # Transpose x from NCHW to NHWC
++    x_t = x.transpose(0, 2, 3, 1)  # (128, 256, 256, 8)
++    
++    # Transpose weight from OIHW to HWIO
++    kernel = weight.transpose(2, 3, 1, 0)  # (3, 3, 8, 64)
++    
++    # Conv2D: NHWC * HWIO -> NHWC
++    conv_out = jax.lax.conv_general_dilated(
++        x_t, kernel,
++        window_strides=(1, 1),
++        padding='VALID',
++        dimension_numbers=('NHWC', 'HWIO', 'NHWC')
++    )  # (128, 254, 254, 64)
++    
++    # Add bias with reshaping for broadcasting
++    bias_reshaped = bias.reshape(1, 1, 1, 64)  # (1, 1, 1, 64)
++    x_add = conv_out + bias_reshaped
++    
++    # Apply GELU activation
++    x_gelu = jax.nn.gelu(x_add)
++    
++    # Global Average Pooling over H and W axes
++    result = jnp.mean(x_gelu, axis=(1, 2))  # (128, 64)
++    
++    return result

@@ -1,0 +1,80 @@
+diff --git a/__pycache__/kernel.cpython-312.pyc b/__pycache__/kernel.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..b52eb39df9aeec8d0e75ec14b1f45d3356ed2b5b
+GIT binary patch
+literal 2663
+zcmd@VO>Em#*p40Nr>>o(=`zN)t{p4Ov~_IRC`eTWY_vlf;ZU?mJuLEKw@u<C#!j|0
+za;hD6ND-)ugp?v7kxG-=sXK%NV%&CuN?dA!wCK^D;Iac!MJFL~f$!OInoNaV#)&7{
+z?|a|>?|VP=_Ie3e<#;jqJwp(`;Dfy!Enw#a098UHL{cWEt({CerYRD`4w+6nrx}2$
+z+r+eMo($7ZuwXPyB1REpS<vF1mL|OM@KNyX{79Nw$=gK9;~;WyvR2ZzYa?LSJvpa+
+zOoE@!E}clapT&U`ku;<0rmVO0i;i5IkYw9n8~DFbXFUHN@qKE&RRf*SN!_7SI;}f(
+zMtAA%^;U(ah%g<EcP8Bh`Rs#lX9Ln+g_4NmOK{XlYcGPzlJ_~q_v#Ld+b&(H=eZKp
+zGZJi$wkx|=10_3Kw8i*b8+5mg^;Qd)djA7k&VR7Q={<U{nZ+KR)j1PlJ3Q~KMJq1R
+z0W$159zs|pUZhIC4vD=+VRtw=ORDp)^E!|1inQpw&)9l(UlEwvIq?IRzt{tnXRJs}
+zPx%hJdyPG>ySn2p1zvb=?T&PJTWWjWrw8;t?5*w*$uWp&o(Q|5BSkimil0oT;-|(F
+z$@uK2zkOZ%<GcF!lfPhn7<M39C?quGPDzp?Cem8iji_WsL6n%y0VEWVBa=ZcEis$U
+zCPc(YiHw#{BU<}N%^^B137K#Zv5JsTV?sO^Q>7W?P77Mfgm_t+$;A{kn~dEw5k56B
+zJJ*G=SZ0Ns)Xma~iA$NBq{g(kAWNniE}QRCVxBuBT$qksp};5PX?uaZyY^dXEM=oj
+zm{BDyFGK8-q9IC6Yls1DN*<!cbS(&(J+jC8GkE%DR!wP&5SLD;BsC++Bg#BtEU>sA
+z6XmQRj*Q7!2t*qnu_*YJ(9S^P-XfaZf#rz74b+aWMOIE3-03p46%17;E0fC?Y6JB?
+zWAJ<<_<Gs1)xW=bwQ_ZNYIEppJz@-vHu~Qvdok-oWuh9bMDIpcM^{GIB6a>DWxRH=
+zarE6raKe(iQn^ySR=IZf!s_J8<l2SJGjBgUYMhy9yfWG7zf|@%gNJG!BN#4wn*9T{
+z6Gs0@Q0xy@4^$2;N7vq~7aRU}%1o0BfNPw8X>M`uGp$;v6l%=cz7@WH{o%QvLYFoo
+zMkw0gJ}6Vo!2ab(<)rPW;U6tCSY4<RTHaSXT&Ik|a}ED_K=Og58;duV78V!2h<`cz
+z`D{&w$c9HB9NwUeH!n91zu(}aWx5$URHG}Uvg;1@F}nkqBksXXjy$;D+MJ+BP$U)F
+z)Sbx0G)0PQEfNO9F62;T)MLH%F{pv8!kiPxH-#lH=H?Y?DyQb5W1N;Qr-*T=H<OKB
+zhoYrSm0>S(+wBem0IiOC+6@-FiP+s1gOf$FTGJ-kr_Q!U-rbhAV2eu~#_fSG$K94w
+zk72Lfc0;Ln)?w@k?OXWWB7S#p&STq0d@S?H*`@Kt@ur*G3iLk;3>$&rT48lzWuad9
+zX5p)aMqr}Z%m2!9kJy6-dvNOo0o#4vfcNP>q7O_C8G)gv1K`Q_5yHjaq3@(>WA&FG
+z$Qze8r^U?~WoOXGs^m7|bE>5JDtI4uTP5+p#WRx0r(uAc=BDCz5BV@!DkzegNW+~V
+z$SQsu)KmC}v!EWwKdh*gqp@^W%*)ca`WE2u<6w^OHbs);&xH3e5qeC7cj!T~W&Uq$
+Cib=}=
+
+literal 0
+HcmV?d00001
+
+diff --git a/kernel.py b/kernel.py
+index a877f2f..e8cb1bf 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,38 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++from jax.experimental import pallas as pl
++
++def workload(pair_act, mask, left_proj_w, right_proj_w, left_gate_w, right_gate_w, center_scale, out_proj_w, out_gate_w):
++    def kernel(pair_act_ref, mask_ref, left_proj_w_ref, right_proj_w_ref, left_gate_w_ref, right_gate_w_ref, center_scale_ref, out_proj_w_ref, out_gate_w_ref, out_ref):
++        act = pair_act_ref[...] * mask_ref[...]
++        left_proj = jnp.dot(act, left_proj_w_ref[...])
++        right_proj = jnp.dot(act, right_proj_w_ref[...])
++        left_gate = jax.nn.sigmoid(jnp.dot(act, left_gate_w_ref[...]))
++        right_gate = jax.nn.sigmoid(jnp.dot(act, right_gate_w_ref[...]))
++        left_proj = left_proj * left_gate
++        right_proj = right_proj * right_gate
++        result = jnp.einsum("ikc,jkc->ijc", left_proj, right_proj)
++        eps = 1e-6
++        rms = jnp.sqrt(jnp.mean(result * result, axis=-1, keepdims=True) + eps)
++        result = (result / rms) * center_scale_ref[...]
++        output = jnp.dot(result, out_proj_w_ref[...])
++        gate = jax.nn.sigmoid(jnp.dot(pair_act_ref[...], out_gate_w_ref[...]))
++        out_ref[...] = output * gate
++
++    return pl.pallas_call(
++        kernel,
++        out_shape=jax.ShapeDtypeStruct(pair_act.shape, pair_act.dtype),
++        grid=(),
++        in_specs=(
++            pl.no_block_spec,
++            pl.no_block_spec,
++            pl.no_block_spec,
++            pl.no_block_spec,
++            pl.no_block_spec,
++            pl.no_block_spec,
++            pl.no_block_spec,
++            pl.no_block_spec,
++            pl.no_block_spec,
++        ),
++        out_specs=pl.no_block_spec,
++    )(pair_act, mask, left_proj_w, right_proj_w, left_gate_w, right_gate_w, center_scale, out_proj_w, out_gate_w)

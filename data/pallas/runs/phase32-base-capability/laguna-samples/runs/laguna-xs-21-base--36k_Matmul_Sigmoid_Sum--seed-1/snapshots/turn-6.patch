@@ -1,0 +1,105 @@
+diff --git a/__pycache__/kernel.cpython-312.pyc b/__pycache__/kernel.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..d06fdb7ff11c5ccbce041137279cede43e0af504
+GIT binary patch
+literal 2536
+zcmbtVO>7fK6rSDn+H1!S`E%?f{A^lKadCq{RewT=N*n4HLR1vQAqS$xvo<!n_I7qH
+z;$TawibEn*3OPB)a4J!92m+}{?V;DI>cR4XXrNN1_QEY{a_XsX_6G+ML933mZ@xG0
+z&6_v-e&&~0EP`PCoSQG6mk|1cG5+8^u=75E2Eqt)8k%uuPUmL?&c%Tl(UApbLYTjU
+zW+W^C4Oh8T;5jofl?`~7*u<~^-_Gwq8pz^caz@cV&tHHUbL*bG9;hMAV}20TMN9Nm
+zia{T>=bBjK);(J_ejWt%papkxN71>j&v|RHmwCq3f-g=E?K!V=AI;DUO{pf;gjxV|
+zIerWjt9(kBPhV6?N!4WQhGNOtvTjr?)s%I`(kq&LLN*I|y<ETyRrC?U{GLills7aQ
+zF-SR26n(aUsZcB#RKR5mkTOU4Qi+DVtyF-WsW27iW{H}kky~mZf5URHbiJUM4hoek
+z?h>avisf50=K26)v!YqF(=+Gu5wPlEGYnqI{`kA^<gGHfX&OpaJ$ci)+=x-71D-kG
+z4BPHXNk437fim+zY_uCh;f|%)V(hNcl9Kkh?S2&NSsq^a!alz%p?I>9S<bASUmb1r
+zjcg{HeIMJGU`PKz<LdI&#<k^ZtCw2w)Akgs^~4*A<;2S2R`+rH!gdhFkJy=oa|>TD
+zOnh@`2aZBnmT3Nn0&o)V5v0_c60e4edz03)fw=)dn9uPb-zW9_w5toR+n?j=0W8!-
+z9H<AeSP$V~UE-0&ezG(6OHqq??+lh;dvy0pND+tbAm5ia=mxR$uXRH>+}6zrZ?G)k
+zNL$<L_WdvR_^3VOj*X~aL>sYn@6XmyjjQqNUJR#Es&hW`nOi_!{T!c5%Wk@-pnzDi
+zr)9-3w5nfLX(&6j#7aw6v~npgD{}=?KIPWgbJki?JYg|?j${W9GHe4$afD${?C4~@
+zRs_p#8|#I6=OB;<s_kiH82NX}@zZFHn_A<jXljM5y2g<%P&b(&nZ$uoX-re}>sT3|
+zA7oXfl@&ZPrj@gbW{v}JWgoCjtV!AE{^dvFCVtq_OplQStnBa92uSv(c-y6RziqEE
+zH_0K`LJl(`1KHyu83z7!-hIgQS$u8u=-A`H!xKMNe!B9*?dGYAuX@OW>HM}Nfc-uE
+zU%q_Ad|}PrMjMsQD;u|8b%C{5#|8Ehu*k7?4cWy{Io)^dzyE;I_Mw}XA9D{rcMeT)
+zR5BEzXqu`4?!^UNEt!RKY1UMArDPSdW=f=C)|ky3ilNd#o<OIU3ZP)9S<@3a@Bn)_
+z3Yto0nMK`9MF_hj?V4sgC#<TWPFtjswII<PTOwv_g!M4mVSo?t4nR(6PA{h6Pa(r@
+zPJ?MG8k%KPXeTQycEDGz{V?U`Xwa=K8eo-0j)N_dVg^HVv)7pc8ui{9my0;Bjf<UY
+zIq>Dj!%KQU)yWyK_cnayuRxrqp}X%%*U@Iz(N*QU{Js2r<z8`fcy)GD`9A+3-|8B-
+zzl25~>s-n#X6~L_ys&WAo`8h|NjtOEd)S`b>Q34hwz~R3Ef9+azdgM)zBv9&8s6#|
+z+KP4m8SPw}T%24<G~XI)MbAF-*n`b?F1DhRK0DYvHrk4w*$xGIBD)dP8*ikS(<{~H
+zyQ8h1GtZKTo+Q)FWO_?}Z&%<4BD--oXL}HZq=o*weLF+3Xkr`1#DtpzUYx@4XpfXC
+zI=qvjGZEI~XwZ#}8z#}HLL|s(5I9kC{tY?CSXStMyU@$HqN(HL6If$?#2f;$EpQz7
+a6h(eRiKnRdDT@CU7~+oXj1F<GAO8UR87|%c
+
+literal 0
+HcmV?d00001
+
+diff --git a/kernel.py b/kernel.py
+index a877f2f..6cbed33 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,62 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import pallas as pl
++import pytpu as pltpu
++
++def matmul_sigmoid_sum_kernel(x_ref, weight_ref, bias_ref, out_ref):
++    """Kernel that computes matmul + sigmoid + sum."""
++    # Get block indices
++    m = pl.program_id(0)  # batch dimension
++    
++    # Compute matmul for this row
++    # x_ref: (8192,) - row of x
++    # weight_ref: (8192, 8192) - full weight matrix
++    # We need to compute x @ weight + bias
++    
++    # For each output element, compute the matmul
++    # out_ref[m, 0] = sum(sigmoid(sum(x[m, k] * weight[k, j] for k) + bias[j]) for j)
++    
++    # Read the input row (vector)
++    x_row = x_ref[:]  # Shape: (8192,)
++    
++    # Compute matmul: x_row @ weight_ref + bias_ref
++    # This gives us intermediate values for all j
++    matmul_result = jnp.dot(x_row, weight_ref) + bias_ref  # Shape: (8192,)
++    
++    # Apply sigmoid
++    sigmoid_result = jax.nn.sigmoid(matmul_result)
++    
++    # Sum along the result
++    sum_result = jnp.sum(sigmoid_result)
++    
++    # Write output
++    out_ref[m, 0] = sum_result
++
++def workload(x, weight, bias):
++    """Compute matmul(x, weight) + bias, apply sigmoid, then sum along axis 1."""
++    # Output shape
++    out_shape = jax.ShapeDtypeStruct((x.shape[0], 1), x.dtype)
++    
++    # Grid: one program per batch element
++    grid = (x.shape[0],)
++    
++    # Block sizes - use multiples of 8 for bfloat16
++    x_block = (1, 8192)  # Full row of x for each batch element
++    weight_block = (8192, 128)  # Process weight in chunks
++    bias_block = (8192,)  # Full bias vector
++    out_block = (1, 1)  # Single output element
++    
++    return pl.pallas_call(
++        matmul_sigmoid_sum_kernel,
++        out_shape=out_shape,
++        grid=grid,
++        in_specs=(
++            pl.BlockSpec(x_block, lambda m: (m, slice(None))),
++            pl.BlockSpec(weight_block, lambda m: (slice(None), slice(None))),
++            pl.BlockSpec(bias_block, lambda m: slice(None)),
++        ),
++        out_specs=pl.BlockSpec(out_block, lambda m: (m, 0)),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel",)
++        ),
++    )(x, weight, bias)

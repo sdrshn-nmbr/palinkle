@@ -1,0 +1,59 @@
+import jax
+import jax.numpy as jnp
+import pallas as pl
+import pl as pltpu
+
+def gemm_relu_kernel(
+    x_ref,
+    weight_ref,
+    bias_ref,
+    out_ref,
+):
+    """Pallas kernel for Gemm + Add(bias) + ReLU."""
+    m = pl.program_id(0)
+    n = pl.program_id(1)
+    
+    # Block sizes - use multiples of 8 for bf16
+    block_m = 128
+    block_n = 128
+    
+    # Compute the output for this tile
+    x_block = x_ref[m * block_m : (m + 1) * block_m, :]
+    weight_block = weight_ref[:, n * block_n : (n + 1) * block_n]
+    
+    # Matrix multiplication with float32 accumulation
+    result = jnp.dot(x_block, weight_block, precision=jax.lax.Precision.DEFAULT)
+    
+    # Add bias
+    result = result + bias_ref[n * block_n : (n + 1) * block_n]
+    
+    # Apply ReLU
+    result = jnp.maximum(result, 0.0)
+    
+    # Write output
+    out_ref[m * block_m : (m + 1) * block_m, n * block_n : (n + 1) * block_n] = result.astype(jnp.bfloat16)
+
+
+def workload(x, weight, bias):
+    """Workload: Gemm + Add bias + ReLU."""
+    # Output shape
+    out_shape = jax.ShapeDtypeStruct((x.shape[0], weight.shape[1]), jnp.bfloat16)
+    
+    # Grid dimensions
+    grid_m = x.shape[0] // 128
+    grid_n = weight.shape[1] // 128
+    
+    return pl.pallas_call(
+        gemm_relu_kernel,
+        out_shape=out_shape,
+        grid=(grid_m, grid_n),
+        in_specs=(
+            pl.BlockSpec((128, 8192), lambda m, n: (m * 128, 0)),
+            pl.BlockSpec((8192, 128), lambda m, n: (0, n * 128)),
+            pl.BlockSpec((128,), lambda m, n: (0, n * 128)),
+        ),
+        out_specs=pl.BlockSpec((128, 128), lambda m, n: (m * 128, n * 128)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel")
+        ),
+    )(x, weight, bias)

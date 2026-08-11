@@ -1,0 +1,170 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..c6a3cf7 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,163 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import pallas as pl
++import pallas_core as plc
++from pallas import TPU as pltpu
++
++# Configuration constants
++CONFIG = {
++    "batch": 4,
++    "emb_dim": 7168,
++    "kv_lora_rank": 512,
++    "model": "DeepSeek-V3-671B",
++    "num_heads": 128,
++    "operator": "mla_attention",
++    "q_lora_rank": 1536,
++    "qk_nope_head_dim": 128,
++    "qk_rope_head_dim": 64,
++    "rope_theta": 10000,
++    "seq_len": 2048,
++    "v_head_dim": 128,
++}
++
++def _compute_rope(head_dim, seq_len, theta, dtype):
++    """Compute rotation frequencies for RoPE."""
++    freqs = 1.0 / (theta ** (jnp.arange(0, head_dim) / head_dim))
++    pos = jnp.arange(seq_len)
++    angles = jnp.outer(pos, freqs)
++    return jnp.cos(angles).astype(dtype), jnp.sin(angles).astype(dtype)
++
++def _apply_rope(x, cos, sin):
++    """Apply RoPE to input tensor."""
++    x1 = x[..., ::2, :]
++    x2 = x[..., 1::2, :]
++    rotated = jnp.stack([
++        x1 * cos - x2 * sin,
++        x1 * sin + x2 * cos,
++    ], axis=-1)
++    return rotated.reshape(x.shape)
++
++def mla_attention_kernel(x_ref, q_down_proj_ref, q_up_proj_ref,
++                          kv_down_proj_ref, k_up_proj_ref, v_up_proj_ref,
++                          o_proj_ref):
++    """Pallas kernel for MLA attention."""
++    # Load inputs from VMEM
++    x = x_ref[...]
++    q_down_proj = q_down_proj_ref[...]
++    q_up_proj = q_up_proj_ref[...]
++    kv_down_proj = kv_down_proj_ref[...]
++    k_up_proj = k_up_proj_ref[...]
++    v_up_proj = v_up_proj_ref[...]
++    o_proj = o_proj_ref[...]
++
++    # Get config values
++    B, S, E = x.shape
++    H = CONFIG["num_heads"]
++    nope = CONFIG["qk_nope_head_dim"]
++    rope = CONFIG["qk_rope_head_dim"]
++    vd = CONFIG["v_head_dim"]
++    kvl = CONFIG["kv_lora_rank"]
++    theta = CONFIG["rope_theta"]
++
++    # Compute q = (x @ q_down_proj) @ q_up_proj
++    q = jnp.dot(x, q_down_proj)
++    q = jnp.dot(q, q_up_proj)
++
++    # Reshape q to (B, S, H, nope + rope)
++    q = q.reshape(B, S, H, nope + rope)
++
++    # Split q into q_nope and q_rope
++    q_nope = q[..., :nope]
++    q_rope = q[..., nope:]
++
++    # Compute kv = x @ kv_down_proj
++    kv = jnp.dot(x, kv_down_proj)
++
++    # Split kv into k_latent and k_rope_raw
++    k_latent = kv[..., :kvl]
++    k_rope_raw = kv[..., kvl:]
++
++    # Compute k_nope = (k_latent @ k_up_proj) reshaped
++    k_nope = jnp.dot(k_latent, k_up_proj)
++    k_nope = k_nope.reshape(B, S, H, nope)
++
++    # Compute rope cos/sin
++    cos, sin = _compute_rope(rope, S, theta, x.dtype)
++
++    # Apply rope to k_rope_raw
++    k_rope = jnp.broadcast_to(
++        _apply_rope(k_rope_raw, cos, sin),
++        (B, S, H, rope)
++    )
++
++    # Apply rope to q_rope
++    q_rope = _apply_rope(q_rope, cos, sin)
++
++    # Compute v = (k_latent @ v_up_proj) reshaped and transposed
++    v = jnp.dot(k_latent, v_up_proj)
++    v = v.reshape(B, S, vd * H).transpose(0, 2, 1)
++
++    # Concatenate q_nope and q_rope, transpose to get q_full
++    q_full = jnp.concatenate([q_nope, q_rope], axis=-1)
++    q_full = q_full.transpose(0, 2, 3, 1)
++
++    # Concatenate k_nope and k_rope, transpose to get k_full
++    k_full = jnp.concatenate([k_nope, k_rope], axis=-1)
++    k_full = k_full.transpose(0, 2, 3, 1)
++
++    # Transpose v
++    v = v.transpose(0, 2, 1, 3)
++
++    # Compute attention scores
++    hd = nope + rope
++    attn = jnp.einsum("bhqk,bhkd->bhqd", q_full, k_full)
++    attn = attn * (hd ** -0.5)
++
++    # Create mask
++    mask = jnp.tril(jnp.ones((S, S)))
++
++    # Apply mask
++    attn = jnp.where(mask, attn, -1e9)
++
++    # Softmax
++    attn = jax.nn.softmax(attn, axis=-1)
++
++    # Compute output
++    out = jnp.einsum("bhqk,bhkd->bhqd", attn, v)
++
++    # Reshape and transpose
++    out = out.reshape(B, vd * H, S).transpose(0, 2, 1)
++
++    # Final output
++    result = jnp.dot(out, o_proj)
++
++    return result
++
++def workload(x, q_down_proj, q_up_proj, kv_down_proj, k_up_proj, v_up_proj, o_proj):
++    """MLA attention workload."""
++    # Define block size for TPU
++    block = 128
++
++    # Compute output shape
++    B, S, E = x.shape
++    H = CONFIG["num_heads"]
++    vd = CONFIG["v_head_dim"]
++
++    return pl.pallas_call(
++        mla_attention_kernel,
++        out_shape=jax.ShapeDtypeStruct((B, S, H * vd), x.dtype),
++        grid=(1,),
++        in_specs=(
++            pl.BlockSpec((block, block, block), lambda _: (0, 0, 0)),
++            pl.BlockSpec((block, block), lambda _: (0, 0)),
++            pl.BlockSpec((block, block), lambda _: (0, 0)),
++            pl.BlockSpec((block, block), lambda _: (0, 0)),
++            pl.BlockSpec((block, block), lambda _: (0, 0)),
++            pl.BlockSpec((block, block), lambda _: (0, 0)),
++            pl.BlockSpec((block, block), lambda _: (0, 0)),
++        ),
++        out_specs=pl.BlockSpec((block, block, block), lambda _: (0, 0, 0)),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel",)
++        ),
++    )(x, q_down_proj, q_up_proj, kv_down_proj, k_up_proj, v_up_proj, o_proj)

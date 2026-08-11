@@ -1,0 +1,84 @@
+diff --git a/__pycache__/kernel.cpython-312.pyc b/__pycache__/kernel.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..f2448cb853c08f5fbea9af4836420ecfe1353e5a
+GIT binary patch
+literal 1995
+zcmds1O>7%Q6rSDn{@5Pd!TGUM@>8l%uo^l2Q7e!_DizuukSw*~<V&>iZW23dd%L@7
+z95a!6=)plqaZdOcP7O+sS_EpiaYW+6Du+fxt5#|+Js<^~1LDM+-L(@ceh%CiY3F_K
+zy?H<L-kbd)7K<QQKkN0<JrSYjjOi>s0PT+ee1<fnaR$o!lq>Ujf%9>wEat@kOJ%vh
+zbEvH3!+|8yk$CcG9)p~}i}JA*E+f2TA#w#Jh{Q-7J^{Y=SDY7>yNgy89y!4ItJKM>
+zBLGSi2eS89N$Q{@N>J%|j6eZW@AgOM7}^f}YrNA{lyDbz!T(P?r~LDsc7*Mq$^;RP
+z@I)XXA`*$n+d*}wQ6`itgu69Dh#B<4*G_xwBrrsSz^;Y~7oZ5?0~Gz2CWlF+(;O15
+zGcQ=<S7QVd(f3e?b{_K)f+MdiBKaptjM;AoLsgH0uQ(9`UAzuilThFj&aGl12Rh7j
+ztJvud*<TG-3H-gf2-bw1P$z%zh>4<clW=SWWyD-|{+EU4jc<N?G4+xqmEmYetrhKz
+zM1@ktq=Hs;Xvn^0Il!wm%2z5>wySeaS*>LfRIJTd`W%fc>&5v6$HU5OQMEmUXDc&y
+zK{a%bivrhGF{Z4m72g_|+p6W^@R5OBUGhCbklU(3#buw&dW2h{64>dcO>u3eQnkve
+zQLO8loq$`M{PX&~Z(_M>E!w79&?gpktD+lO6YPChPcx-aRkiG-QH6Z%sjRPI!)1R7
+z+a2_*r@vX)h&06go)fJL8wm!|t=^4TLp+pFtY`iD+V$qu*2O*i#^zNQXBymrgp#R-
+zw4WYqeYhpKL*s6G{A=N%@<7==@!k91j(&g1efP%R*_&?aW&^|F*kG&I#lxG}#p7Ea
+z?_O{xF1z@$=O;GMEUe{PH(Wf@;QVmc)~>DRKz45PTqC!K-)wNtQt5`=6h6UiNEm$q
+z4}ykS1?>gZ)M;qmDr!_ILPt!!U<WD&Gcx5(gGNo&Fraa8f5T#bC)zX3EI)8oOnut1
+zmI@9PeP5!+WHeT(&dfr=7Co1lFy(4g@&|#2Sf{B14f6U)Wk8;Y0oHi0dC+w5$tJ`a
+zhKM$MzunGRLo5lU(;MqNurfQf1KS<+D?cC(9-K{J>C^M;Q)^TEO8jxM|55U^n>@XF
+z>)!I`%lEm5@&kD<`ObbU@dC#m;UO0fJ^pXt;I(iva@dD@A<`)~dFpT&5;zz^veFo6
+z_BCspsjau}U)sIc9!=mY+yP36S2$|~63)c^qK4rSWh+Z%7(dY?7P}Lbnb?5$C9o~U
+zIK5`-R<W#C92KV3YYxT7g;esT))@2f`rp`O9dn5aY!gibh*w8z6imFlf+|mztJ;#G
+sPg(DQg8c{Vldv5K9LN2HB2Q523F?1}#(qR&Ptln@bfz78n+tCC2Yw00HUIzs
+
+literal 0
+HcmV?d00001
+
+diff --git a/kernel.py b/kernel.py
+index a877f2f..b25a68e 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,47 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.lax as lax
++import jax.experimental.pallas as pl
++import jax.experimental.pallas.tpu as pltpu
++
++def workload(x, weight, bias, bn_scale, bn_bias, bn_mean, bn_var, scale):
++    def kernel(x_ref, weight_ref, bias_ref, bn_scale_ref, bn_bias_ref, bn_mean_ref, bn_var_ref, scale_ref, out_ref):
++        # Load full arrays (single grid element)
++        x_val = x_ref[...]
++        w_val = weight_ref[...]
++        b_val = bias_ref[...]
++        
++        # Matmul + bias
++        y = jnp.dot(x_val, w_val) + b_val
++        
++        # Batch norm
++        bn_eps = 1e-05
++        x_normalized = (y - bn_mean_ref[...]) / jnp.sqrt(bn_var_ref[...] + bn_eps)
++        
++        # Scale and shift
++        y = bn_scale_ref[...] * x_normalized + bn_bias_ref[...]
++        
++        # Scalar scale
++        y = scale_ref[...] * y
++        
++        # Softmax over axis=1
++        y = jax.nn.softmax(y, axis=1)
++        
++        out_ref[...] = y
++    
++    return pl.pallas_call(
++        kernel,
++        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
++        grid=(),
++        in_specs=(
++            pl.no_block_spec,
++            pl.no_block_spec,
++            pl.no_block_spec,
++            pl.no_block_spec,
++            pl.no_block_spec,
++            pl.no_block_spec,
++            pl.no_block_spec,
++            pl.no_block_spec,
++        ),
++        out_specs=pl.no_block_spec,
++    )(x, weight, bias, bn_scale, bn_bias, bn_mean, bn_var, scale)

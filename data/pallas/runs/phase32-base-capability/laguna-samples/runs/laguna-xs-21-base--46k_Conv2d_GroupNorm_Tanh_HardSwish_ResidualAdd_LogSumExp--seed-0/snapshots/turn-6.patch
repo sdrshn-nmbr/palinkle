@@ -1,0 +1,97 @@
+diff --git a/__pycache__/kernel.cpython-312.pyc b/__pycache__/kernel.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..f135e310007bfc85e78f9e2a59a0698d2102394a
+GIT binary patch
+literal 2273
+zcmb7FO>7fK6yEi&f7k2$I5;RxRU#<HAV^b^@DqfTrgf7R1p<_SRb*|li|u5+-t5}M
+zn6<R6dcdbRy~IdJ1hrC)LM!)BDLpkuq+V=oq@n?&O7xN&ReGp;Y2U2vu#og`BG0^e
+zKi_=w-kZ&jEbAd)d>YHmeC;5JXL!>bwuZ1724RWd37!;*NPQ)fwg^SmWjbOvZT5%*
+zR-5Qdx*~4VMuF^!Fd);P5fSeVGGyPtpyMGDQDR~W7Drl1q*Kzgy>S>`T=1jdxA{5D
+za4?y-^R~PrO=2S+GfisstvPE1PpvfcdFQ|Ql03cT>$3RL7Qlw6IW-q=f8bcbj9}#5
+znp?BYIO{v>%sb6L*GdB=XL?)EcVg}4-CIlmc?RG8mGLp)<vn>O@6EFoG$_}r1DJU<
+zyT)kt9Gs<jHTIf)3!SjUnniy(8uI7inFrpjd-^Q?-j{vxZkvCLMrghqAY0;mJH)kU
+z4xE{lMm2K`+^$t?)u_MCsSD?IrO_cdST*`T`ocN+Rtulj9r(01ndI9np6%N`E!K|h
+zR;`U^o4MwFO-XCRe0iUF%XSOG|E->1^K0#9M|D_G0^505th@iw+O^%Pbu@DU8MpL8
+zQ=8wV?YcmOT5@BaJupU6()G9bJ%{$ZucR{acuGlve36slu#9pFe_=kMV)?wFCin~|
+z4)fUgOe%IElYB2Ln;09oB(Y!P&u)G9`!A<Mw1OYWhB@H}w}HC^wD`Fx_-!a|JYjo?
+zLiG6P<OrfiC&$hzxTWEH(#9u}f}|!=QdG($rvybcBR2ko(LlH0VAv4#0(}EN-HRa`
+zqPc8BMXp&vkO5Gwv%)nC`4BZD$;h2nI7yXLs(>gyl}1iQP~)5|AbWkGlL99p>N=+&
+zTAfqUh)zRdkTaQ(63I*w1ULZ;l$eSkO2v|pl|unUW)U+DnT^g1iC8?1+~#H~!Kug{
+zlbTv5h^EdF!^u}68YV|JD#hogkz-a+BtgV`9F53vM2;YG6p@okC)`58tzmjY(eP@L
+z^Jb%QC|gv;bwe%n*l6QoJhEr8jF@Z`C<9@jtKtU4t+0Lk(a}4fQf5_|n-+TObdJb3
+zkP9ot6vrzA5Q;0RegieuiRUiD*Q$pfd3^fFZw|uOws5s@wbWM<4fc>8exVsEdkuD=
+zshKQH7B7`9RgaxrXV2;3=MdOYO#BoG)&jvYS?()ym3AZ0Ut{~55g2uF`IN!FWxBWT
+zUg}=#{^SFFSf9Jqb8F&>i&<a_Ofg)VSatxyrTa`}VwJ3RpEO)U`Y`bDwk#Yk94`)+
+z#wzqWGoZiw#KSHG3&CPfDOBdyJxBGCN4}QgzC!%Y-n$2GA6PzG_TM{UbRDj-hj(H)
+zRq3fr7=dFo_SkChhu-gdAND+)sGd7tz4%de^0IOAN{zkJB!9VZxp>WBUpMz1ol8TD
+zLwD4>H*eo84_5k&HwG$mhX2HBxaNOnZKCE6>t}#(XV=o~;_UK%NXE4aw>tRk>{{O%
+zS3Njt1jh8UkG!vy#G3b@{vNpc153fhAkYrp4t}}!tKhw0`OPnmROZ(D*SkiI_A&j#
+zpP4|F4s1f%h!6`efy*K{Oh@3YL2>QoqTp{Qa>$%0LeJV{5qauz6#nHS4|cEb75u`%
+zQN#uXKRslZ#k8C;d*eQ#41!AO$9mVPWQxy-!f9m~w)mr<cEj|XB1!Tw;dx4QJ|_H+
+TiO#3QzNf_gO}dxtG^76lN)`n?
+
+literal 0
+HcmV?d00001
+
+diff --git a/kernel.py b/kernel.py
+index a877f2f..3bf62db 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,55 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import pallas as pl
++import pl as pallas_lib
++from jax.pallas import lib as pl_lib
++from jax.pallas import triton as pltpu
++
++def workload(x, conv_weight, conv_bias, gn_weight, gn_bias):
++    """
++    Conv2d + GroupNorm + Tanh + HardSwish + ResidualAdd + LogSumExp
++    """
++    groups = 16
++    eps = 1e-5
++    
++    # Transpose x from NCHW to NHWC
++    x_nhwc = jnp.transpose(x, (0, 2, 3, 1))
++    
++    # Transpose kernel from OIHW to HWIO
++    kernel = jnp.transpose(conv_weight, (2, 3, 1, 0))
++    
++    # Convolution: NHWC * HWIO -> NHWC
++    x_conv = jnp.dot(x_nhwc, kernel, dimension_numbers=('NHWC', 'HWIO', 'NHWC'))
++    
++    # Add bias with reshaping
++    x_conv = x_conv + conv_bias.reshape(1, 1, 1, -1)
++    
++    # Transpose back to NCHW
++    x_conv = jnp.transpose(x_conv, (0, 3, 1, 2))
++    
++    # Get shape and reshape for group norm
++    N, C, H, W = x_conv.shape
++    x = jnp.reshape(x_conv, (N, groups, C // groups, H, W))
++    
++    # Group normalization
++    mean = jnp.mean(x, axis=(2, 3, 4), keepdims=True)
++    var = jnp.var(x, axis=(2, 3, 4), keepdims=True)
++    x_norm = (x - mean) / jnp.sqrt(var + eps)
++    
++    # Scale and shift
++    x_norm = x_norm * gn_weight.reshape(1, 1, -1, 1, 1) + gn_bias.reshape(1, 1, -1, 1, 1)
++    
++    # Tanh
++    x_tanh = jnp.tanh(x_norm)
++    
++    # HardSwish
++    x_hard_swish = jnp.minimum(jnp.maximum(x_tanh, 0), 6) * x_tanh / 6
++    
++    # Residual add (need to reshape x_conv back to match)
++    x_conv_reshaped = jnp.reshape(x_conv, (N, groups, C // groups, H, W))
++    x_res = x_conv_reshaped + x_hard_swish
++    
++    # LogSumExp along group axis
++    x_logsumexp = jnp.log(jnp.sum(jnp.exp(x_res), axis=1, keepdims=True))
++    
++    return x_logsumexp

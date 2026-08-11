@@ -1,0 +1,63 @@
+import jax
+import jax.numpy as jnp
+import jax.experimental.pallas as pl
+import jax.experimental.pallas.tpu as pltpu
+
+CONFIG = {"batch": 4, "head_dim": 128, "seq_len": 4096, "num_heads": 64}
+
+def workload(q, k, v, rel_pos_bias):
+    batch = CONFIG["batch"]
+    num_heads = CONFIG["num_heads"]
+    seq_len = CONFIG["seq_len"]
+    head_dim = CONFIG["head_dim"]
+    block_q = 128
+    
+    def kernel(q_ref, k_ref, v_ref, rel_ref, out_ref):
+        # q_ref: (1, 1, block_q, head_dim)
+        # k_ref: (1, 1, seq_len, head_dim)
+        # v_ref: (1, 1, seq_len, head_dim)
+        # rel_ref: (1, block_q, seq_len)
+        q_block = q_ref[...]
+        k_block = k_ref[...]
+        v_block = v_ref[...]
+        rel_block = rel_ref[...]
+        
+        # Compute attention scores
+        # q_block: (block_q, head_dim), k_block: (seq_len, head_dim)
+        attn = jnp.dot(q_block, k_block.T)  # (block_q, seq_len)
+        sm_scale = head_dim ** -0.5
+        attn = attn * sm_scale
+        
+        # Add relative position bias
+        # rel_block: (block_q, seq_len)
+        attn = attn + rel_block
+        
+        # Apply causal mask
+        q_start = pl.program_id(2) * block_q
+        q_idx = jnp.arange(block_q) + q_start
+        k_idx = jnp.arange(seq_len)
+        causal_mask = q_idx[:, None] >= k_idx[None, :]
+        attn = jnp.where(causal_mask, attn, -1e30)
+        
+        # Softmax
+        attn = jax.nn.softmax(attn, axis=-1)
+        
+        # Apply to values
+        out_block = jnp.dot(attn, v_block)  # (block_q, head_dim)
+        out_ref[...] = out_block
+    
+    grid = (batch, num_heads, seq_len // block_q)
+    
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct(q.shape, q.dtype),
+        grid=grid,
+        in_specs=(
+            pl.BlockSpec((1, 1, block_q, head_dim), lambda b, h, i: (b, h, i * block_q, 0)),
+            pl.BlockSpec((1, 1, seq_len, head_dim), lambda b, h, i: (b, h, 0, 0)),
+            pl.BlockSpec((1, 1, seq_len, head_dim), lambda b, h, i: (b, h, 0, 0)),
+            pl.BlockSpec((1, block_q, seq_len), lambda b, h, i: (h, i * block_q, 0)),
+        ),
+        out_specs=pl.BlockSpec((1, 1, block_q, head_dim), lambda b, h, i: (b, h, i * block_q, 0)),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel", "parallel")),
+    )(q, k, v, rel_pos_bias)

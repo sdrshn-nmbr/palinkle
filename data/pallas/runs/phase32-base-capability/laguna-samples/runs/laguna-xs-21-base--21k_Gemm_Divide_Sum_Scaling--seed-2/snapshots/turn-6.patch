@@ -1,0 +1,122 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..c4664c3 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,115 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as plp
++from jax import lax
++
++def workload(x: jax.Array, weight: jax.Array):
++    """TPU Pallas kernel for Gemm + Divide + Sum + Scaling.
++    
++    Semantic operations:
++    1. x = dot_general(x, weight.T, dimension_numbers=((1,), (0,)), precision=HIGHEST)
++    2. x = x / 2.0
++    3. x = sum(x, axis=1, keepdims=True)
++    4. x = x * 1.5
++    
++    Input shapes: x=[4096, 8192], weight=[8192, 8192]
++    Output shape: [4096, 1]
++    """
++    batch_size = x.shape[0]  # 4096
++    hidden_size = x.shape[1]  # 8192
++    
++    # Block size for matmul - use multiples of 8 for bf16
++    block_size = 128
++    
++    def pallas_kernel(
++        x_ref: pl.ReduceReference,
++        weight_ref: pl.Reference,
++        out_ref: pl.Reference,
++        *,
++        axis: int = 0,
++    ):
++        # Accumulate in float32 for precision
++        acc = jnp.zeros((), dtype=jnp.float32)
++        
++        # Perform the matmul operation
++        # x_ref has shape [hidden_size] for this row
++        # weight_ref has shape [hidden_size, hidden_size]
++        # We need to compute: sum(x_ref * weight_ref, axis=1)
++        
++        # Actually, let's think about this differently
++        # The operation is: out = (x @ weight.T) / 2.0
++        # Then sum along axis 1, then multiply by 1.5
++        
++        # For Pallas, we'll do the computation in the kernel
++        pass
++    
++    # Let's implement a simpler approach - use pallas_call with appropriate specs
++    # The matmul can be done using dot operation in the kernel
++    
++    # Grid: one program per output row
++    grid = (batch_size,)
++    
++    def compute_kernel(
++        x_ref: pl.Reference,
++        weight_ref: pl.Reference,
++        out_ref: pl.Reference,
++    ):
++        # x_ref: [batch_size, hidden_size] - one row
++        # weight_ref: [hidden_size, hidden_size] - full matrix
++        # out_ref: [1] - scalar output
++        
++        # Compute: sum_i (x_ref[0, i] * weight_ref[i, :]) / 2.0 * 1.5
++        # But we need to be careful about the semantics
++        
++        # Actually, looking at the spec again:
++        # x = dot_general(x, weight.T, ...) gives shape [4096, 8192]
++        # Then divide by 2
++        # Then sum along axis 1 -> shape [4096, 1]
++        # Then multiply by 1.5
++        
++        # Let me reconsider the kernel design
++        # We need to do a batched matmul where each batch element is processed
++        
++        # For simplicity, let's use a single kernel that does the full computation
++        # and uses pl.program_id to index into the batch dimension
++        
++        row_idx = pl.program_id(0)
++        
++        # Load x[row_idx, :] and compute matmul with weight
++        x_row = x_ref[row_idx]  # [hidden_size]
++        
++        # Compute matmul: x_row @ weight.T
++        # This is equivalent to: sum over k of x[row_idx, k] * weight[:, k]
++        # Result shape: [hidden_size]
++        
++        # Use dot for the matmul
++        result = jnp.dot(x_row, weight.T, precision=lax.Precision.HIGHEST)
++        
++        # Divide by 2.0
++        result = result / 2.0
++        
++        # Sum (already a 1D array, so this is just the sum)
++        result = jnp.sum(result)
++        
++        # Multiply by 1.5
++        result = result * 1.5
++        
++        # Store to output
++        out_ref[row_idx] = result.astype(jnp.bfloat16)
++    
++    # Define input and output specs
++    x_spec = pl.BlockSpec((1, hidden_size), lambda i: (i, 0))
++    weight_spec = pl.BlockSpec((hidden_size, hidden_size), lambda _: (0, 0))
++    out_spec = pl.BlockSpec((1,), lambda i: (i,))
++    
++    return pl.pallas_call(
++        compute_kernel,
++        out_shape=jax.ShapeDtypeStruct((batch_size, 1), jnp.bfloat16),
++        grid=grid,
++        in_specs=(x_spec, weight_spec),
++        out_specs=(out_spec,),
++        compiler_params=plp.TPUCompilerParams(
++            dimension_semantics=("parallel",)
++        ),
++    )(x, weight)

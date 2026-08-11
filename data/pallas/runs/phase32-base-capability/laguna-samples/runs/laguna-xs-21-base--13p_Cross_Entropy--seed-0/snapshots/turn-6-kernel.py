@@ -1,0 +1,145 @@
+import jax
+import jax.numpy as jnp
+import pallas as pl
+import triton.tools as pltpu
+
+def fused_cross_entropy_kernel(
+    hidden_ref,
+    weight_ref,
+    labels_ref,
+    loss_ref,
+):
+    """Pallas kernel for fused linear + cross-entropy."""
+    # Get program IDs
+    batch_idx = pl.program_id(0)
+    
+    # Get dimensions
+    hidden_dim = hidden_ref.shape[1]
+    vocab_size = weight_ref.shape[1]
+    
+    # Compute logits for this batch element
+    # logits = hidden @ weight
+    hidden_row = hidden_ref[batch_idx, :]  # (hidden_dim,)
+    weight_col = weight_ref[:, batch_idx]  # (hidden_dim, vocab_size) - WRONG
+    
+    # Actually, we need to think about this differently
+    # hidden: (batch_size, hidden_dim)
+    # weight: (hidden_dim, vocab_size)
+    # logits: (batch_size, vocab_size)
+    
+    # For each batch element, compute logits = hidden[batch_idx, :] @ weight
+    # Then compute log_softmax and cross-entropy
+    
+    # Let's use a simpler approach: compute the full logits matrix
+    # and then compute loss
+    
+    pass
+
+
+def workload(hidden, weight, labels):
+    """Fused linear projection + cross-entropy loss kernel."""
+    batch_size = hidden.shape[0]
+    hidden_dim = hidden.shape[1]
+    vocab_size = weight.shape[1]
+    
+    def kernel_fn(
+        hidden_ref,
+        weight_ref,
+        labels_ref,
+        loss_ref,
+    ):
+        # Get batch index
+        batch_idx = pl.program_id(0)
+        
+        # Compute logits for this batch element: logits[b] = hidden[b] @ weight
+        # hidden_ref: (batch_size, hidden_dim)
+        # weight_ref: (hidden_dim, vocab_size)
+        # We need to compute dot(hidden[batch_idx, :], weight)
+        
+        # For TPU, we should use jnp.dot with proper accumulation
+        # Let's compute the full logits matrix first
+        
+        # Actually, let's think about this more carefully
+        # We want to compute:
+        # 1. logits = hidden @ weight  -> (batch_size, vocab_size)
+        # 2. log_probs = log_softmax(logits, axis=-1)
+        # 3. one_hot = one_hot(labels, vocab_size)
+        # 4. loss = -mean(sum(one_hot * log_probs, axis=-1))
+        
+        # For Pallas on TPU, we need to tile appropriately
+        # Let's use block sizes that work well with TPU
+        
+        # Block size for hidden dimension (should be multiple of 8 for bf16)
+        block_hidden = 128
+        # Block size for vocab (should be multiple of 128 for vectorization)
+        block_vocab = 128
+        
+        # Compute partial logits using matmul
+        # For simplicity, let's compute the full operation in one go
+        # since the grid is small (batch_size)
+        
+        # Get the hidden row for this batch element
+        h = hidden_ref[batch_idx, :]  # (hidden_dim,)
+        
+        # Compute logits = h @ weight
+        # weight_ref: (hidden_dim, vocab_size)
+        # We need to do a matrix-vector product
+        
+        # For TPU matmul, accumulate in float32
+        logits = jnp.zeros(vocab_size, dtype=jnp.float32)
+        
+        # Tile the hidden dimension
+        for i in range(0, hidden_dim, block_hidden):
+            h_block = h[i:i + block_hidden]  # (block_hidden,)
+            w_block = weight_ref[i:i + block_hidden, :]  # (block_hidden, vocab_size)
+            # Compute partial logits
+            partial = jnp.dot(h_block.astype(jnp.float32), w_block.astype(jnp.float32))
+            logits = logits + partial
+        
+        # Convert logits to float32 for numerical stability
+        logits = logits.astype(jnp.float32)
+        
+        # Compute log_softmax
+        log_probs = jax.nn.log_softmax(logits)
+        
+        # Get label for this batch element
+        label = labels_ref[batch_idx]
+        
+        # Compute cross-entropy loss for this element
+        # loss = -log_probs[label]
+        loss_val = -log_probs[label]
+        
+        # Store in loss_ref
+        loss_ref[...] = loss_val
+    
+    # Grid is batch_size
+    grid = (batch_size,)
+    
+    # Block spec for hidden: (batch_size, hidden_dim) -> each block is one row
+    hidden_spec = pl.BlockSpec((1, hidden_dim), lambda i: (i, 0))
+    
+    # Block spec for weight: (hidden_dim, vocab_size) -> full matrix
+    weight_spec = pl.BlockSpec((hidden_dim, vocab_size), lambda _: (0, 0))
+    
+    # Block spec for labels: (batch_size,) -> one element per block
+    labels_spec = pl.BlockSpec((1,), lambda i: (i,))
+    
+    # Block spec for loss output: scalar per batch element
+    loss_spec = pl.BlockSpec((1,), lambda i: (i,))
+    
+    # Call the kernel
+    loss_values = pl.pallas_call(
+        kernel_fn,
+        out_shape=jax.ShapeDtypeStruct((batch_size,), jnp.float32),
+        grid=grid,
+        in_specs=(hidden_spec, weight_spec, labels_spec),
+        out_specs=(loss_spec,),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",)
+        ),
+    )(hidden, weight, labels)
+    
+    # Compute mean loss
+    mean_loss = jnp.mean(loss_values[0])
+    
+    return mean_loss

@@ -1,0 +1,118 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..daf68b8 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,111 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import pallas as pl
++import pytensor as pltpu
++
++def kernel(matmul_result_ref, bias_ref, out_ref, xv, yv):
++    # matmul_result_ref is (M, N) - result of x @ weight
++    # bias_ref is (N,) - bias to add
++    # out_ref is (M, 1) - final output after sigmoid and sum
++    
++    m, n = matmul_result_ref.shape
++    
++    # Add bias to matmul result
++    result = matmul_result_ref + bias_ref[None, :]
++    
++    # Apply sigmoid
++    sigm = jax.nn.sigmoid(result)
++    
++    # Sum along axis 1 with keepdims
++    summed = jnp.sum(sigm, axis=1, keepdims=True)
++    
++    out_ref[:] = summed
++
++def workload(x, weight, bias):
++    # x: (4096, 8192) bfloat16
++    # weight: (8192, 8192) bfloat16
++    # bias: (8192,) bfloat16
++    # output: (4096, 1) bfloat16
++    
++    # We need to compute: sigmoid(x @ weight + bias) then sum along axis 1
++    
++    # For TPU Pallas, we'll use a simple approach with matmul
++    # Block size considerations for TPU: multiples of 8 for bf16
++    
++    block_size = 128  # Reasonable block size for TPU
++    
++    # Grid dimensions
++    m = x.shape[0]  # 4096
++    n = weight.shape[1]  # 8192
++    
++    # We'll compute the entire operation in one kernel call
++    # Since the output is (4096, 1), we can tile along the batch dimension
++    
++    def compute_kernel(ref_matmul_result, ref_bias, ref_out):
++        # ref_matmul_result: (M, N) - result of x @ weight
++        # ref_bias: (N,)
++        # ref_out: (M, 1)
++        
++        m, n = ref_matmul_result.shape
++        
++        # Add bias
++        result = ref_matmul_result + ref_bias[None, :]
++        
++        # Sigmoid
++        sigm = jax.nn.sigmoid(result)
++        
++        # Sum along axis 1
++        summed = jnp.sum(sigm, axis=1, keepdims=True)
++        
++        ref_out[:] = summed
++    
++    # For simplicity, we'll use a higher-level approach
++    # Compute matmul first, then apply sigmoid and sum
++    
++    # Actually, let's do this more efficiently with a single pallas call
++    # that handles the entire computation
++    
++    # Since we need x @ weight, which is (4096, 8192), we can use
++    # pl.pallas_call with appropriate specs
++    
++    # Let's use a simpler approach: compute the intermediate result
++    # and then apply sigmoid and sum in the kernel
++    
++    # First, compute matmul result
++    matmul_result = jnp.matmul(x, weight)  # (4096, 8192)
++    
++    # Now use pallas to apply sigmoid and sum
++    # Output shape is (4096, 1)
++    
++    def sigmoid_sum_kernel(matmul_ref, bias_ref, out_ref):
++        # matmul_ref: (M, N) - matmul result
++        # bias_ref: (N,) - bias
++        # out_ref: (M, 1) - output
++        
++        m, n = matmul_ref.shape
++        
++        # Add bias and apply sigmoid
++        result = matmul_ref + bias_ref[None, :]
++        sigm = jax.nn.sigmoid(result)
++        
++        # Sum along axis 1
++        out_ref[:] = jnp.sum(sigm, axis=1, keepdims=True)
++    
++    # Use pallas_call with proper specs
++    # For matmul result (4096, 8192), we tile along both dimensions
++    # For bias (8192,), we tile along the N dimension
++    # For output (4096, 1), we tile along the M dimension
++    
++    return pl.pallas_call(
++        sigmoid_sum_kernel,
++        out_shape=jax.ShapeDtypeStruct((m, 1), jnp.bfloat16),
++        grid=(m // block_size,),
++        in_specs=(
++            pl.BlockSpec((block_size, n), lambda i: (i * block_size, 0)),
++            pl.BlockSpec((n,), lambda: 0),
++            pl.BlockSpec((block_size, 1), lambda i: (i, 0)),
++        ),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel",)
++        ),
++    )(matmul_result, bias)

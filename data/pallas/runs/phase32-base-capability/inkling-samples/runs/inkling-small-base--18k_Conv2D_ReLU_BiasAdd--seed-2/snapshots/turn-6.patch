@@ -1,0 +1,72 @@
+diff --git a/__pycache__/kernel.cpython-312.pyc b/__pycache__/kernel.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..7daa6820f39c61bd166fc2f723e0702fbdf05105
+GIT binary patch
+literal 1908
+zcmcIkOK%%h6u$Ew+v7YOH))hon#2TLAs0{^7Nn6%qt>ZtSOn2xMY1NINor?2w(d;G
+zLlcxm7d9Xzk&xmQ%7O(bU9zc!#1DW)tSoF@60v}dcM<N24V*hKf`pnCSDJIabMBe*
+zp7|*rk0Ll<7dA@^JVL)wAvmlLx>*4GNJAQ9pq$5<GMnQV5A$UqC%Bk3P+820zFsQJ
+z1(reONG=K*?kUQ}HkdTup>F5W3}H>P05QWuGvVOrPB3mf<|*3ZS!9Fcol=ldpaAah
+zwh)LVF+l%tjkV=KD!H`=lE)8ypBiU}7bPWxA^87pm-v_ae#RgA6*|aa9M<6u{jSZU
+zv@ll)%ZFSgcn09<e&n{$fsqY^xFtA@k3@&{k>qebk}qhnps_)lwuB38MU4w>BQGC~
+zBRCO_*91*`CIuxzrspGsqk|&+<4BquMA!r!WE2bT{%dfKaOf}4g}Dn_B=Ai0aAeOv
+zAYNmpAjk$vN9QtW9@C}ixP&fjhXw#GT|Z1mfN9>YQJVEIRS@ChJ0Hx>q&dRRWgp!o
+zeD=}ohnVgpsCw3lrdC<YTQ)9gx<#a_s%b@Yne=PLvTj<%ikUZ8%Zoa;Ad>4pB%QzD
+z_*tEcPt!?Dge#d<60xyrTGfiB6V6cANwQEeKg}=erjAu3uN4i|)-@tw-Fl){bxf-w
+zJl2iXbd(6|d8{vy=$c+!eqy^g?!LZQR4rGOLnKvJJqu=?h~5h%5*ibp8WMR$$EI%N
+z*DPB6web9zys=inD^^u4=r=r@Om%~Z9^AZ4FO7<-Wu}ZuK{c%DjCVsDVI2b5Ms1~k
+zcf9_f#<crK8h7_zt%>dA=)rh1IZ=zWdxsiaeXGX*uJrCatUqjwHWrSR>ow+NU~vET
+z-tB|IZ?7B=OxENRrMIP|no6pz#B1yAk<oT?q<wYrMMQ{4Ys{H~;yqt+`?0-PWA<R{
+zxbId|xdl#?o}K&k`@46(fau`iUlG93E?>_=T0@s>(k}P8(uH(kXFA)!@HmjpXB4G?
+zd<S|Gp^bEhLHK1@2_hHGyj9f;mVZSdOqZ=1Bvw@o14aQoF<{&<-oAM{#u<B~s?Xba
+zwP52ua7^UICFr01_9Tg$mHZ-famDqS7Vrp-eua`(D7i|>C=iSOUfc=cYk-Ix3<19d
+zB3*Wi{=T-+A8bMxK6^t{#4q33nXXT_<(`worB-61nV2|w{k<RNe_VLJaGZG1j`yA<
+zlC8v8Gcoqf`>oW?X6okmi>=9f&B=Q|v#spoX7=$>|0ki%ix{|so=b9VaCf*d(~XPD
+z*clRqF+2u=(+YkQ7>PjH8Tde8Uj&zV6-!hN3y%|E<gN7(Rq5-n<@Cd{RU_lIk0|Gr
+zMD(=yI(?DWieICI#`HTeRjz2OhCYqo1s(kbShRm<9K$fbpy(+YIz^XGQQ}vWIzp)~
+JKf-t!{|(%Po8<ri
+
+literal 0
+HcmV?d00001
+
+diff --git a/kernel.py b/kernel.py
+index a877f2f..9b7a5cc 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,34 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.lax as lax
++from jax import nn
++import jax.experimental.pallas as pl
++
++def workload(x, weight, conv_bias, bias):
++    def kernel(x_ref, weight_ref, conv_bias_ref, bias_ref, out_ref):
++        x = x_ref[...]
++        weight = weight_ref[...]
++        conv_bias = conv_bias_ref[...]
++        bias = bias_ref[...]
++        
++        x = jnp.transpose(x, (0, 2, 3, 1))
++        kernel_w = jnp.transpose(weight, (2, 3, 1, 0))
++        x = lax.conv_general_dilated(
++            x, kernel_w,
++            window_strides=(1, 1),
++            padding="VALID",
++            dimension_numbers=("NHWC", "HWIO", "NHWC")
++        )
++        x = x + jnp.reshape(conv_bias, (1, 1, 1, -1))
++        x = nn.relu(x)
++        x = jnp.transpose(x, (0, 3, 1, 2))
++        x = x + bias
++        out_ref[...] = x
++    
++    return pl.pallas_call(
++        kernel,
++        out_shape=jax.ShapeDtypeStruct((128, 128, 126, 126), jnp.bfloat16),
++        grid=(),
++        in_specs=(pl.no_block_spec, pl.no_block_spec, pl.no_block_spec, pl.no_block_spec),
++        out_specs=pl.no_block_spec,
++    )(x, weight, conv_bias, bias)

@@ -1,0 +1,76 @@
+diff --git a/__pycache__/kernel.cpython-312.pyc b/__pycache__/kernel.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..9904c102f3e581f5bdf92e10ed54a14309dbb6c6
+GIT binary patch
+literal 2162
+zcmbtVO-vg{6rTOHF>7L*fE@%4G$N7<ane*x4yB}|L6NG6Rs!|F#ag^;uvy#N-9;E{
+zt@^+Ls!G5KdMZefl878qsRtrOYHvOC5{pP!Q#iF3ZdO5R)l=Ww^<pcfKT=2X%(wGq
+z-uLFcZ^l0cg8>5Vw^S+n15e1$_~A9S0Z#4$*dz*37>!K3Ba>sNImX3&PM8)P%xYrJ
+zH|=*Yr?uq*)9rxyWil--F>&D-9Ztj<D(bSP$tEDq(ic)55t`fK$HDKU!Z@VNGAXk*
+z$)fGGrm&Y_rpzf^nYTHcFM*#lQx;fap$DgB;ZUzPo3(u2T-NWQ=4f*YpJpv5F*uu*
+znl=yZHe$Ag7OoD@+8k~EZ(`>$_B5*q%f$0#o#i1LYI^VxMASUhxl9<fBDVPJ^!8>i
+zdZ;-nzNh|O$T7C3ZM&k2Y+^HBJd-3Im`I(G!U6$)==5aDDUJ<_z++?^ZUCOOmcyJ=
+z0*|=N+06g;!M7x)ag4Jt0H8F^E3<dZvS14eTLR&gTZ?&C{-!Tj2hw;d>^5@Z>=a9o
+z6-57%h4Vzz$eYb7%m~mdk+^RnG20;g;26zQahCFOF=JByysGL-CTBJl{C+3yqoQnD
+zOS($AY+k3nv{sO<cWzQnDOi-5qMW&qqy8CZ`t4hBkqX76p{A*@=nTHXg5`b}lWEun
+z(>O3oCZ@69X@6Y2zF08kO<hi@*XLCuuWAW>iHa^P#n1?>N@7GSq-4z;O}G}kSLQNw
+z6;k(;aQAv@BXAHJsD=g}UU@XMGqfK{tO&JG*SYhjA_<1p?yufoAK!ZS>)T)5-j}Yd
+zFf}Q-&aK{GVGgAWj&W>j>@ojJy4GT<MPr-Ajp9S@k+dW2N3X5;*10dF6NrNtc)gDM
+z5#jYuwTc!^j<B)nn*@cOW+%xLcEZ{9ggjv=lQD5izY&F=`bRW5H>1d-rJld0z_VS3
+zl_qAQLiWOYW6wncugia7HhN*9(TCj|(6uld{qX%yq;KMSm-Lyu7yjl`hZNpgzb+f_
+z?y4H#P7sosH#3EN(o}PD-pZuRxIo)b5$2o>isEODj6(exSfHyZvte@Jg;XJ@XEfDF
+zqQ{&WZ>NI0iPbgQ?mq5GP=f}#l#4Vpi5~BvP$w;8A!Ql(${YB|(YCvwoB2ubON04B
+zat6N~Mk?qU{5jB$4;y5kxLhJ-id0-wGqZD+5knV&8QDtBCCyAprGn$Y7{nYjMcgQv
+zS198am{9}fx6oC{udE~_>b)e=xf$JvZiP2`Dj(IPj>>pV>fRcxN|#@@4^-~e`G6#T
+zd2?-ab+qR1IE-{1M6OmNS04wSjctGag8NQ-F6~FgYr*g@QpehZ)dyRH+u=vio#^B6
+zPS49r!_~y-zI5kM>Nt>kt5R=W;39!jKk4k+9Nrk-7PddzDpiNx+mDPK#`+Fo!`0aE
+z_kFKoAD?ytYyBee`B%D6x&l(TP69&MEosmghWKe4<T#OE$icM~oWV&i_2IMz>F2Nu
+z;g?#}RRare$(n(WnDG`mh`w%1xFs}rTyg_D%$O@jRIqmias_2UQ%8;WVGi$xiN-p|
+ZFw9RRa73a<r0a;pkI0P^zK?N({u6*X%0&PG
+
+literal 0
+HcmV?d00001
+
+diff --git a/kernel.py b/kernel.py
+index a877f2f..49dd3c1 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,36 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.lax as lax
++from jax.experimental import pallas as pl
++from jax.experimental.pallas import tpu as pltpu
++
++def workload(x, weight):
++    def kernel(x_ref, w_ref, out_ref):
++        # x_ref: (32, 8192), w_ref: (8192, 8192)
++        # Compute dot: x_ref @ w_ref.T -> (32, 8192)
++        # Use float32 accumulation
++        x_f32 = x_ref[...].astype(jnp.float32)
++        w_f32 = w_ref[...].astype(jnp.float32)
++        # dot_general: contract x dim 1 with w.T dim 0 = w dim 1
++        # So y = jnp.dot(x_ref, w_ref.T)
++        y = jnp.dot(x_f32, w_f32.T)
++        y = y / 2.0
++        y = jnp.sum(y, axis=1, keepdims=True)
++        y = y * 1.5
++        out_ref[...] = y.astype(jnp.bfloat16)
++    
++    batch_size = x.shape[0]
++    block = 32
++    grid = (batch_size // block,)
++    
++    return pl.pallas_call(
++        kernel,
++        out_shape=jax.ShapeDtypeStruct((batch_size, 1), jnp.bfloat16),
++        grid=grid,
++        in_specs=(
++            pl.BlockSpec((block, x.shape[1]), lambda i: (i, 0)),
++            pl.no_block_spec,
++        ),
++        out_specs=pl.BlockSpec((block, 1), lambda i: (i, 0)),
++        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
++    )(x, weight)

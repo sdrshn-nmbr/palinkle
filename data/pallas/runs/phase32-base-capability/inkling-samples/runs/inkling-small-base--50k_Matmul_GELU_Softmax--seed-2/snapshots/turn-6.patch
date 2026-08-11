@@ -1,0 +1,47 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..7451c18 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,40 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.experimental.pallas as pl
++import jax.experimental.pallas.tpu as pltpu
++
++def workload(x, weight, bias):
++    def kernel(x_ref, w_ref, b_ref, out_ref, scratch_ref):
++        # Initialize scratch accumulation buffer
++        scratch_ref[...] = jnp.zeros((128, 8192), jnp.float32)
++        # Tile over output features (8192 / 128 = 64)
++        for j in range(64):
++            w_tile = w_ref[:, j * 128:(j + 1) * 128]
++            # x_ref is [128, 8192], w_tile is [8192, 128]
++            acc_tile = jnp.dot(x_ref.astype(jnp.float32), w_tile.astype(jnp.float32))
++            # Accumulate into scratch
++            old = scratch_ref[:, j * 128:(j + 1) * 128]
++            scratch_ref[:, j * 128:(j + 1) * 128] = old + acc_tile
++        # Add bias
++        scratch_ref[...] = scratch_ref[...] + b_ref.astype(jnp.float32)
++        # GELU
++        scratch_ref[...] = jax.nn.gelu(scratch_ref[...])
++        # Softmax over axis=1
++        max_val = jnp.max(scratch_ref[...], axis=1, keepdims=True)
++        exp_val = jnp.exp(scratch_ref[...] - max_val)
++        sum_val = jnp.sum(exp_val, axis=1, keepdims=True)
++        out_ref[...] = (exp_val / sum_val).astype(jnp.bfloat16)
++
++    return pl.pallas_call(
++        kernel,
++        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
++        grid=(4096 // 128,),
++        in_specs=(
++            pl.BlockSpec((128, 8192), lambda i: (i * 128, 0)),
++            pl.no_block_spec,
++            pl.no_block_spec,
++        ),
++        out_specs=pl.BlockSpec((128, 8192), lambda i: (i * 128, 0)),
++        scratch_shapes=(pltpu.VMEM((128, 8192), jnp.float32),),
++        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
++    )(x, weight, bias)

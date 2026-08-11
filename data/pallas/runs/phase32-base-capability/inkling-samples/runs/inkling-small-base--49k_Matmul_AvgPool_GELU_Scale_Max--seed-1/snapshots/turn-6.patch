@@ -1,0 +1,94 @@
+diff --git a/__pycache__/kernel.cpython-312.pyc b/__pycache__/kernel.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..86fa6496d9b3cf45de7eee92bbd166feeaa451fe
+GIT binary patch
+literal 1927
+zcmbtU&2Jk;6rb5o$KG`kH>p$7R&6K|t4MCC1g8+yQcHlM^bm=IFJ|MNr0cBL%kCOG
+z)<)`~2M3TEP7Nn=MacyTi6egi7ot>(H6&^!xa4MVPMmnNA5LhBdSEQ?d++!5eZSdX
+zR5gv@l$YDp6%nD|nUEYVX8NB2^As7#z!oY+6xX;Ck0V~Fi6t@QISbXKk`&`|Emh$#
+zstuLWF_KA;5LZen;QV7$%C2EeIA-A%G)y_$uJBBV&k#^1_ft5`13yOVJcoRcqEk&W
+zO#q+)??XM&sY(fVN)66WB~mr)K_W$TC-!OZ{y<Sx2JC?OKicKj_%?)HaVO3_KmiW8
+zowzTHNRt*S!XOKTSTPsi-)C)kiUJtcB@owz0LPpda4{#nrgcIfCglfGn|YDXSe%Ut
+zI(7ot;CA`M2Hut<9HHu<$q5p^E%<|xysG(z2tR38PKq~D?aWJAykZpRvKUTcR!0)<
+zlm_xnyg=(RSPr#eUH(;P?)2S+dpSZN2fTr2LA{2w^g`j7d4vrX^p@$ZBvu;lvTDP}
+zG0TLCpB6v)=&mNxv}v1u`3v1@5SppfYfi)0eY0-U(WYq|^=8>HYsB^d@n|-NJl{19
+z;!)Yr4a2lo;yAbNBmwVeY06h^hw?_<ry0_6blYH_Jjz>oi>fX$8WmEG{81j<P}%#u
+zK}egpY{96oLaYYmYkEsdQL$Ba$ubq25m^d}TyOZ1++yi7ZAg|vg4aAY_iOR_d+cVj
+z?yh={ULiMEiE9(9;H*(8V%rl;Y1MV3Fl*H-y5-FkA`QFv-p}xOgkFq{Z&toZcf{^F
+z=0rm3$dmbv`OSM<@9rztx9{yKS_en)gN+AU#qHuVWjaO<lq-A6m9C<8^KTqZOnxVS
+zD|fHH-JN`^J2rWu%4)ioMe69E!?HRG7Guoy{f+xucpE=crXnB1VX)#?A9rvMVrMt`
+zjrk-VOQX02@ve68i~K}K-sHbj`cML_g^6JJ-=hy;?nA77-b39X&}$ecO__Gtb4bOD
+zRS|32K5-qF_?k>P$D$cWw=CT&Lz65RG0bvgkvX~RuQ_DVcN-PoWlK*}OUuwu|DE@!
+zYS+t4(AL$^y(UoHqEeHXD-V4tESb9JUIzn@U1~Nh_gZM4OvJqnA{(XW!Q&D7i<=TJ
+z^*+QIMf&>olevw#ZYq128$ZZR@8zbqn?LeDDL*Ltx%a#3@E=O{K)Jl9Ts}O<^kgBI
+zK1rhsU^umxo9gEBC*$C<cM-{{&c)5Kem<k*dnhC3-6@Ex4ZAZy=nzy~up2el9Wf+P
+zu`+{Uv0Zj!qXo`02o|5X?Ed&V>|5A5s+<L>6rrxhyifjzO~H5IF0hB_SU|#_xNovp
+zEV;O2v$eX>u*jUtz6R_w;4x*7#~A;H(nlzNgvO6h?m4>gE4uL<&FrI@zHkdi1^xqz
+CSgFPU
+
+literal 0
+HcmV?d00001
+
+diff --git a/kernel.py b/kernel.py
+index a877f2f..a4a91c2 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,56 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.lax as lax
++from jax import nn
++import jax.experimental.pallas as pl
++import jax.experimental.pallas.tpu as pltpu
++
++def workload(x, weight, bias):
++    def kernel(x_ref, w_ref, b_ref, out_ref):
++        # Load inputs
++        x_val = x_ref[...]
++        w_val = w_ref[...]
++        b_val = b_ref[...]
++        
++        # Matmul + bias
++        y = jnp.dot(x_val, w_val) + b_val
++        
++        # Expand dims axis=1
++        y = jnp.expand_dims(y, axis=1)
++        
++        # Avg pool: reduce_window with add, divide by 16
++        y = lax.reduce_window(
++            y,
++            init_value=0.0,
++            computation=lax.add,
++            window_dimensions=(1, 1, 16),
++            window_strides=(1, 1, 16),
++            padding="VALID",
++        ) / 16.0
++        
++        # Squeeze axis=1
++        y = jnp.squeeze(y, axis=1)
++        
++        # GELU
++        y = nn.gelu(y)
++        
++        # Scale
++        y = y * 2.0
++        
++        # Max over axis=1
++        y = jnp.max(y, axis=1)
++        
++        out_ref[...] = y
++    
++    return pl.pallas_call(
++        kernel,
++        out_shape=jax.ShapeDtypeStruct((4096,), jnp.bfloat16),
++        grid=(),
++        in_specs=(
++            pl.no_block_spec,
++            pl.no_block_spec,
++            pl.no_block_spec,
++        ),
++        out_specs=pl.no_block_spec,
++        interpret=False,
++    )(x, weight, bias)

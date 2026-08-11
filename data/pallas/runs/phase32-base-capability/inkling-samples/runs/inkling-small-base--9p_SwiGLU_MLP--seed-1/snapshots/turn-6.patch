@@ -1,0 +1,62 @@
+diff --git a/__pycache__/kernel.cpython-312.pyc b/__pycache__/kernel.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..ebaba191d18d993aefa212fcfc7aae1214850a8f
+GIT binary patch
+literal 2311
+zcmcH(Jxm){_}#ya&ybiH2Ru+k5sDMyNTn4ar5>uPQ^Z26NbZ0xz6-TE+n2j@Y?DJ`
+zV8B%+!(=Q~!c4VA2Qsx|_bx>@Bzkd_p;;<*u<A^m`n~%pMsZ`7KIwgb?|pyoec$(M
+zI6Q`6@#~wpUl@dbCyc*nkLZ61L<7l4rc{)6F_ov&4CT^no=bBc&F6&-O`&`s9rPq)
+zzQmD-(jv&|9h44NsRZ)}aj}wNJx>IMVM8RS-=!R{)DGHWX=DQDuACp2F92+@Cg-y`
+z-lxv6g>r#2&Zj`?WbgAXKKAU(^ng$C{2js#w<$9_$hR;;pBfgE%wAZZ9;(k>Sf3fH
+z&!6c(Vn<{!^i^fy%)*a>WA9%qWKkAvF~{CtucAb7CG+p6!Fvj@Ct>&h1kgYxKz9xM
+z@Z6xLch4jioHZ;l3(9vIPA$sC{wE!Kg|)?9P@g`pzr~Nx<1Bs?qP3XwdKN2F%Mec$
+zCFqr8g2PNss$jZMz^su~OTZR1%*aJEAz-eurYnzdU|lj5hvG|`E0K%kf<p<#lIajE
+zxrFJGW{~Ijz+Hb|xl=Cc8-^xjlsg-WUQpDeR>izaZeAsaYEhDt%W5$rsYWX4o{*+7
+zz6P+3-b_U5Pijx<Pis%VUpQQBF19{yPafTCSAJ$XTXy_Ydm^>VcEgwI4{8tgzB*Xg
+zPq(Jp%u(D9-`=IWv6)7BzkFb}9yY7(8z&2$+ji{kuCT{^EB3)W>YxlkgUhJ}QY{Ts
+zr8@LVg3(E54uC6!bpW}mUj~2!%c_)rC`+l$nRk=&&&YLynBGS1gig58-s$%{)?;Ah
+zeLhK?eb?v77Z>oUlVWwVJD=i6Pf<|xvOAgkUp-Bc5N8M&{f4@8dB~TI%;)MrK0(J*
+zg2h2n@5VQhreJnm&&oKEEvy-uk}<p^LPG1%nu<f3q^gp!29>SqWN_e1t3>m2v#Kep
+zre4aJm~(A$GLhlnXV3>5t6&2fld9m5(|K-B;2<=gM~0mKa~VBC;w0vsp7YAlFG77D
+z4oF8D&j4(rzi5_Q>WLwd|L((js+M{Y81F`+&m(iEk-666AIeAN6Y3}7nP5lmz6eje
+z5y$KIYxfT>AI6%o(`yU1_)*sr#h*{#Je|JTS+T`WeA)EjY;(4gw8bS~GI*;O<RW8l
+zMKl?0%<s=1JU%Qp%cnP%?8v>hQHZBEg@nLvd@tLI_hTV3*+U^N=|20o`+7l`RLMdq
+z4-<rQkWS_V7Km7dA;u68Bb-vv6g`_)3Z?`D$N2>;4hk{vO7&~RLi|5;lBNa&kpNCp
+z0XdKPZs+HVa!FNE`XbmOQ{9*a&|@fydWptfq1Y=FeT}aFhOWOxw`_E)&qgRWv3~%a
+C1ke5e
+
+literal 0
+HcmV?d00001
+
+diff --git a/kernel.py b/kernel.py
+index a877f2f..f15ec6f 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,25 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.lax as lax
++import jax.experimental.pallas as pl
++import jax.experimental.pallas.tpu as pltpu
++
++def workload(x, gate_kernel, up_kernel, down_kernel):
++    def kernel(x_ref, gate_ref, up_ref, down_ref, out_ref):
++        # Full array computation inside kernel
++        gate = jax.nn.silu(jnp.dot(x_ref[...], gate_ref[...]))
++        up = jnp.dot(x_ref[...], up_ref[...])
++        out_ref[...] = jnp.dot(gate * up, down_ref[...])
++    
++    return pl.pallas_call(
++        kernel,
++        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
++        grid=(),
++        in_specs=(
++            pl.BlockSpec(x.shape, lambda: (0, 0, 0)),
++            pl.BlockSpec(gate_kernel.shape, lambda: (0, 0)),
++            pl.BlockSpec(up_kernel.shape, lambda: (0, 0)),
++            pl.BlockSpec(down_kernel.shape, lambda: (0, 0)),
++        ),
++        out_specs=pl.BlockSpec(x.shape, lambda: (0, 0, 0)),
++    )(x, gate_kernel, up_kernel, down_kernel)

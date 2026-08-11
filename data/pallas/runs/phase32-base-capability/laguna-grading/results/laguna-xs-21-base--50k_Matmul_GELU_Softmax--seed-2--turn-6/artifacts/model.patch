@@ -1,0 +1,79 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..d94804d 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,72 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import pallas as pl
++import pallas_core as pcore
++from pallas_core import tpu as pltpu
++
++def matmul_gelu_softmax_kernel(
++    x_ref,
++    weight_ref,
++    bias_ref,
++    out_ref,
++):
++    """Pallas kernel for Matmul + GELU + Softmax."""
++    m = x_ref.shape[0]
++    k = x_ref.shape[1]
++    n = weight_ref.shape[1]
++
++    # Get block indices
++    row_block = pl.program_id(0)
++    col_block = pl.program_id(1)
++
++    # Block sizes
++    block_m = x_ref.shape[0] // pl.grid()[0] if pl.grid()[0] > 0 else m
++    block_n = out_ref.shape[1] // pl.grid()[1] if pl.grid()[1] > 0 else n
++
++    # Compute matmul for this block
++    x_block = x_ref[row_block, :]
++    weight_block = weight_ref[:, col_block]
++
++    # Matmul: x @ weight
++    result = jnp.dot(x_block, weight_block)
++
++    # Add bias
++    result = result + bias_ref[col_block]
++
++    # Apply GELU
++    result = jax.nn.gelu(result)
++
++    # Apply softmax
++    result = jax.nn.softmax(result, axis=-1)
++
++    # Write output
++    out_ref[row_block, col_block] = result.astype(x_ref.dtype)
++
++
++def workload(x, weight, bias):
++    """Workload: Matmul + GELU + Softmax."""
++    # Output shape
++    out_shape = jax.ShapeDtypeStruct((x.shape[0], weight.shape[1]), x.dtype)
++
++    # Define grid based on output shape
++    # Use block sizes suitable for TPU
++    block_size_m = 128
++    block_size_n = 128
++
++    grid_m = x.shape[0] // block_size_m
++    grid_n = out_shape.shape[1] // block_size_n
++
++    return pl.pallas_call(
++        matmul_gelu_softmax_kernel,
++        out_shape=out_shape,
++        grid=(grid_m, grid_n),
++        in_specs=(
++            pl.BlockSpec((block_size_m, x.shape[1]), lambda i: (i * block_size_m, 0)),
++            pl.BlockSpec((x.shape[0], block_size_n), lambda i: (0, i * block_size_n)),
++            pl.BlockSpec((block_size_n,), lambda i: (i,)),
++        ),
++        out_specs=pl.BlockSpec((block_size_m, block_size_n), lambda i: (i[0] * block_size_m, i[1] * block_size_n)),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel", "parallel")
++        ),
++    )(x, weight, bias)

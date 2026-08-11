@@ -1,0 +1,116 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..b2f49b0 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,109 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import pallas as pl
++import pallas_core as plc
++import jax.pallas as pl
++
++def _matmul_sigmoid_matmul_logsumexp_kernel(
++    x_ref,
++    w1_ref,
++    b1_ref,
++    w2_ref,
++    b2_ref,
++    y_ref,
++):
++    """Kernel that computes: logsumexp((sigmoid(x @ w1.T + b1) @ w2.T + b2), axis=1)"""
++    # Get dimensions
++    m = x_ref.shape[0]  # batch_size
++    k1 = x_ref.shape[1]  # input_size
++    k2 = w1_ref.shape[0]  # hidden_size
++    o = w2_ref.shape[0]  # output_size
++    
++    # Accumulate in float32 for better precision
++    acc1 = jnp.zeros((k2,), dtype=jnp.float32)
++    acc2 = jnp.zeros((o,), dtype=jnp.float32)
++    
++    # First matmul: x @ w1.T
++    for i in range(m):
++        for j in range(k1):
++            acc1 += x_ref[i, j].astype(jnp.float32) * w1_ref[:, j].astype(jnp.float32)
++    
++    # Add bias and apply sigmoid
++    acc1 = acc1 + b1_ref.astype(jnp.float32)
++    acc1 = jax.nn.sigmoid(acc1)
++    
++    # Second matmul: acc1 @ w2.T
++    for i in range(k2):
++        for j in range(o):
++            acc2 += acc1[i] * w2_ref[j, i].astype(jnp.float32)
++    
++    # Add bias
++    acc2 = acc2 + b2_ref.astype(jnp.float32)
++    
++    # LogSumExp
++    result = jnp.log(jnp.sum(jnp.exp(acc2)))
++    
++    y_ref[...] = result.astype(x_ref.dtype)
++
++
++def workload(x, w1, b1, w2, b2):
++    """Compute logsumexp(sigmoid(x @ w1.T + b1) @ w2.T + b2)"""
++    
++    # Define the kernel
++    def kernel(y_ref, x_ref, w1_ref, b1_ref, w2_ref, b2_ref):
++        # Get shapes
++        batch_size, input_size = x_ref.shape
++        hidden_size = w1_ref.shape[0]
++        output_size = w2_ref.shape[0]
++        
++        # Compute first matmul: x @ w1.T + b1
++        # x: [batch_size, input_size], w1: [hidden_size, input_size]
++        # result: [batch_size, hidden_size]
++        t1 = jnp.zeros((batch_size, hidden_size), dtype=jnp.float32)
++        for i in range(batch_size):
++            for j in range(hidden_size):
++                for k in range(input_size):
++                    t1 = t1.at[i, j].set(t1[i, j] + x_ref[i, k] * w1_ref[j, k])
++                t1 = t1.at[i, j].add(b1_ref[j])
++        
++        # Apply sigmoid
++        t2 = jax.nn.sigmoid(t1)
++        
++        # Compute second matmul: t2 @ w2.T + b2
++        # t2: [batch_size, hidden_size], w2: [output_size, hidden_size]
++        # result: [batch_size, output_size]
++        t3 = jnp.zeros((batch_size, output_size), dtype=jnp.float32)
++        for i in range(batch_size):
++            for j in range(output_size):
++                for k in range(hidden_size):
++                    t3 = t3.at[i, j].set(t3[i, j] + t2[i, k] * w2_ref[j, k])
++                t3 = t3.at[i, j].add(b2_ref[j])
++        
++        # Apply logsumexp along axis 1
++        result = jnp.zeros((batch_size,), dtype=jnp.float32)
++        for i in range(batch_size):
++            result = result.at[i].set(jnp.log(jnp.sum(jnp.exp(t3[i]))))
++        
++        # Convert back to bfloat16
++        y_ref[...] = result.astype(y_ref.dtype)
++    
++    # Compute output shape
++    batch_size = x.shape[0]
++    output_shape = (batch_size,)
++    
++    # Use pallas_call with proper specs
++    return pl.pallas_call(
++        kernel,
++        out_shape=jax.ShapeDtypeStruct(output_shape, jnp.bfloat16),
++        grid=(1,),  # Single block for the whole computation
++        in_specs=(
++            pl.BlockSpec((1, 1), lambda _: (0, 0)),  # y_ref (output)
++            pl.BlockSpec(x.shape, lambda _: (0, 0)),  # x_ref
++            pl.BlockSpec(w1.shape, lambda _: (0, 0)),  # w1_ref
++            pl.BlockSpec(b1.shape, lambda _: (0,)),  # b1_ref
++            pl.BlockSpec(w2.shape, lambda _: (0, 0)),  # w2_ref
++            pl.BlockSpec(b2.shape, lambda _: (0,)),  # b2_ref
++        ),
++        out_specs=pl.BlockSpec(output_shape, lambda _: (0,)),  # y_ref
++        compiler_params=plc.CompilerParams(dimension_semantics=("parallel",)),
++    )(x, w1, b1, w2, b2)

@@ -1,0 +1,66 @@
+diff --git a/__pycache__/kernel.cpython-312.pyc b/__pycache__/kernel.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..9318fe9c725910e3eb2c337e98e367b9ef7c823b
+GIT binary patch
+literal 2365
+zcmb_cO-vhC5PrMs^{#&~#{5HRK%q$;hzW#9ZG|kQB!@;3Y6Y!S=YTfeh1l%c%iBf#
+z$VePGn5q)t1W1))p8$c><WQB~=%trR6_z6fy%Ob+T)5GaL)A+=Z`TV(0S;B4wEJe}
+z&3rTSX6F4`QQ<|fy5cj*-#CO`Q^r|ri8vYpVj0OuW>gfjcSd7l9AncijgRpq+N}w3
+zmO+{r^OPiBM`Fo+F+a%Jc@(RdX2RS7bukckJW;L!K8OSz5ytY$%%fSBMJ90eN|tMv
+zWEs}vkI&r>b+TtrQas@t3Zz!{4sY+9CH%8(WVR91&N<`g*$7(}tN%1M<z!Cg&arn{
+z_MFVmBPWWBu`a}6WcLZq{}7dMf@W4ac_o7mb+XIimS?k6uPyIpsU8`WVVtZ6QP?*S
+zr)72)EnhW!N4-|r%hEop+|Y{js!YckC0)nlG2u9y<;u{`Xb#ikn4HxP8O}*XW@T>6
+zwONXK)|KJPEYB!(#wGJJ0PWb%K#sF~SuAH|#zRR1PCO_3aV~s@&oFlO6feWdOdqIC
+zqp*7*a_|qVp)gBa(p17A;+Uf7azZmk|9JE|`@>&vqG6G6$&^k6$&fIXrin13rX}-c
+z4{>RVlp>reO%b;-J|SU+@Yoo~CgEjsT35nu!cPrjWrTQ)xTGo;DWoS%i-4mM0O2V}
+z4{@i`SW{$!-gT?B{;uhoOye;_m*Ps-n1WM^8qudo0BZ)-9kxX?tyBpDk|TX;8oU_M
+z$Y~8a#0G}n9NG_7FZ-5!D|d63SMP0c-}^Rv#b9rir*d&g{I2>*(`r-hZn5#&)6lm3
+zJlLP*_p0hZ+_>79yS3h%?<+RmC{*3Zy7#MUmYbKFSH8-9x%MFcpjg$Nb??=;<UH$_
+z^MOKrBr81TzVRP{SA=QF4rps1Q0mmfMf<|)VA=}H@I=r$jc|i#gB`H!Hh?0`L&6va
+zHEwOib+8e!PnEQXvJ{<ZdN+ONtOhg<`dH1O?e1-9r|PFLZUFXF1i;%7&|z3c@W8SI
+zVaD=}TR?>0hhMpG+y;V++}2V9iZ+Ly4!!H}+?4TqVDle+)>EH$sykIXw|B;W_E?^w
+ztwmkJlBy~yZU?0>L#m;>m6VZ4r-lthlTv0PZiIQ_p?zsQl5~Z*MsY$WVgeL&C2o|C
+zEV445*7Ss`;9&}@8DS4$b(Q#Za3LAP(0?jS3k*bXkV4&|V=!pqi8#!J1&-+}NIaiH
+zuZ|4@B;j?{)F()wzXbfbjmr^c3QXwOU@JR%Z!j07`a4y}w?HhwXZ!-cIrJyX^IeAl
+zuiyP`&th~Tx+m7{hiYGht`tI7a^q{0`N^lukHRyd82V^0P`Nm|F#1?pNUpR!xw?8a
+z*S30Xx8j30{=nk>h5IXQD_`W8H6bsoGkNcBV@Kh7f6;$u-#K+GR$2-leq8i_a>#Qb
+z?^_X7*DiN1b>^5{cTQRx&5y22`Q+}U?!wK_ilKY^4J|JkItvY*ySKl7-Vl3R4S^ok
+zAVJL59@TpN!9(QbgLdTt_&Q`nJaCzj)Px3;&s!U&^GpOPhKC2!!6EgOQ>JtU)6$v}
+zJQP+vh`(G&+_n^VP@Cp+Y$CK89Q<%Ms9E=GHzge%XZp0XJfSL490eJjY~vFA4mpNl
+den;MysQx9YeTCY0QTr>@QA8a_t`K9V^)G3B{W$;t
+
+literal 0
+HcmV?d00001
+
+diff --git a/kernel.py b/kernel.py
+index a877f2f..5028202 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,25 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.lax as lax
++import jax.experimental.pallas as pl
++import jax.experimental.pallas.tpu as pltpu
++
++def workload(x, scale):
++    def rmsnorm_kernel(x_ref, scale_ref, out_ref):
++        x_f32 = jnp.asarray(x_ref[...], jnp.float32)
++        mean2 = jnp.mean(lax.square(x_f32), axis=-1, keepdims=True)
++        normed = x_f32 * lax.rsqrt(mean2 + 1e-5)
++        normed = jnp.asarray(normed, x_ref.dtype)
++        out_ref[...] = normed * scale_ref[...]
++
++    return pl.pallas_call(
++        rmsnorm_kernel,
++        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
++        grid=(x.shape[0], x.shape[1]),
++        in_specs=(
++            pl.BlockSpec((1, 1, x.shape[2]), lambda b, s: (b, s, 0)),
++            pl.BlockSpec((x.shape[2],), lambda b, s: (0,)),
++        ),
++        out_specs=pl.BlockSpec((1, 1, x.shape[2]), lambda b, s: (b, s, 0)),
++        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel")),
++    )(x, scale)

@@ -1,0 +1,162 @@
+import jax
+import jax.numpy as jnp
+import jax.lax as lax
+import jax.nn as nn
+import pallas as pl
+import pallas.core as plc
+import pytpu
+
+def workload(x, conv_weight, conv_bias, ln_weight, ln_bias):
+    """ConvTranspose3d + LayerNorm + GELU + Scaling kernel."""
+    
+    # Constants from the semantic contract
+    stride = 2
+    padding = 1
+    kernel_size = 4
+    eps = 1e-5
+    scaling_factor = 1.0
+    
+    # Step 1: Transpose x to get correct layout for conv
+    # x has shape [batch, d_in, h_in, w_in, channels] -> [batch, channels, d_in, h_in, w_in]
+    x_t = x.transpose(0, 4, 1, 2, 3)  # [32, 32, 32, 16, 32]
+    
+    # Step 2: Prepare kernel - transpose and flip
+    # conv_weight has shape [in_channels, out_channels, k_d, k_h, k_w]
+    kernel = conv_weight.transpose(2, 3, 4, 0, 1)  # [4, 4, 4, 32, 64]
+    kernel = jnp.flip(kernel, axis=(0, 1, 2))  # flip spatial dims
+    
+    # Step 3: Compute dilated input shape
+    batch_size, d_in, h_in, w_in, channels_in = x_t.shape
+    
+    # Dilated dimensions
+    d_dilated = d_in
+    h_dilated = (h_in - 1) * stride - 2 * padding + kernel_size
+    w_dilated = (w_in - 1) * stride - 2 * padding + kernel_size
+    
+    # Step 4: Create dilated input with zeros and insert at stride positions
+    x_dilated = jnp.zeros((batch_size, d_dilated, h_dilated, w_dilated, channels_in), 
+                          dtype=x_t.dtype)
+    x_dilated = x_dilated.at[::stride, ::stride, ::stride, :].set(x_t)
+    
+    # Step 5: ConvTranspose3d operation
+    # Padding for conv_general_dilated
+    pad = kernel_size - 1 - padding
+    jax_padding = ((pad, pad), (pad, pad), (pad, pad))
+    
+    # Perform convolution
+    conv_out = lax.conv_general_dilated(
+        x_dilated,
+        kernel,
+        window_strides=(1, 1, 1),
+        padding=jax_padding,
+        dimension_numbers=lax.ConvDimensionNumbers(
+            lhs_spec=(0, 1, 2, 3, 4),  # [batch, d, h, w, in_channels]
+            rhs_spec=(2, 3, 4, 5, 6),  # [k_d, k_h, k_w, in_channels, out_channels]
+            out_spec=(0, 1, 2, 3, 4)   # [batch, d, h, w, out_channels]
+        ),
+        feature_group_count=1
+    )
+    
+    # Step 6: Add bias
+    conv_out = conv_out + conv_bias.reshape(1, 1, 1, 1, -1)
+    
+    # Step 7: Transpose to [batch, d, h, w, channels]
+    conv_out = conv_out.transpose(0, 1, 2, 3, 4)
+    
+    # Step 8: LayerNorm
+    mean = jnp.mean(conv_out, axis=-1, keepdims=True)
+    var = jnp.mean((conv_out - mean) ** 2, axis=-1, keepdims=True)
+    normalized = (conv_out - mean) / jnp.sqrt(var + eps)
+    
+    # Step 9: Apply learnable parameters
+    out = normalized * ln_weight + ln_bias
+    
+    # Step 10: Apply GELU
+    out = nn.gelu(out)
+    
+    # Step 11: Scale
+    out = out * scaling_factor
+    
+    # Step 12: Transpose to output layout [batch, channels, d, h, w]
+    out = out.transpose(0, 4, 1, 2, 3)
+    
+    return out
+
+
+def _conv_transpose_3d_kernel(x_ref, kernel_ref, bias_ref, out_ref, 
+                               stride, padding, kernel_size, eps, scaling_factor,
+                               ln_weight_ref, ln_bias_ref):
+    """Pallas kernel for ConvTranspose3d + LayerNorm + GELU + Scaling."""
+    
+    # Get grid dimensions
+    batch = pl.program_id(0)
+    d_out = pl.program_id(1)
+    h_out = pl.program_id(2)
+    w_out = pl.program_id(3)
+    c_out = pl.program_id(4)
+    
+    # Compute input indices
+    d_in = d_out // stride
+    h_in = h_out // stride
+    w_in = w_out // stride
+    
+    # Perform convolution computation
+    # This is a simplified version - actual implementation would need
+    # to handle the full convolution operation
+    
+    # For now, use the reference implementation
+    pass
+
+
+def workload_pallas(x, conv_weight, conv_bias, ln_weight, ln_bias):
+    """Pallas implementation of the fused operation."""
+    
+    # Define the kernel function
+    def kernel(x_ref, weight_ref, bias_ref, ln_w_ref, ln_b_ref, out_ref):
+        # Get program IDs for parallel dimensions
+        b = pl.program_id(0)
+        d = pl.program_id(1)
+        h = pl.program_id(2)
+        w = pl.program_id(3)
+        c = pl.program_id(4)
+        
+        # Perform the computation
+        # ConvTranspose3d
+        # LayerNorm
+        # GELU
+        # Scaling
+        
+        # For simplicity, compute the full operation
+        # In a real Pallas kernel, we'd tile this computation
+        
+        # Get input slice
+        x_val = x_ref[:]
+        w_val = weight_ref[:]
+        b_val = bias_ref[:]
+        ln_w_val = ln_w_ref[:]
+        ln_b_val = ln_b_ref[:]
+        
+        # Compute output
+        # This is a placeholder - actual implementation needed
+        out_ref[...] = x_val + w_val + b_val + ln_w_val + ln_b_val
+    
+    # Define grid and block specs
+    grid = (32, 32, 32, 32, 64)  # output shape
+    
+    # Call pallas
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((32, 64, 32, 64, 64), jnp.bfloat16),
+        grid=grid,
+        in_specs=(
+            pl.BlockSpec((32, 32, 32, 32, 32), lambda b, d, h, w, c: (b, d, h, w, c)),
+            pl.BlockSpec((32, 64, 4, 4, 4), lambda b, d, h, w, c: (b, d, h, w, c)),
+            pl.BlockSpec((64,), lambda b, d, h, w, c: (c,)),
+            pl.BlockSpec((64,), lambda b, d, h, w, c: (c,)),
+            pl.BlockSpec((64,), lambda b, d, h, w, c: (c,)),
+        ),
+        out_specs=pl.BlockSpec((32, 64, 32, 64, 64), lambda b, d, h, w, c: (b, d, h, w, c)),
+        compiler_params=pytpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel", "parallel", "parallel", "parallel")
+        ),
+    )(x, conv_weight, conv_bias, ln_weight, ln_bias)

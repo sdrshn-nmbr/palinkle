@@ -1,0 +1,182 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..880cc7d 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,175 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import pallas as pl
++import jax.pallas as plp
++import jax.interpreters.tpu as pltpu
++
++def workload(x, weight, bias):
++    """Matmul + Scale + ResidualAdd + Clamp + LogSumExp + Mish kernel."""
++    
++    def kernel(x_ref, weight_ref, bias_ref, output_ref):
++        # Get program indices
++        m = pl.program_id(0)  # batch dimension (4096)
++        
++        # Matmul: x[m, :] @ weight[:, :] -> result[m, :]
++        # x_ref is [128, 8192], weight_ref is [8192, 128] (transposed for column-major)
++        # We need to compute x @ weight.T + bias
++        
++        # Read the full row segment and weight column segment
++        x_row = x_ref[m, :]  # [128]
++        w_col = weight_ref[:, m]  # [128]
++        
++        # Actually, let's think about this differently
++        # For matmul on TPU, we need to tile properly
++        # x: [4096, 8192], weight: [8192, 8192], output: [4096, 8192]
++        # Then logsumexp reduces to [4096, 1]
++        
++        # Let's use a simpler approach: compute matmul in float32
++        # and then apply the rest of the operations
++        
++        # For now, let's just implement the kernel inline
++        pass
++    
++    # Define block sizes for TPU
++    BLOCK_M = 128  # tile along batch dimension
++    BLOCK_K = 128  # tile along reduction dimension
++    BLOCK_N = 128  # tile along output dimension
++    
++    # Grid dimensions
++    grid_m = x.shape[0] // BLOCK_M
++    grid_n = 1  # output is reduced via logsumexp
++    
++    def pallas_kernel(ref_x, ref_weight, ref_bias, ref_out):
++        # ref_x: [BLOCK_M, BLOCK_K]
++        # ref_weight: [BLOCK_K, BLOCK_N]
++        # ref_bias: [BLOCK_N]
++        # ref_out: [BLOCK_M, 1]
++        
++        m = pl.program_id(0)
++        
++        # Compute matmul in float32 for accumulation
++        x_block = ref_x[m, :]  # [BLOCK_K]
++        w_block = ref_weight[:, :]  # [BLOCK_K]
++        
++        # Matmul: sum(x * w)
++        result = jnp.dot(x_block, w_block)
++        
++        # Add bias
++        result = result + ref_bias
++        
++        # Scale by 2.0
++        result = result * 2.0
++        
++        # Residual add (multiply by 2 again)
++        result = result + result
++        
++        # Clip to [-10, 10]
++        result = jnp.clip(result, -10.0, 10.0)
++        
++        # LogSumExp along axis 0 (since we have a 1D result)
++        # Actually, the logsumexp is applied to the full tensor
++        # Let me reconsider...
++        
++        ref_out[m, 0] = result
++    
++    # This approach won't work for the full computation
++    # Let me implement it properly
++    
++    # For the actual workload, we need to:
++    # 1. Do the matmul
++    # 2. Apply scale, residual, clamp
++    # 3. Apply logsumexp
++    # 4. Apply softplus and mish
++    
++    # Let's use a single kernel that does everything
++    
++    def kernel(x_ref, weight_ref, bias_ref, out_ref):
++        # x_ref: [4096, 8192] - we tile this
++        # weight_ref: [8192, 8192] - we tile this
++        # bias_ref: [8192] - we tile this
++        # out_ref: [4096, 1] - we tile this
++        
++        # For simplicity, let's process one block at a time
++        # But we need the full matmul result first
++        
++        # Actually, let's just do the computation directly
++        # using pallas operations
++        
++        # Get the current block indices
++        i = pl.program_id(0)  # row index
++        j = pl.program_id(1)  # column index (for matmul)
++        
++        # For matmul: C = A @ B
++        # We accumulate in float32
++        
++        # Let's use a different approach - compute the entire
++        # operation in one go using jax operations inside the kernel
++        
++        # Read inputs
++        x_val = x_ref[:]  # [BLOCK_M, BLOCK_K]
++        w_val = weight_ref[:]  # [BLOCK_K, BLOCK_N]
++        b_val = bias_ref[:]  # [BLOCK_N]
++        
++        # Matmul
++        result = jnp.dot(x_val, w_val)
++        
++        # Add bias
++        result = result + b_val
++        
++        # Scale by 2
++        result = result * 2.0
++        
++        # Residual add
++        result = result + result
++        
++        # Clip
++        result = jnp.clip(result, -10.0, 10.0)
++        
++        # LogSumExp along last axis
++        result = jax.scipy.special.logsumexp(result, axis=-1, keepdims=True)
++        
++        # Softplus
++        softplus = jax.scipy.special.logaddexp(result, 0.0)
++        
++        # Mish
++        mish = result * jnp.tanh(softplus)
++        
++        # Final multiply
++        result = result * mish
++        
++        # Write output
++        out_ref[:] = result
++    
++    # Grid spec for 2D tiling
++    # x: [4096, 8192], weight: [8192, 8192], bias: [8192], out: [4096, 1]
++    
++    # For matmul, we need to tile x along batch and weight along output
++    # But logsumexp reduces the last dimension
++    
++    # Let me reconsider the shapes:
++    # After matmul: [4096, 8192]
++    # After scale/residual/clamp: [4096, 8192]
++    # After logsumexp(axis=1, keepdims=True): [4096, 1]
++    
++    # So we need to tile along batch dimension only
++    
++    grid = (x.shape[0],)  # one block per batch element
++    
++    in_specs = (
++        pl.BlockSpec((1, x.shape[1]), lambda _: (0, 0)),  # x: [1, 8192]
++        pl.BlockSpec((x.shape[1], weight.shape[1]), lambda _: (0, 0)),  # weight: [8192, 8192]
++        pl.BlockSpec((weight.shape[1],), lambda _: (0,)),  # bias: [8192]
++    )
++    
++    out_specs = pl.BlockSpec((1, 1), lambda _: (0, 0))  # output: [1, 1]
++    
++    return pl.pallas_call(
++        kernel,
++        out_shape=jax.ShapeDtypeStruct((x.shape[0], 1), x.dtype),
++        grid=grid,
++        in_specs=in_specs,
++        out_specs=out_specs,
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel", "reduction")
++        ),
++    )(x, weight, bias)

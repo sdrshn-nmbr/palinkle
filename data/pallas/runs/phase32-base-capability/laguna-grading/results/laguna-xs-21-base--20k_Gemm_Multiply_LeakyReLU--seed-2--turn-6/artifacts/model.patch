@@ -1,0 +1,69 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..9975ad6 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,62 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import pallas as pl
++import pallas.core as plcore
++import jax.pallas as pl
++import jax.pallas.lib as pllib
++import jax.pallas.tpu as pltpu
++
++def workload(x, weight, bias):
++    """Gemm + Multiply + LeakyReLU kernel."""
++    # Output shape: [4096, 8192]
++    out_shape = jax.ShapeDtypeStruct(x.shape, x.dtype)
++
++    def gemm_multiply_leaky_relu_kernel(ref_ref, w_ref, b_ref, out_ref):
++        # Grid dimensions
++        m = pl.program_id(0)  # batch dimension (4096)
++        n = pl.program_id(1)  # output feature dimension (8192)
++
++        # Block sizes for tiling
++        block_m = 128
++        block_n = 128
++
++        # Accumulate in float32 for better precision
++        acc = ref_ref.zeros_like(jnp.float32)
++
++        # Matrix multiplication: x @ weight
++        # x is [block_m, 8192], weight is [8192, block_n]
++        # We need to reduce over the k dimension
++        k = 0
++        while k < 8192:
++            # Load tiles
++            x_tile = ref_ref[k:k+16, n:n+block_n]  # vectorized load
++            w_tile = w_ref[m:m+block_m, k:k+16]  # vectorized load
++            acc += jnp.sum(x_tile * w_tile, axis=0)
++            k += 16
++
++        # Add bias
++        acc += b_ref[n:n+block_n]
++
++        # Multiply by 2.0
++        acc = acc * 2.0
++
++        # LeakyReLU: where(x >= 0, x, x * 0.1)
++        acc = jnp.where(acc >= 0, acc, acc * 0.1)
++
++        # Store output
++        out_ref[m*block_m:(m+1)*block_m, n*block_n:(n+1)*block_n] = acc.astype(x.dtype)
++
++    return pl.pallas_call(
++        gemm_multiply_leaky_relu_kernel,
++        out_shape=out_shape,
++        grid=(32, 64),  # 4096/128=32, 8192/128=64
++        in_specs=(
++            pl.BlockSpec((128, 128), lambda i: (i[0], i[1])),
++            pl.BlockSpec((128, 128), lambda i: (i[0], i[1])),
++            pl.BlockSpec((128,), lambda i: (i,)),
++        ),
++        out_specs=pl.BlockSpec((128, 128), lambda i: (i[0], i[1])),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel", "parallel")
++        ),
++    )(x, weight, bias)

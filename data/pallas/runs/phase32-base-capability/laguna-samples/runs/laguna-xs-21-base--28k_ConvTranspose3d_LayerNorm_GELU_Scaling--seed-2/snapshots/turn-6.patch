@@ -1,0 +1,168 @@
+diff --git a/__pycache__/kernel.cpython-312.pyc b/__pycache__/kernel.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..680f35d8fd0965b85de2b59bc075d1e2be9aae39
+GIT binary patch
+literal 223
+zcmX@j%ge<81mBb@vgCpEV-N=h7@>^MASKfoQW#noq8KU}HJOrODqu7_knx!Xtg4bh
+zlhJP_khsN`nO9I+Qd|r&M&Xx;etCXTc5y*sa;koIYEfQlj$T3KEe?=iPJUua5gSky
+zNM$iAkZ54I!NUF-$YAi(WCTkUF#|b8AbW~H3T|=O<mRW8=A_ycaR9ksjUZQkU}j`w
+M{LIA2$N^Rh07NY*Hvj+t
+
+literal 0
+HcmV?d00001
+
+diff --git a/kernel.py b/kernel.py
+index a877f2f..4f6c852 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,148 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++from jax import lax
++import jax.pallas as pl
++import jax.pallas as plp
++import jax.interpreters.pallas as pallas
++from jax.interpreters import pxla
++from jax.interpreters.pallas import shm
++from jax.interpreters.pallas import lib as pallas_lib
++import functools
++
++# Constants from the semantic contract
++STRIDE = 2
++PADDING = 1
++KERNEL_SIZE = 4
++EPS = 1e-5
++SCALING_FACTOR = 1.0
++
++
++def workload(x, conv_weight, conv_bias, ln_weight, ln_bias):
++    """ConvTranspose3d + LayerNorm + GELU + Scaling workload."""
++    
++    # Step 1: Transpose x from (batch, d_in, h_in, w_in, channels) to (batch, channels, d_in, h_in, w_in)
++    x_t = jnp.transpose(x, (0, 4, 2, 3, 1))
++    
++    # Step 2: Transpose kernel from (in_channels, out_channels, k, k, k) to (k, k, k, out_channels, in_channels)
++    kernel = jnp.transpose(conv_weight, (2, 3, 4, 1, 0))
++    
++    # Step 3: Flip kernel along first 3 axes (spatial dimensions)
++    kernel = jnp.flip(kernel, axis=(0, 1, 2))
++    
++    # Step 4: Get input shape
++    batch_size, d_in, h_in, w_in, channels = x.shape
++    
++    # Step 5: Calculate dilated dimensions
++    k = KERNEL_SIZE
++    d_dilated = d_in + (k - 1) * (STRIDE - 1)
++    h_dilated = h_in + (k - 1) * (STRIDE - 1)
++    w_dilated = w_in + (k - 1) * (STRIDE - 1)
++    
++    # Step 6: Create dilated input with padding
++    pad = (k - 1) - PADDING
++    x_dilated = jnp.zeros((batch_size, d_dilated, h_dilated, w_dilated, channels), dtype=x.dtype)
++    x_dilated = x_dilated.at[x_t].set(x)
++    
++    # Step 7: ConvTranspose3d operation
++    # Output shape: (batch, channels, d_out, h_out, w_out)
++    # where d_out = d_in + 2 * padding = d_in + 2
++    # and kernel_size = 4, stride = 2
++    # For conv_transpose, output_size = input_size * stride + 2 * padding - kernel_size + output_padding
++    # Here: output_size = d_in * 2 + 2 * 1 - 4 + 0 = 2 * d_in - 2
++    # But we need to match the expected output shape (32, 64, 32, 64, 64)
++    
++    # Actually, let me reconsider. The conv_general_dilated is used with:
++    # - window_strides = (1, 1, 1)
++    # - padding = ((pad, pad), (pad, pad), (pad, pad))
++    # - dimension_numbers = ('NDHWC', 'IOHWOI', 'NDHWC')
++    
++    # Wait, looking at the semantic contract more carefully:
++    # dimension_numbers for conv_general_dilated: ('NDHWC', 'DHWOI', 'NDHWC')
++    # This means:
++    # - input: NDHWC (batch, d, h, w, c_in)
++    # - kernel: DHWOI (d, h, w, c_out, c_in)
++    # - output: NDHWC (batch, d, h, w, c_out)
++    
++    # But we transposed x to get x_t which is (batch, channels, d_in, h_in, w_in)
++    # And kernel is (k, k, k, out_ch, in_ch) after flip
++    
++    # Let me trace through the shapes:
++    # x: (32, 32, 16, 32, 32) -> x_t: (32, 32, 32, 32, 32) after transpose to (batch, channels, d, h, w)
++    # Wait, the original x is (batch, d_in, h_in, w_in, channels) = (32, 32, 16, 32, 32)
++    # After transpose to (batch, channels, d, h, w): (32, 32, 32, 16, 32)
++    
++    # Hmm, let me re-read the semantic contract...
++    # x is assigned to x_dilated which has shape (batch_size, d_dilated, h_dilated, w_dilated, channels)
++    # where batch_size, d_in, h_in, w_in, channels = x.shape
++    
++    # So x_dilated is created with shape from x.shape
++    # Then x_dilated.at[x_t].set(x) - this sets x_t into x_dilated
++    
++    # x_t has shape (batch, channels, d_in, h_in, w_in) after the first transpose
++    # But wait, the first assignment says x = jnp.transpose(x, (0, 2, 3, 4, 1))
++    # So x becomes (batch, d_in, h_in, w_in, channels) -> (batch, channels, d_in, h_in, w_in)
++    
++    # Let me re-read: x is assigned to jnp.transpose(x, (0, 2, 3, 4, 1))
++    # Original x: (32, 32, 16, 32, 32)
++    # After transpose: (32, 16, 32, 32, 32) - wait that doesn't match (0, 2, 3, 4, 1)
++    # (0, 2, 3, 4, 1) means: new_axis_0 = old_axis_0, new_axis_1 = old_axis_2, etc.
++    # So: (32, 16, 32, 32, 32)
++    
++    # Actually I need to be more careful. Let me implement this step by step following the semantic contract exactly.
++    
++    # Following the semantic contract exactly:
++    # 1. x = jnp.transpose(x, (0, 2, 3, 4, 1))  # x becomes (batch, d, h, w, channels) -> (batch, h, w, channels, d)
++    #    Wait, the indices are (0, 2, 3, 4, 1)
++    #    Original: (batch, d, h, w, c) = (32, 32, 16, 32, 32)
++    #    After: (32, 16, 32, 32, 32) - new shape
++    
++    # Let me just implement the full computation as described in the semantic contract
++    
++    # Actually, I realize I should implement this more carefully. Let me trace through the semantic contract:
++    
++    # The semantic contract shows the exact operations. Let me implement them in order.
++    
++    # First, let me understand the shapes:
++    # x: (32, 32, 16, 32, 32) - (batch, d_in, h_in, w_in, channels_in)
++    # conv_weight: (32, 64, 4, 4, 4) - (in_ch, out_ch, k, k, k)
++    # conv_bias: (64,) - (out_ch,)
++    # ln_weight: (64,) - (channels_out,)
++    # ln_bias: (64,) - (channels_out,)
++    
++    # Output: (32, 64, 32, 64, 64) - (batch, d_out, h_out, w_out, channels_out)
++    
++    # Let me implement this properly:
++    
++    # Transpose x: (0, 2, 3, 4, 1) -> (32, 16, 32, 32, 32)
++    x = jnp.transpose(x, (0, 2, 3, 4, 1))
++    
++    # Transpose kernel: (2, 3, 4, 1, 0) -> (4, 4, 4, 64, 32)
++    kernel = jnp.transpose(conv_weight, (2, 3, 4, 1, 0))
++    
++    # Flip kernel along axes (0, 1, 2)
++    kernel = jnp.flip(kernel, axis=(0, 1, 2))
++    
++    # Get shape of x (now transposed)
++    batch_size, d_in, h_in, w_in, channels = x.shape
++    
++    # Calculate dilated dimensions
++    k = KERNEL_SIZE
++    d_dilated = d_in + (k - 1) * (STRIDE - 1)
++    h_dilated = h_in + (k - 1) * (STRIDE - 1)
++    w_dilated = w_in + (k - 1) * (STRIDE - 1)
++    
++    # Create zeros array for dilated input
++    x_dilated = jnp.zeros((batch_size, d_dilated, h_dilated, w_dilated, channels), dtype=x.dtype)
++    
++    # Set the transposed x into the dilated array at the correct position
++    # The slice is (slice(None), slice(None, None, stride), slice(None, None, stride), slice(None, None, stride), slice(None))
++    x = x_dilated.at[
++        batch_size * h_dilated * w_dilated * channels:,  # This is wrong, let me think again
++    ].set(x)
++    
++    # Actually, looking at the semantic contract again:
++    # x_dilated.at[x_t].set(x) where x_t is the transposed x
++    # But we already transposed x, so we need to use the original x
++    
++    # Let me restart with a cleaner implementation
++    pass

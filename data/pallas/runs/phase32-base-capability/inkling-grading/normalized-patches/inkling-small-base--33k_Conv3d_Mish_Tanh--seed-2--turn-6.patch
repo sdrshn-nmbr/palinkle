@@ -1,0 +1,88 @@
+diff --git a/__pycache__/kernel.cpython-312.pyc b/__pycache__/kernel.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..4b0d41199dc00c5516d5c25277ac6112f3d26a4f
+GIT binary patch
+literal 2177
+zcmbtU-D@0G6u<L5yP4f=l5IYS)S9l~q`I*h1BEnH8``we6p0|D56kS%B-vzkcDOTf
+zH(>*L=)<lGNuN?dFvWtF^wAeV@DK1MVIQ(wEfws`J{jELgD-mSd~8yU2Jyn2uY2w}
+z=l;&Q^L;E9MX-L+R~LsRgnp(<xY$5wy$`|`(vi-XXx8UUft}?TU*-$KtPsdzLCUcV
+zD#){uz!D8Dp1osM0Xusa&Bj(3m21)z(>X54L|Ftrs<)zymzBAT);Jere=UYpg$Cd{
+z>++$xD2CDz-wDpF@hoy_d~Yp!HxD(RSGWqVbFLg(7nM*t;{RuN?v&V%`5hss1XY*{
+zyAvQYgH&NU*S;jU&=Py#YyIZIRDtFUfV#$4m_QOLY#@pM4j){ZJ%Z>IUqR>EzLFah
+zi_l51SNMvg^SYpmkEQThYy7eJZJ43(U{yq2ZpWAZi!Wr8S0T!C8BS>Nv6v?`SC1Uq
+zkB3zq@e02aj3Uhy${}BiKoyZyK;^V5j^aG$dBSi*ccN`Xc!<yG%sAv;L2AczS`{!o
+z)AR@(mL?sNCan>+XnQby5E$Mz!W3`MUFCe)Gf<*(k63TVC-jYAN>q*r)00ylTqOd~
+z8@Dk96pZmw-qMSujN{_GZa74;HC@kJ^Q2497YxhE7p;u7T*w;Ofil`@j-=)vusk)m
+z!LbV4RjV@L7A>1ZT&!7+U33h>nOd17b4BaJ%)DV4STi$v-qc(}ClWTC1<f`H?`qZp
+zcoydgXOwL<N`!I-8*@Y``7G-(skrQV0#hbTi7;6rFB#Y}%uI<ysf!m)Cww9AEI9Py
+z=i2M{<VdNAmmFKm86*Cww7o(^UtH~{n`Tkd)8l3_r<u+~+TWo_I6nbdM-8QG^L*`Q
+zmHE4HD56+m<5um~{g>`%>dI?X=2=hg*5!Mbx4X7)*Ly~*@-wA#UrFsLsfH4(mK%eq
+zM)K9h*-M8JAr`GNhjG+9uyyC&o$apO)M)+8Th%Cp{HqC$Zboa<;2uSZo{e&?{2BMT
+z^r^JXJiPkl^#|9#di#r;590Oyk$UIrRi1kDwJ9h?>D-vAO>MsS@w>iqyv{~ne^uJ#
+zK2ln6N0`870$B43C1)v_0D@lu@(8IsiO>!NJ)4I?B68l!IJS{<f-Nel5)1(}JuyR@
+zJL#_2#*B-Xb1tT_iJYASpxujOgtbl5VQZ$TIT^s*Br&U)$pZdMUQC#?7w7@8WaQ@;
+zT*7DbnuE{Nf`)-Obn3kR;vwoLhb_copwj2#U?A)0SN5DRa5%}JuH=3qwU<ckzI^H1
+zH@_SIX1t!5TEB6?ii-Hj8ygd~iH00+bPqOSoj-Ob_q&Jox`!UVv!5E>OO1Y=-5<NQ
+zH+F5e>w0_dumcVrC`gj4y_?BaOjP;~kSO%w6r@$-I1P+M0Esj_ESNRHV?GEHHN(rm
+z-PEa%YB2Z)rf<>J%(RaRQH~pl=v(ncdS>t+&ZJ#?nQ)W{wh7Eb1FLYvt1G~2yinAa
+tO=ALIferfaab5&+z%dN-1ByODeNWJtrzo|HQcux^I=ax}hZ+B3e*$gG%LxDg
+
+literal 0
+HcmV?d00001
+
+diff --git a/kernel.py b/kernel.py
+index a877f2f..329bc8f 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,49 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.lax as lax
++import jax.experimental.pallas as pl
++import jax.experimental.pallas.tpu as pltpu
++
++def workload(x, weight, bias):
++    def kernel(x_ref, w_ref, b_ref, out_ref):
++        x = x_ref[...]
++        w = w_ref[...]
++        b = b_ref[...]
++        # Transpose x: (0,2,3,4,1) -> wait original: x transpose to (0,2,3,4,1)?
++        # From AST: transpose x with (0,2,3,4,1)
++        x = jnp.transpose(x, (0, 2, 3, 4, 1))
++        # Transpose weight: (2,3,4,1,0)
++        kernel_w = jnp.transpose(w, (2, 3, 4, 1, 0))
++        # Conv
++        x = lax.conv_general_dilated(
++            x, kernel_w,
++            window_strides=(1, 1, 1),
++            padding=((0, 0), (0, 0), (0, 0)),
++            dimension_numbers=("NDHWC", "DHWIO", "NDHWC")
++        )
++        # Add bias reshaped
++        b_reshaped = jnp.reshape(b, (1, 1, 1, 1, -1))
++        # Wait AST: reshape bias with (1,1,1,1,-1) then add
++        # Actually AST: reshape(bias, (1,1,1,1,-1))? Let's check: args are 1,1,1,1, UnaryOp(USub(1)) -> (1,1,1,1,-1)
++        b_reshaped = jnp.reshape(b, (1, 1, 1, 1, -1))
++        x = x + b_reshaped
++        # Mish: x * tanh(log(1 + exp(x)))
++        # Actually AST: tanh(log(1 + exp(x))) * x? Let's parse:
++        # Mult(left=x, right=tanh(log(1 + exp(x))))
++        # So x * tanh(log(1 + exp(x)))
++        mish = jnp.tanh(jnp.log(1 + jnp.exp(x)))
++        x = x * mish
++        # Tanh
++        x = jnp.tanh(x)
++        # Transpose back: (0,4,1,2,3)
++        x = jnp.transpose(x, (0, 4, 1, 2, 3))
++        out_ref[...] = x
++
++    out_shape = jax.ShapeDtypeStruct((16, 64, 30, 62, 62), jnp.bfloat16)
++    return pl.pallas_call(
++        kernel,
++        out_shape=out_shape,
++        grid=(),
++        in_specs=(pl.no_block_spec, pl.no_block_spec, pl.no_block_spec),
++        out_specs=pl.no_block_spec,
++    )(x, weight, bias)

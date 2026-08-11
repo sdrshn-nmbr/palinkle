@@ -1,0 +1,65 @@
+diff --git a/__pycache__/kernel.cpython-312.pyc b/__pycache__/kernel.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..e4950952831de9025b1420bcfdd59391f9a0de44
+GIT binary patch
+literal 2166
+zcmbtUO=ufO6rS1DN-J4*WI3vpv`uSb(yDf4l0aLiD@c<=T7qd%p`eSp*<Hz!SJGy7
+zjen5A2OsQGuzj+RHUvy?4(+MQ&AFxY5}|_4)Fp-H;+v>)>Z$MTk8LG!4eh|rn|b^8
+zy>Gtx-u}|v9U(AotFz_L0)+gD8-EDiqJ0w<YeXX&HAv32v?An0>aGJ7Nfjum1al$J
+zBl{l5AI?R<FD#H;*9=XG2bgwD^|Rxy3my@k_LtPDL>I`Mpb2xLKy2{1qkQ}e&sP_0
+z>F|BfUme*xDa%JYe+6FW)c)SJ+g|><c&ui$GX{5>s09{?AAL%!qy>*+3&JVUAx%Dt
+zw$J#r%Q1g-WVP^v$hODLgRX7w>~&J7KC&!HMaNX6)gMSzA3SZ@p}7thdJeYbLyG-C
+zLhM7b%OH!FhhKP3tkeIUBVZq5EWhpwMNL4I^?+;r<IPER=@jIzxq2UYUC`(#WSt=?
+zaV*X7v?+-P70aG6buN~xCJz;inqptQ!bPoSbNP<5z5G!s$ffB#(+gaha!t)O)A<4f
+zgA<LYsH%mhdDj_#pB<U1u?fpmRDEPZXI0%un=`zZDaE3$<)J{{_0C?zI4G>8M~#}Q
+z7*;0zN>B*$THnGnPyUD{R@BwVZfu|t8@P9IYiM(*8A~rpdnfpx_w+6omx?R;`nA>Z
+z4QWH!l$$-NMR6~YT+6NI?ulE`&1f_6;i9yteivy&4It<MiDamp1JiY&Vh-kUBB0F<
+zk>O=JB8$Ufji4emIt$X%gn|f~6vx;b@W!G1KDjS)TI96CY1P6nfh~q==klnbRPJa>
+zX7>E6jQH;`k<|m!Jb5_q@b*sMqi=SUNAEB!of26B4C}`U13OTns5?+<6eJ-aP9G&|
+z!i9?RW9MP&fXFU@=iks_<>Tn+&h^Kkm(V#>oQy6BDUNf9vOUBocuf9Bc=(xx8~}ND
+zcLsLU$L~G4{KWeC<3=XyG00_8VTxhs1{;7tXG&4tr<E#t)hgAhc}uS-RlB5G&^_VW
+zq@B0M6=<M9k(D$qmmt8@Rm*$jEYGO5idiyrmdD%`D;4H~Y49!+>L^woByT|fDbqZb
+z#Z))2A+t7{RBbM~$tBHc((vcdAQM?g$|cjV%}L&K-AnzIn>oPgG!ISbrQ*14v0gmE
+zARZboAKTJXny)W*75vz<)(TAX<S!v8rCV_l?VrEV5+c#y_g9uPOPM|S+<rW<8^6?u
+zU)s34HMKeQ1N|xVW2hPbWUssTd9-Kw*3zx@3ysvxX7r2w&TUH)<B=CK=}W8)uMV%z
+zHPYE;{OkSX+q=o(MsoP+HT~CQ;YA<RYMmt^d9lBph(zNp5|QHWl|<PGfQ^TNpmcSz
+z0{;-nF${6@est^8rq1w!Yz2NY4y!zR+{uHkm%WeQym`VmX=GG{iH$&*!wqwkhRx;o
+tXr-o28hVC(3O@WNSZ~495-Fv>k;w0){}~y4N(P^ip(Yt>2NKjh#Xo$1&8`3d
+
+literal 0
+HcmV?d00001
+
+diff --git a/kernel.py b/kernel.py
+index a877f2f..1042f61 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,27 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.experimental.pallas as pl
++import jax.experimental.pallas.tpu as pltpu
++
++def workload(x, weights):
++    def ragged_dot_kernel(x_ref, w_ref, o_ref):
++        # Load full K for this M/N tile
++        x_f32 = x_ref[...].astype(jnp.float32)
++        w_f32 = w_ref[...].astype(jnp.float32)
++        # x_f32: (1, 128, 4096), w_f32: (1, 4096, 128)
++        acc = jnp.dot(x_f32[0], w_f32[0])
++        o_ref[...] = acc.astype(jnp.bfloat16)
++
++    # Grid over groups (8), M tiles (1024/128=8), N tiles (14336/128=112)
++    grid = (8, 8, 112)
++    return pl.pallas_call(
++        ragged_dot_kernel,
++        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
++        grid=grid,
++        in_specs=(
++            pl.BlockSpec((1, 128, 4096), lambda g, m, n: (g, m * 128, 0)),
++            pl.BlockSpec((1, 4096, 128), lambda g, m, n: (g, 0, n * 128)),
++        ),
++        out_specs=pl.BlockSpec((1, 128, 128), lambda g, m, n: (g, m * 128, n * 128)),
++        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel", "parallel")),
++    )(x, weights)

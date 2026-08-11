@@ -1,0 +1,79 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas.lib as pllib
+import jax.interpreters.tpu as pltpu
+
+def workload(x, weight, bias):
+    """Matmul + Scaling + ResidualAdd kernel."""
+    # Output shape
+    out_shape = jax.ShapeDtypeStruct(x.shape, x.dtype)
+    
+    # Block size - use 128 for efficient vectorization on TPU
+    block_m = 128
+    block_k = 128
+    block_n = 128
+    
+    # Grid dimensions
+    grid_m = x.shape[0] // block_m
+    grid_n = x.shape[1] // block_n
+    
+    def kernel(ref_key, weight_ref, bias_ref, out_ref):
+        # Get program indices
+        i = pl.program_id(0)
+        j = pl.program_id(1)
+        
+        # Define slice indices
+        start_m = i * block_m
+        end_m = start_m + block_m
+        start_n = j * block_n
+        end_n = start_n + block_n
+        
+        # Initialize accumulator in float32
+        acc = jnp.zeros((block_m, block_n), dtype=jnp.float32)
+        
+        # Perform matmul with accumulation
+        for k in range(0, x.shape[1], block_k):
+            # Load blocks from input and weight
+            x_block = ref_key[start_m:end_m, k:k+block_k].astype(jnp.float32)
+            w_block = weight_ref[k:k+block_k, start_n:end_n].astype(jnp.float32)
+            
+            # Accumulate
+            acc = acc + jnp.dot(x_block, w_block)
+        
+        # Add bias (broadcast along rows)
+        bias_block = bias_ref[start_n:end_n]
+        acc = acc + bias_block[None, :]
+        
+        # Store intermediate result (for residual)
+        intermediate = acc.astype(x.dtype)
+        
+        # Scale by 0.5
+        scaled = intermediate * 0.5
+        
+        # Add residual (add intermediate back to scaled)
+        result = scaled + intermediate
+        
+        # Write output
+        out_ref[start_m:end_m, start_n:end_n] = result.astype(x.dtype)
+    
+    return pl.pallas_call(
+        kernel,
+        out_shape=out_shape,
+        grid=(grid_m, grid_n),
+        in_specs=(
+            # Input x spec
+            pl.BlockSpec((block_m, block_k), lambda i, j, k, l: (i * block_m, k * block_k)),
+            # Weight spec
+            pl.BlockSpec((block_k, block_n), lambda i, j, k, l: (k * block_k, j * block_n)),
+            # Bias spec
+            pl.BlockSpec((block_n,), lambda i, j, k, l: (j * block_n,)),
+        ),
+        out_specs=(
+            # Output spec
+            pl.BlockSpec((block_m, block_n), lambda i, j, k, l: (i * block_m, j * block_n)),
+        ),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel")
+        ),
+    )(x, weight, bias)

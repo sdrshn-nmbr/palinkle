@@ -2,8 +2,12 @@ import json
 from pathlib import Path
 
 from opjax.pallas.g42_harness import canonical_sha256, file_sha256
+from opjax.pallas.phase32_adjudication import adjudicate_dma_failures
 from opjax.pallas.phase32_grading import remove_empty_unit_roots
 from opjax.pallas.phase32_results import summarize_behavior
+
+
+REPO_ROOT = Path(__file__).parents[2]
 
 
 def test_summarize_behavior_counts_native_actions_and_format_errors(
@@ -71,3 +75,22 @@ def test_remove_empty_unit_roots_preserves_any_partial_evidence(tmp_path: Path) 
     assert remove_empty_unit_roots(tmp_path) == ["empty"]
     assert not empty.exists()
     assert partial.exists()
+
+
+def test_dma_halts_are_adjudicated_from_two_destroyed_workers() -> None:
+    root = REPO_ROOT / "data/pallas/runs/phase32-base-capability/inkling-grading"
+
+    result = adjudicate_dma_failures(
+        grading_path=root / "result.json",
+        grading_root=root,
+    )
+
+    assert result["horizons"]["k6"]["candidate_failures"] == 138
+    assert result["horizons"]["k6"]["infrastructure_failures"] == 0
+    assert len(result["adjudication"]["unit_ids"]) == 3
+    for record in result["records"]:
+        if "adjudication" not in record:
+            continue
+        attempts = record["adjudication"]["attempts"]
+        assert len({attempt["worker_identity"] for attempt in attempts}) == 2
+        assert all(attempt["worker_destroyed_at"] for attempt in attempts)
