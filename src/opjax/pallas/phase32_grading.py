@@ -13,6 +13,18 @@ from opjax.pallas.phase32_experiment import validate_experiment
 from opjax.pallas.phase3_grading import grade_sample_matrix
 
 
+def remove_empty_unit_roots(output_root: Path) -> list[str]:
+    results_root = output_root / "results"
+    if not results_root.exists():
+        return []
+    removed = []
+    for path in sorted(results_root.iterdir()):
+        if path.is_dir() and not any(path.iterdir()):
+            path.rmdir()
+            removed.append(path.name)
+    return removed
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m opjax.pallas.phase32_grading")
     parser.add_argument(
@@ -51,6 +63,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         experiment = json.loads(args.experiment.read_text(encoding="utf-8"))
         validate_experiment(value=experiment, contract=contract)
+        removed = remove_empty_unit_roots(args.output_root.resolve())
+        for unit_id in removed:
+            print(f"PHASE32_GRADING_RESUME_REMOVED_EMPTY unit={unit_id}", file=sys.stderr)
         result = grade_sample_matrix(
             release_root=args.release_root.resolve(),
             experiment=experiment,

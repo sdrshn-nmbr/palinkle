@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 from opjax.pallas.g42_harness import canonical_sha256, file_sha256
+from opjax.pallas.phase32_grading import remove_empty_unit_roots
 from opjax.pallas.phase32_results import summarize_behavior
 
 
@@ -58,3 +59,15 @@ def test_summarize_behavior_counts_native_actions_and_format_errors(
         "valid_actions": 0,
         "format_errors": 1,
     }
+
+
+def test_remove_empty_unit_roots_preserves_any_partial_evidence(tmp_path: Path) -> None:
+    empty = tmp_path / "results" / "empty"
+    partial = tmp_path / "results" / "partial"
+    empty.mkdir(parents=True)
+    partial.mkdir()
+    (partial / "request.json").write_text("{}", encoding="utf-8")
+
+    assert remove_empty_unit_roots(tmp_path) == ["empty"]
+    assert not empty.exists()
+    assert partial.exists()
