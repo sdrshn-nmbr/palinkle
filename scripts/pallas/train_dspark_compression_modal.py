@@ -682,7 +682,7 @@ def train_h200(student: str, max_steps: int = 1) -> dict[str, object]:
         accumulation_steps=32,
         moe_backend="marlin",
         server_backend_args=(" --fp4-gemm-backend marlin --moe-runner-backend marlin"),
-        server_mem_fraction=0.70,
+        server_mem_fraction=0.64,
     )
 
 

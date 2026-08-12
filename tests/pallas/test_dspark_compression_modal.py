@@ -60,6 +60,7 @@ def test_h200_topology_fits_target_and_separates_trainers(monkeypatch) -> None:
     assert captured["server_tp"] == 2
     assert captured["trainer_gpus"] == "2,3"
     assert captured["trainer_nproc"] == 2
+    assert captured["server_mem_fraction"] == 0.64
 
 
 def test_server_disables_decode_and_prefill_cuda_graphs(
