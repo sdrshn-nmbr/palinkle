@@ -671,8 +671,8 @@ def train_h200(student: str, max_steps: int = 1) -> dict[str, object]:
     return run_training(
         student,
         max_steps,
-        server_gpus="0,1",
-        server_tp=2,
+        server_gpus="0",
+        server_tp=1,
         trainer_gpus="2,3",
         trainer_nproc=2,
         accumulation_steps=32,

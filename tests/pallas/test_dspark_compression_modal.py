@@ -46,6 +46,22 @@ def test_compile_parallelism_leaves_host_capacity_for_orchestration() -> None:
     assert training.FUNCTION_OPTIONS["memory"] == 524288
 
 
+def test_h200_topology_avoids_duplicate_target_loaders(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_training(student: str, max_steps: int, **kwargs) -> dict[str, object]:
+        captured.update(student=student, max_steps=max_steps, **kwargs)
+        return captured
+
+    monkeypatch.setattr(training, "run_training", fake_run_training)
+    training.train_h200.local("dspark-500m", 1)
+
+    assert captured["server_gpus"] == "0"
+    assert captured["server_tp"] == 1
+    assert captured["trainer_gpus"] == "2,3"
+    assert captured["trainer_nproc"] == 2
+
+
 def test_heartbeat_is_structured_and_durable(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
