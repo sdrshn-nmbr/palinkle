@@ -89,6 +89,10 @@ def test_server_disables_decode_and_prefill_cuda_graphs(
     )
 
     environment = captured["env"]
+    assert (
+        '--model-loader-extra-config {"enable_multithread_load":false}'
+        in environment["SERVER_EXTRA_ARGS"]
+    )
     assert "--cuda-graph-backend-decode disabled" in environment["SERVER_EXTRA_ARGS"]
     assert "--cuda-graph-backend-prefill disabled" in environment["SERVER_EXTRA_ARGS"]
     assert "--disable-cuda-graph" not in environment["SERVER_EXTRA_ARGS"]

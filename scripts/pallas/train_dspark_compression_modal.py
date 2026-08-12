@@ -311,6 +311,7 @@ def launch_rank(
                 + " --dtype bfloat16 --attention-backend "
                 + attention_backend
                 + " --context-length 4096 --quantization modelopt_fp4"
+                + ' --model-loader-extra-config {"enable_multithread_load":false}'
                 + server_backend_args
                 + " --page-size 128 --mamba-radix-cache-strategy extra_buffer"
                 + " --max-mamba-cache-size 64 --swa-full-tokens-ratio 0.1"
