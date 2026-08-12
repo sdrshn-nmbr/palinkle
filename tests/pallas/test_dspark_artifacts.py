@@ -133,11 +133,13 @@ def test_summarize_host_sampler_reports_memory_and_process_peaks(
         "2026-08-12T01:00:00+00:00\n"
         "cgroup-memory-current=1000\n"
         "cgroup-memory-max=2000\n"
+        "process-rss-kib=500\n"
         "MemAvailable: 900 kB\n"
         "10 1 S 4 100 200 5.0 1.0 python python server.py\n"
         "2026-08-12T01:00:10+00:00\n"
         "cgroup-memory-current=1800\n"
         "cgroup-memory-max=2000\n"
+        "process-rss-kib=1700\n"
         "MemAvailable: 100 kB\n"
         "10 1 S 4 150 200 5.0 1.0 python python server.py\n"
     )
@@ -146,4 +148,5 @@ def test_summarize_host_sampler_reports_memory_and_process_peaks(
     assert result["sample_count"] == 2
     assert result["cgroup_memory_current_bytes"] == {"max": 1800, "last": 1800}
     assert result["mem_available_kib"] == {"min": 100, "last": 100}
+    assert result["process_rss_kib"] == {"max": 1700, "last": 1700}
     assert result["process_max_rss_kib"]["python"] == 150

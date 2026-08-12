@@ -264,6 +264,11 @@ def summarize_host_sampler(path: Path) -> dict[str, object]:
             if value.isdigit():
                 current["cgroup_memory_max_bytes"] = int(value)
             continue
+        if line.startswith("process-rss-kib="):
+            value = line.partition("=")[2]
+            if value.isdigit():
+                current["process_rss_kib"] = int(value)
+            continue
         if line.startswith("MemAvailable:"):
             value = line.split()[1]
             if value.isdigit():
@@ -289,6 +294,11 @@ def summarize_host_sampler(path: Path) -> dict[str, object]:
         for sample in samples
         if "mem_available_kib" in sample
     ]
+    process_rss_values = [
+        int(sample["process_rss_kib"])
+        for sample in samples
+        if "process_rss_kib" in sample
+    ]
     return {
         "sample_count": len(samples),
         "first_timestamp": samples[0]["timestamp"] if samples else None,
@@ -300,6 +310,10 @@ def summarize_host_sampler(path: Path) -> dict[str, object]:
         "mem_available_kib": {
             "min": min(available_values) if available_values else None,
             "last": available_values[-1] if available_values else None,
+        },
+        "process_rss_kib": {
+            "max": max(process_rss_values) if process_rss_values else None,
+            "last": process_rss_values[-1] if process_rss_values else None,
         },
         "process_max_rss_kib": dict(
             sorted(

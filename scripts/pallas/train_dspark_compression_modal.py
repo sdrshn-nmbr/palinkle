@@ -255,10 +255,12 @@ def launch_host_sampler(run_root: Path) -> subprocess.Popen:
     command = (
         "while true; do "
         "date -Ins; "
-        "printf 'cgroup-memory-current='; "
-        "cat /sys/fs/cgroup/memory.current 2>/dev/null || true; "
-        "printf 'cgroup-memory-max='; "
-        "cat /sys/fs/cgroup/memory.max 2>/dev/null || true; "
+        "printf 'cgroup-memory-current=%s\\n' "
+        '"$(cat /sys/fs/cgroup/memory.current 2>/dev/null || true)"; '
+        "printf 'cgroup-memory-max=%s\\n' "
+        '"$(cat /sys/fs/cgroup/memory.max 2>/dev/null || true)"; '
+        "printf 'process-rss-kib='; "
+        "ps -e -o rss= | awk '{total += $1} END {print total}'; "
         "awk '/^(MemTotal|MemFree|MemAvailable|SwapTotal|SwapFree):/ {print}' "
         "/proc/meminfo; "
         "ps -eo pid,ppid,stat,nlwp,rss,vsz,pcpu,pmem,comm,args --sort=-rss "
@@ -636,22 +638,23 @@ def run_training(
                         ),
                         flush=True,
                     )
+                inference_ready = (run_root / "inference.ready").exists()
+                if not inference_ready or time.monotonic() >= next_snapshot_at:
+                    persist_run_snapshot(run_root, persistent_root, replace=False)
+                    artifacts.commit()
+                    print(
+                        json.dumps(
+                            {
+                                "event": "opjax_dspark_snapshot_committed",
+                                "run": run_root.name,
+                                "timestamp": datetime.now(UTC).isoformat(),
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+                    next_snapshot_at = time.monotonic() + 300
                 next_status_at = time.monotonic() + 30
-            if time.monotonic() >= next_snapshot_at:
-                persist_run_snapshot(run_root, persistent_root, replace=False)
-                artifacts.commit()
-                print(
-                    json.dumps(
-                        {
-                            "event": "opjax_dspark_snapshot_committed",
-                            "run": run_root.name,
-                            "timestamp": datetime.now(UTC).isoformat(),
-                        },
-                        sort_keys=True,
-                    ),
-                    flush=True,
-                )
-                next_snapshot_at = time.monotonic() + 60
             time.sleep(1)
     finally:
         for process in [rank0, rank1, gpu_sampler, host_sampler]:
