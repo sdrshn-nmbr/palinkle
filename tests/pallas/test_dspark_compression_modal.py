@@ -34,6 +34,17 @@ def test_config_enables_one_bounded_profile_step(tmp_path: Path) -> None:
     assert "profiling:\n  enabled: true\n  start_step: 5\n  num_steps: 1" in full_text
 
 
+def test_specforge_readiness_patch_uses_model_identity() -> None:
+    patch = (
+        REPO_ROOT / "scripts/pallas/specforge_model_readiness.patch"
+    ).read_text()
+    assert '-    until curl -fsS "http://$HEAD_IP:$SERVER_PORT/health"' in patch
+    assert (
+        '+    until curl -fsS "http://$HEAD_IP:$SERVER_PORT/get_model_info"'
+        in patch
+    )
+
+
 def test_compile_parallelism_leaves_host_capacity_for_orchestration() -> None:
     rank0 = training.process_thread_environment(0)
     rank1 = training.process_thread_environment(1)

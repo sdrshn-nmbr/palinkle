@@ -54,9 +54,15 @@ artifacts = modal.Volume.from_name(
 secret = modal.Secret.from_name("opjax-secrets", environment_name="main")
 image = (
     modal.Image.from_registry(BASE_IMAGE)
+    .add_local_file(
+        Path(__file__).with_name("specforge_model_readiness.patch"),
+        "/tmp/specforge_model_readiness.patch",
+        copy=True,
+    )
     .run_commands(
         "git clone --filter=blob:none https://github.com/sgl-project/SpecForge.git /opt/specforge",
         f"git -C /opt/specforge checkout --detach {SPECFORGE_REVISION}",
+        "git -C /opt/specforge apply /tmp/specforge_model_readiness.patch",
         "python -m pip install -e /opt/specforge --no-deps",
         "python -m pip install mooncake-transfer-engine-cuda13",
     )
