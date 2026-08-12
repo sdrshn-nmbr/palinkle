@@ -114,3 +114,21 @@ def test_volume_commits_stop_before_training_writes_begin(tmp_path: Path) -> Non
 
     (tmp_path / "inference.ready").touch()
     assert training.should_commit_while_running(tmp_path) is False
+
+
+def test_persist_run_snapshot_replaces_prior_state(tmp_path: Path) -> None:
+    active = tmp_path / "active" / "run"
+    durable = tmp_path / "durable" / "run"
+    active.mkdir(parents=True)
+    (active / "telemetry.jsonl").write_text("first")
+    (active.parent / "run-rank0.log").write_text("rank zero")
+
+    training.persist_run_snapshot(active, durable, replace=True)
+    assert (durable / "telemetry.jsonl").read_text() == "first"
+    assert (durable / "rank0.log").read_text() == "rank zero"
+
+    (durable / "stale").write_text("remove me")
+    (active / "telemetry.jsonl").write_text("final")
+    training.persist_run_snapshot(active, durable, replace=True)
+    assert (durable / "telemetry.jsonl").read_text() == "final"
+    assert not (durable / "stale").exists()

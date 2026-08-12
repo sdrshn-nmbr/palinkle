@@ -4,6 +4,7 @@ import json
 import os
 import platform
 import signal
+import shutil
 import socket
 import subprocess
 import sys
@@ -192,6 +193,35 @@ def should_commit_while_running(run_root: Path) -> bool:
     return not (run_root / "inference.ready").exists()
 
 
+def persist_run_snapshot(
+    run_root: Path,
+    persistent_root: Path,
+    *,
+    replace: bool,
+) -> None:
+    collect_rank_logs(run_root)
+    if replace and persistent_root.exists():
+        shutil.rmtree(persistent_root)
+    if run_root.exists():
+        shutil.copytree(
+            run_root,
+            persistent_root,
+            dirs_exist_ok=True,
+            symlinks=True,
+        )
+    else:
+        persistent_root.mkdir(parents=True, exist_ok=True)
+
+
+def collect_rank_logs(run_root: Path) -> None:
+    if not run_root.exists():
+        return
+    for rank in (0, 1):
+        source = run_root.parent / f"{run_root.name}-rank{rank}.log"
+        if source.is_file():
+            shutil.copy2(source, run_root / f"rank{rank}.log")
+
+
 def compact_runtime_status(status: dict[str, object]) -> dict[str, object]:
     return {
         "event": status["event"],
@@ -316,31 +346,40 @@ def emit_runtime_status(
         run_root / "consumer.done",
         run_root / "inference.done",
     ]
-    gpu_query = run_text_command(
-        [
-            "nvidia-smi",
-            f"--query-gpu={','.join(GPU_QUERY_FIELDS)}",
-            "--format=csv,noheader,nounits",
-        ],
-        timeout=5,
-    )
-    process_query = run_text_command(
-        [
-            "nvidia-smi",
-            f"--query-compute-apps={','.join(COMPUTE_PROCESS_FIELDS)}",
-            "--format=csv,noheader,nounits",
-        ],
-        timeout=5,
-    )
-    process_snapshot = run_text_command(
-        [
-            "ps",
-            "-eo",
-            "pid,ppid,stat,pcpu,pmem,rss,etime,args",
-            "--sort=-pcpu",
-        ],
-        timeout=5,
-    )
+    query_system = not (run_root / "inference.ready").exists()
+    if query_system:
+        gpu_query = run_text_command(
+            [
+                "nvidia-smi",
+                f"--query-gpu={','.join(GPU_QUERY_FIELDS)}",
+                "--format=csv,noheader,nounits",
+            ],
+            timeout=5,
+        )
+        process_query = run_text_command(
+            [
+                "nvidia-smi",
+                f"--query-compute-apps={','.join(COMPUTE_PROCESS_FIELDS)}",
+                "--format=csv,noheader,nounits",
+            ],
+            timeout=5,
+        )
+        process_snapshot = run_text_command(
+            [
+                "ps",
+                "-eo",
+                "pid,ppid,stat,pcpu,pmem,rss,etime,args",
+                "--sort=-pcpu",
+            ],
+            timeout=5,
+        )
+    else:
+        gpu_query = {"status": "disabled_after_inference_ready", "lines": []}
+        process_query = {"status": "disabled_after_inference_ready", "lines": []}
+        process_snapshot = {
+            "status": "disabled_after_inference_ready",
+            "lines": [],
+        }
     load_average = Path("/proc/loadavg")
     memory_info = Path("/proc/meminfo")
     status = {
@@ -511,8 +550,10 @@ def run_training(
     if max_steps <= 0:
         raise ValueError("max_steps must be positive")
     run_name = f"{student}-steps{max_steps}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
-    run_root = Path("/artifacts/runs") / run_name
+    run_root = Path("/tmp/opjax-dspark-runs") / run_name
+    persistent_root = Path("/artifacts/runs") / run_name
     run_root.parent.mkdir(parents=True, exist_ok=True)
+    persistent_root.parent.mkdir(parents=True, exist_ok=True)
     config = write_config(
         student,
         run_root,
@@ -589,6 +630,11 @@ def run_training(
                 run_root
             ):
                 try:
+                    persist_run_snapshot(
+                        run_root,
+                        persistent_root,
+                        replace=True,
+                    )
                     artifacts.commit()
                     print(
                         json.dumps(
@@ -635,7 +681,8 @@ def run_training(
         "run": run_name,
         "rank0_status": rank0_status,
         "rank1_status": rank1_status,
-        "run_root": str(run_root),
+        "run_root": str(persistent_root),
+        "working_root": str(run_root),
         "gpu_names": gpu_name_query["lines"],
         "gpu_name_query_status": gpu_name_query["status"],
         "student": student,
@@ -645,11 +692,13 @@ def run_training(
     (run_root / "result.json").write_text(
         json.dumps(result, indent=2, sort_keys=True) + "\n"
     )
-    (run_root.parent / f"{run_name}-result.json").write_text(
+    write_runtime_artifacts(run_root=run_root, config=config, result=result)
+    collect_rank_logs(run_root)
+    write_artifact_manifest(run_root)
+    persist_run_snapshot(run_root, persistent_root, replace=True)
+    (persistent_root.parent / f"{run_name}-result.json").write_text(
         json.dumps(result, indent=2, sort_keys=True) + "\n"
     )
-    write_runtime_artifacts(run_root=run_root, config=config, result=result)
-    write_artifact_manifest(run_root)
     artifacts.commit()
     if rank0_status != 0 or rank1_status != 0:
         raise RuntimeError(json.dumps(result))
