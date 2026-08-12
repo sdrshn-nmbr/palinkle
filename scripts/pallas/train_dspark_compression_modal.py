@@ -318,6 +318,7 @@ def launch_rank(
                 + " --mamba-full-memory-ratio 0.1"
                 + " --cuda-graph-backend-decode disabled"
                 + " --cuda-graph-backend-prefill disabled"
+                + " --skip-server-warmup"
             ),
         }
     )
