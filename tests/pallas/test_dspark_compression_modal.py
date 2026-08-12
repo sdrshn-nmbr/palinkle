@@ -42,6 +42,8 @@ def test_compile_parallelism_leaves_host_capacity_for_orchestration() -> None:
     assert rank1["TORCHINDUCTOR_COMPILE_THREADS"] == "1"
     assert rank0["OMP_NUM_THREADS"] == "16"
     assert rank1["OMP_NUM_THREADS"] == "4"
+    assert training.FUNCTION_OPTIONS["cpu"] == 64.0
+    assert training.FUNCTION_OPTIONS["memory"] == 262144
 
 
 def test_heartbeat_is_structured_and_durable(
