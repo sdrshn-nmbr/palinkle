@@ -323,8 +323,17 @@ JAXlib 0.10.1, libtpu 0.0.41, the TPU device identity, and the worker runtime
 lock. The hash-bound closeout evidence is in
 [`jaxbench-full-v1-closeout`](data/pallas/runs/jaxbench-full-v1-closeout/manifest.json).
 
-Provider-neutral checkpoint storage, Miles resume parity, and SGLang logit
-parity move to Phase 4. The backend mapping remains in
+The canonical Phase 1 experiment foundation now provides provider-neutral
+model, training, inference, and checkpoint-store contracts. Its local and
+mounted-Modal implementation proves atomic validated promotion, hash-bound
+lineage, and crash recovery. A live Qwen2.5-0.5B control also proves exact
+continuation through synchronous Miles and full-vocabulary float32
+log-probability parity after loading the byte-identical export in fresh
+SGLang. Production bfloat16 did not meet the original strict parity contract
+and remains a recorded serving-numerics boundary. Phase 1 is complete for the
+generic control; canonical Phase 3 repeats the lifecycle for exact Inkling
+Small and adds its agent and TPU probes. The backend mapping and exact proof
+boundary are in
 [`training-backend-migration.md`](docs/training-backend-migration.md).
 
 Phase 3 closed the untouched-base capability and benchmark-calibration phase.
@@ -386,3 +395,5 @@ result is overturned, a later entry records the correction. The manifests in
 | 2026-08-09 | Calibrated all six optimized JAXBench references that belong to the frozen 47-task denominator. | Only `8p_GEMM` passed correctness, Pallas provenance, lowering, and profiling on the pinned runtime, and it measured `0.99643x` XLA. The other five exposed pinned API or correctness drift. No JAXBench task met the predeclared `1.05x` lower-confidence-bound headroom rule. |
 | 2026-08-09 | Imported pinned SGLang-JAX and calibrated a real 32K variable-length keyed-delta-attention megakernel against a persistent compiled naïve recurrent XLA baseline. | The four-stage Pallas pipeline passed independent output and final-state checks, measured `1.18152x` with a paired 95% interval of `1.18104x` to `1.18359x`, and produced Perfetto and Pallas-provenance evidence. An initial `4341x` number included repeated baseline compilation and is explicitly superseded. KDA is the first admitted Megakernel-v0 task. |
 | 2026-08-10 | Completed the frozen untouched-base Phase 3 comparison across 47 scoreable JAXBench tasks, three seeds, and matched three-call and six-call snapshots. | Inkling Small and Laguna XS 2.1 both scored `0/141` at both horizons with zero infrastructure failures. Laguna generated 54 non-empty six-call patches, but 41 failed TPU compilation and 13 failed normal lowering; Inkling generated two and both failed compilation. The result rules out untouched-base capability under this harness while preserving Laguna's higher patch-production rate as behavior, not competence. |
+| 2026-08-11 | Completed the generic substrate of canonical Phase 1 with provider-neutral experiment interfaces and an atomic checkpoint lifecycle. | Deterministic acceptance tests proved exact next-update continuation orchestration, export-parity orchestration, lineage and version monotonicity, tamper rejection, and recovery after every injected publication kill window. Separate Modal writer and reader containers committed and reloaded the same hash-bound checkpoint from `opjax-checkpoints-v2`. The pinned Miles and SGLang source audit passes at `b1860dd2` and `c80a38ed`. Phase 1 remains open on a small real Miles resume and real SGLang logit-parity control. |
+| 2026-08-11 | Closed canonical Phase 1 with a live Qwen2.5-0.5B Miles and SGLang control. | Synchronous Miles produced the same second-update loss, DCP model/optimizer/RNG payloads, scheduler state, cursor, and Hugging Face export after fresh-process resume. Fresh SGLang matched all 151,936 float32 token log-probabilities within `2.29e-05`; bfloat16 failed the stricter original parity contract and remains non-acceptance diagnostic evidence. The accepted store manifest is `6f994536`. |

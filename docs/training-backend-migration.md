@@ -29,6 +29,70 @@ PRIME-RL and other Prime Intellect products are deferred. Their OPD/OPSD
 implementations may be read later, but they are not dependencies, submodules,
 or execution targets for this migration.
 
+## Canonical Phase 1 foundation
+
+The provider-neutral experiment boundary is implemented in
+`opjax.pallas.experiment_foundation`. It defines the model arm, training
+method, training backend, inference backend, and checkpoint-store protocols.
+The concrete filesystem store works on local storage and mounted Modal
+Volumes. A checkpoint package is accepted only when it contains one model or
+adapter weight role, optimizer and scheduler state, RNG and data/rollout
+cursors, an inference export, monotonic update and policy versions, immutable
+base-model identity, and hashes for the experiment, configuration, data,
+tokenizer, renderer, toolchain, and every payload file.
+
+Publication has four recoverable boundaries: staging, immutable package
+commit, validation, and `latest` promotion. The accepted pointer binds the
+manifest, validation result, and acceptance record. Replacement requires the
+declared parent to equal the current `latest`, and both the global update and
+policy version must increase. A failed validation, interrupted publication,
+payload mutation, metadata mutation, stale parent, version regression,
+symlink, or overlapping artifact path cannot change `latest`.
+
+The deterministic acceptance probe runs an uninterrupted two-update control
+against save, reload, and the same second update. It compares the complete
+model, optimizer, scheduler, RNG, cursor, loss, and canary-logit evidence. The
+same checkpoint export is loaded through the inference-backend protocol and
+must reproduce the frozen-prompt logits before promotion. Boundary fakes test
+the orchestration; the live control below proves the real Miles and SGLang
+paths.
+
+The storage boundary was also exercised through two separate Modal containers
+against the mounted `opjax-checkpoints-v2` Volume. Run
+`ap-UEE3YCNbVK7DsA4HboYrFf` wrote, committed, reloaded, and independently read
+checkpoint `modal-canary-d6ccdbe207b748f2af02f352498b8585`; its manifest,
+validation, and acceptance hashes matched. This proves the mounted-Volume
+publication path. It does not prove a Miles optimizer resume or SGLang model
+logit match.
+
+The generic experiment-foundation substrate and canonical Phase 1 live control
+are complete. Modal run `ap-fnMquMUw7KgopdH9fsBXOf` trained a full-model
+Qwen2.5-0.5B control through synchronous Miles lanes: uninterrupted two
+updates, one update plus checkpoint and process exit, then a fresh-process
+resume. The second loss was exactly `0.1679287552833557` in both paths. Run
+`ap-A4ix8UGzBGULR1P53PTwg2` proved exact DCP model, optimizer, and RNG payloads,
+semantic scheduler and iteration state, cursor state, and all 13 Hugging Face
+export files. The checkpoint artifacts include a resumed Hugging Face model,
+the native DCP package that also contains model and RNG shards, the next data
+and rollout cursor, and a separate inference export.
+
+Run `ap-AX5BJLP1EYQMkylzYfx9ZT` loaded that export into a fresh pinned SGLang
+process. With float32 and native PyTorch fused operations, all 151,936 token
+log-probabilities matched the Transformers reference within `2.29e-05`, and
+the top-128 ordering was exact. This is full-vocabulary log-probability parity,
+not bit-exact logits. Production bfloat16 did not meet the original stricter
+`0.02` and exact-top-128 contract: the preserved diagnostic has exact top-1,
+32/32 top-32 set overlap, and a maximum aligned error of `0.1651`. It is not
+accepted as parity evidence.
+
+Run `ap-ADzcuaqPhIKiHcNUEzhzU1` published the accepted checkpoint through the
+provider-neutral store only after both live validations passed. The published
+manifest is `6f9945363a033bad8b8113bf9b0a5cb50b666c45a593b993565684183c061dff`.
+The validator hash-binds the resume evidence, float32 parity evidence, and the
+rejected bfloat16 diagnostic. Canonical Phase 3 repeats this accepted lifecycle
+for exact Inkling Small, then adds its agent trajectory and TPU grade. Laguna's
+equivalent proof remains canonical Phase 4.
+
 ## Pinned inspection surfaces
 
 | Surface | Revision | Relevant contract |
@@ -36,7 +100,7 @@ or execution targets for this migration.
 | Tinker SDK | `0.24.0` | Managed LoRA client, forward/backward, optimizer, sampler materialization, checkpoint state |
 | Tinker Cookbook | `0.5.3` | Inkling tokenizer/renderer, supervised datum construction, rollout and RL recipes |
 | Miles | `b1860dd264e17c96d5d92da96c957d88cfd3a1f8` | Inkling Small LoRA, SGLang rollout, Megatron trainer, GRPO, OPD |
-| SGLang `sglang-miles` | `cb05a44f35a7c9e27e46d74112cc841ca674ef43` | Inkling and Laguna inference, Poolside reasoning parser, LoRA serving, routed-expert capture, dynamic adapter loading |
+| SGLang `sglang-miles` | `c80a38edcd2c7077c909a5ed925c9241e754c067` | Inkling and Laguna inference, Poolside reasoning parser, LoRA serving, routed-expert capture, dynamic adapter loading |
 | Laguna XS 2.1 | `e9df9a59996d790b94b70f3fef343fe1d9e34bdf` | External 33B-total, 3B-active code-model arm; SGLang inference only at this boundary |
 
 Run the contract audit after checkout, dependency changes, or submodule
@@ -201,10 +265,11 @@ optimizer, rollout policy, verifier, and checkpoint hashes.
   plugin at the pinned revision. SGLang inference support alone does not prove
   train-inference parity for Laguna.
 
-Gate 7 is therefore paused at backend conformance. The next primary probe is
-Miles renderer and base-logit parity for Inkling Small, followed by a one-batch
-SFT canary. Laguna's six-call inference baseline is complete; its next boundary
-is a Miles model-plugin port. Once the port passes the same conversion, renderer,
-one-step, rollout, and reload checks, the experiment factory can cross the
-model arm with the existing SFT, DAPT, GRPO, and OPD recipes without changing
-the data, harness, reward, or evaluation.
+Canonical Phase 3 is therefore the next model-specific boundary: Miles
+renderer and base-logit parity for Inkling Small, followed by a one-batch SFT
+canary, exact continuation, export, SGLang reload, one agent trajectory, and a
+TPU grade. Laguna's six-call inference baseline is complete; canonical Phase 4
+starts with its Miles model-plugin port. Once both arms pass the same checks,
+the experiment factory can cross the model arm with the existing SFT, DAPT,
+GRPO, and OPD recipes without changing the data, harness, reward, or
+evaluation.

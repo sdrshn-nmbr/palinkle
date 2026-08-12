@@ -33,6 +33,14 @@ SOURCE_CONTRACTS = {
             "policy_loss_function",
             "sft_loss_function",
         },
+        "miles/backends/megatron_utils/checkpoint.py": {
+            "load_checkpoint",
+            "save_checkpoint_with_lora",
+        },
+        "miles/backends/megatron_utils/lora_utils.py": {
+            "load_lora_adapter",
+            "save_lora_checkpoint",
+        },
         "miles/rollout/on_policy_distillation.py": {
             "post_process_rewards",
             "reward_func",
@@ -67,6 +75,11 @@ SOURCE_CONTRACTS = {
         "python/sglang/srt/managers/io_struct.py": {
             "BatchTokenIDOutput",
             "GenerateReqInput",
+            "LoadLoRAAdapterReqInput",
+            "LoRAUpdateOutput",
+        },
+        "python/sglang/srt/entrypoints/http_server.py": {
+            "load_lora_adapter",
         },
         "python/sglang/srt/state_capturer/routed_experts.py": {
             "RoutedExpertsCapturer",
