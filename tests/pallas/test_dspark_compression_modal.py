@@ -46,7 +46,7 @@ def test_compile_parallelism_leaves_host_capacity_for_orchestration() -> None:
     assert training.FUNCTION_OPTIONS["memory"] == 524288
 
 
-def test_h200_topology_avoids_duplicate_target_loaders(monkeypatch) -> None:
+def test_h200_topology_fits_target_and_separates_trainers(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
     def fake_run_training(student: str, max_steps: int, **kwargs) -> dict[str, object]:
@@ -56,10 +56,42 @@ def test_h200_topology_avoids_duplicate_target_loaders(monkeypatch) -> None:
     monkeypatch.setattr(training, "run_training", fake_run_training)
     training.train_h200.local("dspark-500m", 1)
 
-    assert captured["server_gpus"] == "0"
-    assert captured["server_tp"] == 1
+    assert captured["server_gpus"] == "0,1"
+    assert captured["server_tp"] == 2
     assert captured["trainer_gpus"] == "2,3"
     assert captured["trainer_nproc"] == 2
+
+
+def test_server_disables_decode_and_prefill_cuda_graphs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    captured: dict[str, object] = {}
+
+    class LaunchedProcess:
+        pass
+
+    def fake_popen(command, **kwargs):
+        captured.update(command=command, **kwargs)
+        return LaunchedProcess()
+
+    monkeypatch.setattr(training.subprocess, "Popen", fake_popen)
+    training.launch_rank(
+        rank=0,
+        config=tmp_path / "config.yaml",
+        run_root=tmp_path / "run",
+        server_gpus="0,1",
+        server_tp=2,
+        trainer_gpus="2,3",
+        trainer_nproc=2,
+        accumulation_steps=32,
+        server_backend_args=" --fp4-gemm-backend marlin",
+        attention_backend="fa4",
+    )
+
+    environment = captured["env"]
+    assert "--cuda-graph-backend-decode disabled" in environment["SERVER_EXTRA_ARGS"]
+    assert "--cuda-graph-backend-prefill disabled" in environment["SERVER_EXTRA_ARGS"]
+    assert "--disable-cuda-graph" not in environment["SERVER_EXTRA_ARGS"]
 
 
 def test_heartbeat_is_structured_and_durable(

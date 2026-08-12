@@ -314,7 +314,9 @@ def launch_rank(
                 + server_backend_args
                 + " --page-size 128 --mamba-radix-cache-strategy extra_buffer"
                 + " --max-mamba-cache-size 64 --swa-full-tokens-ratio 0.1"
-                + " --mamba-full-memory-ratio 0.1 --disable-cuda-graph"
+                + " --mamba-full-memory-ratio 0.1"
+                + " --cuda-graph-backend-decode disabled"
+                + " --cuda-graph-backend-prefill disabled"
             ),
         }
     )
@@ -671,8 +673,8 @@ def train_h200(student: str, max_steps: int = 1) -> dict[str, object]:
     return run_training(
         student,
         max_steps,
-        server_gpus="0",
-        server_tp=1,
+        server_gpus="0,1",
+        server_tp=2,
         trainer_gpus="2,3",
         trainer_nproc=2,
         accumulation_steps=32,
