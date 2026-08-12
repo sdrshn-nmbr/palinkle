@@ -192,6 +192,34 @@ def should_commit_while_running(run_root: Path) -> bool:
     return not (run_root / "inference.ready").exists()
 
 
+def compact_runtime_status(status: dict[str, object]) -> dict[str, object]:
+    return {
+        "event": status["event"],
+        "run": status["run"],
+        "timestamp": status["timestamp"],
+        "elapsed_s": status["elapsed_s"],
+        "rank0_status": status["rank0_status"],
+        "rank1_status": status["rank1_status"],
+        "files": status["files"],
+        "checkpoint_states": status["checkpoint_states"],
+        "gpus": [
+            {
+                key: gpu.get(key)
+                for key in (
+                    "index",
+                    "memory.used",
+                    "utilization.gpu",
+                    "utilization.memory",
+                    "power.draw",
+                    "temperature.gpu",
+                )
+            }
+            for gpu in status["gpus"]
+        ],
+        "top_processes": [str(row)[:256] for row in status["top_processes"][:8]],
+    }
+
+
 def launch_rank(
     *,
     rank: int,
@@ -351,7 +379,7 @@ def emit_runtime_status(
         "process_query_status": process_snapshot["status"],
     }
     encoded = json.dumps(status, sort_keys=True)
-    print(encoded, flush=True)
+    print(json.dumps(compact_runtime_status(status), sort_keys=True), flush=True)
     if run_root.exists():
         with (run_root / "runtime-telemetry.jsonl").open("a") as handle:
             handle.write(encoded + "\n")

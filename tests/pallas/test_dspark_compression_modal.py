@@ -34,7 +34,9 @@ def test_config_enables_one_bounded_profile_step(tmp_path: Path) -> None:
     assert "profiling:\n  enabled: true\n  start_step: 5\n  num_steps: 1" in full_text
 
 
-def test_heartbeat_is_structured_and_durable(tmp_path: Path, monkeypatch) -> None:
+def test_heartbeat_is_structured_and_durable(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
     responses = iter(
         [
             {
@@ -75,6 +77,19 @@ def test_heartbeat_is_structured_and_durable(tmp_path: Path, monkeypatch) -> Non
     assert payload["rank1_status"] == 0
     assert payload["gpus"][0]["name"] == "NVIDIA H200"
     assert payload["gpu_processes"][0]["process_name"] == "trainer"
+    logged = json.loads(capsys.readouterr().out)
+    assert logged["event"] == "opjax_dspark_heartbeat"
+    assert logged["gpus"] == [
+        {
+            "index": "0",
+            "memory.used": "100",
+            "power.draw": "500",
+            "temperature.gpu": "60",
+            "utilization.gpu": "75",
+            "utilization.memory": "20",
+        }
+    ]
+    assert "gpu_processes" not in logged
 
 
 def test_manifest_hashes_all_frozen_files(tmp_path: Path) -> None:
