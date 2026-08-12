@@ -6,6 +6,7 @@ from hashlib import sha256
 from pathlib import Path
 
 from opjax.pallas.dspark_artifacts import (
+    summarize_gpu_sampler,
     summarize_telemetry,
     summarize_trace,
     validate_manifest,
@@ -104,3 +105,20 @@ def test_summarize_trace_aggregates_complete_events(tmp_path: Path) -> None:
         "total_duration_us": 30,
         "mean_duration_us": 15,
     }
+
+
+def test_summarize_gpu_sampler_reports_utilization_and_failures(tmp_path: Path) -> None:
+    sampler = tmp_path / "gpu-sampler.log"
+    sampler.write_text(
+        "2026-08-12T01:00:00+00:00\n"
+        "0, GPU-1, NVIDIA H200, P0, 100, 140000, 20, 10, 200, 700, 50, 1000, 3000\n"
+        "2026-08-12T01:00:05+00:00\n"
+        "0, GPU-1, NVIDIA H200, P0, 300, 140000, 80, 20, 400, 700, 60, 1800, 3000\n"
+        "nvidia-smi-status=124\n"
+    )
+
+    result = summarize_gpu_sampler(sampler)
+    assert result["sample_count"] == 2
+    assert result["failure_count"] == 1
+    assert result["gpus"]["0"]["utilization.gpu"]["mean"] == 50
+    assert result["gpus"]["0"]["memory.used"]["max"] == 300

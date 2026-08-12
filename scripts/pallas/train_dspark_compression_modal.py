@@ -37,7 +37,6 @@ GPU_QUERY_FIELDS = (
     "clocks.sm",
     "clocks.mem",
 )
-COMPUTE_PROCESS_FIELDS = ("pid", "gpu_uuid", "used_memory", "process_name")
 
 app = modal.App(APP_NAME)
 hf_cache = modal.Volume.from_name(
@@ -178,17 +177,6 @@ def run_text_command(command: list[str], *, timeout: float = 10) -> dict[str, ob
     }
 
 
-def parse_csv_rows(
-    fields: tuple[str, ...], result: dict[str, object]
-) -> list[dict[str, str]]:
-    rows = []
-    for line in result["lines"]:
-        values = [value.strip() for value in str(line).split(",")]
-        if len(values) == len(fields):
-            rows.append(dict(zip(fields, values, strict=True)))
-    return rows
-
-
 def should_commit_while_running(run_root: Path) -> bool:
     return not (run_root / "inference.ready").exists()
 
@@ -220,6 +208,35 @@ def collect_rank_logs(run_root: Path) -> None:
         source = run_root.parent / f"{run_root.name}-rank{rank}.log"
         if source.is_file():
             shutil.copy2(source, run_root / f"rank{rank}.log")
+    sampler = run_root.parent / f"{run_root.name}-gpu-sampler.log"
+    if sampler.is_file():
+        shutil.copy2(sampler, run_root / "gpu-sampler.log")
+
+
+def launch_gpu_sampler(run_root: Path) -> subprocess.Popen:
+    output = run_root.parent / f"{run_root.name}-gpu-sampler.log"
+    handle = output.open("w")
+    command = (
+        "while true; do "
+        "date -Ins; "
+        "timeout --kill-after=1 5 nvidia-smi "
+        f"--query-gpu={','.join(GPU_QUERY_FIELDS)} "
+        "--format=csv,noheader,nounits || echo nvidia-smi-status=$?; "
+        "sleep 5; "
+        "done"
+    )
+    return subprocess.Popen(
+        ["bash", "-lc", command],
+        stdout=handle,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+
+
+def tail_text(path: Path, *, line_count: int = 12) -> list[str]:
+    if not path.is_file():
+        return []
+    return path.read_text(errors="replace").splitlines()[-line_count:]
 
 
 def compact_runtime_status(status: dict[str, object]) -> dict[str, object]:
@@ -232,21 +249,7 @@ def compact_runtime_status(status: dict[str, object]) -> dict[str, object]:
         "rank1_status": status["rank1_status"],
         "files": status["files"],
         "checkpoint_states": status["checkpoint_states"],
-        "gpus": [
-            {
-                key: gpu.get(key)
-                for key in (
-                    "index",
-                    "memory.used",
-                    "utilization.gpu",
-                    "utilization.memory",
-                    "power.draw",
-                    "temperature.gpu",
-                )
-            }
-            for gpu in status["gpus"]
-        ],
-        "top_processes": [str(row)[:256] for row in status["top_processes"][:8]],
+        "gpu_sampler_tail": status["gpu_sampler_tail"],
     }
 
 
@@ -346,42 +349,9 @@ def emit_runtime_status(
         run_root / "consumer.done",
         run_root / "inference.done",
     ]
-    query_system = not (run_root / "inference.ready").exists()
-    if query_system:
-        gpu_query = run_text_command(
-            [
-                "nvidia-smi",
-                f"--query-gpu={','.join(GPU_QUERY_FIELDS)}",
-                "--format=csv,noheader,nounits",
-            ],
-            timeout=5,
-        )
-        process_query = run_text_command(
-            [
-                "nvidia-smi",
-                f"--query-compute-apps={','.join(COMPUTE_PROCESS_FIELDS)}",
-                "--format=csv,noheader,nounits",
-            ],
-            timeout=5,
-        )
-        process_snapshot = run_text_command(
-            [
-                "ps",
-                "-eo",
-                "pid,ppid,stat,pcpu,pmem,rss,etime,args",
-                "--sort=-pcpu",
-            ],
-            timeout=5,
-        )
-    else:
-        gpu_query = {"status": "disabled_after_inference_ready", "lines": []}
-        process_query = {"status": "disabled_after_inference_ready", "lines": []}
-        process_snapshot = {
-            "status": "disabled_after_inference_ready",
-            "lines": [],
-        }
     load_average = Path("/proc/loadavg")
     memory_info = Path("/proc/meminfo")
+    gpu_sampler = run_root.parent / f"{run_root.name}-gpu-sampler.log"
     status = {
         "event": "opjax_dspark_heartbeat",
         "run": run_root.name,
@@ -396,10 +366,7 @@ def emit_runtime_status(
             for path in tracked_files
         },
         "checkpoint_states": checkpoint_states,
-        "gpus": parse_csv_rows(GPU_QUERY_FIELDS, gpu_query),
-        "gpu_processes": parse_csv_rows(COMPUTE_PROCESS_FIELDS, process_query),
-        "gpu_query_status": gpu_query["status"],
-        "gpu_process_query_status": process_query["status"],
+        "gpu_sampler_tail": tail_text(gpu_sampler),
         "load_average": (
             load_average.read_text().strip() if load_average.exists() else None
         ),
@@ -414,8 +381,6 @@ def emit_runtime_status(
             if memory_info.exists()
             else {}
         ),
-        "top_processes": process_snapshot["lines"][:25],
-        "process_query_status": process_snapshot["status"],
     }
     encoded = json.dumps(status, sort_keys=True)
     print(json.dumps(compact_runtime_status(status), sort_keys=True), flush=True)
@@ -577,6 +542,7 @@ def run_training(
         attention_backend=attention_backend,
         server_mem_fraction=server_mem_fraction,
     )
+    gpu_sampler = launch_gpu_sampler(run_root)
     rank1 = None
     started_at = time.monotonic()
     try:
@@ -662,10 +628,10 @@ def run_training(
                 next_commit_at = time.monotonic() + 60
             time.sleep(1)
     finally:
-        for process in [rank0, rank1]:
+        for process in [rank0, rank1, gpu_sampler]:
             if process is not None and process.poll() is None:
                 os.killpg(process.pid, signal.SIGTERM)
-        for process in [rank0, rank1]:
+        for process in [rank0, rank1, gpu_sampler]:
             if process is not None and process.poll() is None:
                 try:
                     process.wait(timeout=30)

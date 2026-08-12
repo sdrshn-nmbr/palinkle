@@ -37,29 +37,14 @@ def test_config_enables_one_bounded_profile_step(tmp_path: Path) -> None:
 def test_heartbeat_is_structured_and_durable(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
-    responses = iter(
-        [
-            {
-                "status": 0,
-                "lines": [
-                    "0, GPU-1, NVIDIA H200, P0, 100, 141000, 75, 20, 500, 700, 60, 1800, 3000"
-                ],
-                "stderr": "",
-            },
-            {
-                "status": 0,
-                "lines": ["123, GPU-1, 100, trainer"],
-                "stderr": "",
-            },
-            {
-                "status": 0,
-                "lines": ["PID PPID STAT %CPU %MEM RSS ELAPSED COMMAND"],
-                "stderr": "",
-            },
-        ]
-    )
+    sampler = tmp_path.parent / f"{tmp_path.name}-gpu-sampler.log"
+    sampler.write_text("2026-08-12T01:00:00+00:00\n0, GPU-1, NVIDIA H200\n")
     monkeypatch.setattr(
-        training, "run_text_command", lambda *args, **kwargs: next(responses)
+        training,
+        "run_text_command",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("heartbeat must not launch external commands")
+        ),
     )
 
     training.emit_runtime_status(
@@ -75,21 +60,10 @@ def test_heartbeat_is_structured_and_durable(
     assert payload["event"] == "opjax_dspark_heartbeat"
     assert payload["rank0_status"] is None
     assert payload["rank1_status"] == 0
-    assert payload["gpus"][0]["name"] == "NVIDIA H200"
-    assert payload["gpu_processes"][0]["process_name"] == "trainer"
+    assert payload["gpu_sampler_tail"][-1] == "0, GPU-1, NVIDIA H200"
     logged = json.loads(capsys.readouterr().out)
     assert logged["event"] == "opjax_dspark_heartbeat"
-    assert logged["gpus"] == [
-        {
-            "index": "0",
-            "memory.used": "100",
-            "power.draw": "500",
-            "temperature.gpu": "60",
-            "utilization.gpu": "75",
-            "utilization.memory": "20",
-        }
-    ]
-    assert "gpu_processes" not in logged
+    assert logged["gpu_sampler_tail"][-1] == "0, GPU-1, NVIDIA H200"
 
 
 def test_manifest_hashes_all_frozen_files(tmp_path: Path) -> None:

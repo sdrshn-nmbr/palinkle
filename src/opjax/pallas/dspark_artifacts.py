@@ -11,6 +11,23 @@ from statistics import fmean
 from typing import Any
 
 
+GPU_FIELDS = (
+    "index",
+    "uuid",
+    "name",
+    "pstate",
+    "memory.used",
+    "memory.total",
+    "utilization.gpu",
+    "utilization.memory",
+    "power.draw",
+    "power.limit",
+    "temperature.gpu",
+    "clocks.sm",
+    "clocks.mem",
+)
+
+
 def file_sha256(path: Path) -> str:
     digest = sha256()
     with path.open("rb") as handle:
@@ -167,6 +184,63 @@ def summarize_telemetry(path: Path) -> dict[str, object]:
     }
 
 
+def summarize_gpu_sampler(path: Path) -> dict[str, object]:
+    samples: list[dict[str, str]] = []
+    timestamp: str | None = None
+    failures: list[str] = []
+    for raw_line in path.read_text(errors="replace").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if len(line) >= 19 and line[:4].isdigit() and "T" in line:
+            timestamp = line
+            continue
+        if line.startswith("nvidia-smi-status="):
+            failures.append(line)
+            continue
+        values = [value.strip() for value in line.split(",")]
+        if len(values) != len(GPU_FIELDS):
+            failures.append(line)
+            continue
+        sample = dict(zip(GPU_FIELDS, values, strict=True))
+        sample["timestamp"] = timestamp or "unknown"
+        samples.append(sample)
+
+    grouped: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    for sample in samples:
+        index = sample["index"]
+        for field in (
+            "memory.used",
+            "utilization.gpu",
+            "utilization.memory",
+            "power.draw",
+            "temperature.gpu",
+            "clocks.sm",
+            "clocks.mem",
+        ):
+            value = _number(sample.get(field))
+            if value is not None:
+                grouped[index][field].append(value)
+    return {
+        "sample_count": len(samples),
+        "failure_count": len(failures),
+        "failures": failures,
+        "first_timestamp": samples[0]["timestamp"] if samples else None,
+        "last_timestamp": samples[-1]["timestamp"] if samples else None,
+        "gpus": {
+            index: {
+                field: {
+                    "mean": round(fmean(values), 3),
+                    "p95": _percentile(values, 0.95),
+                    "max": max(values),
+                }
+                for field, values in sorted(fields.items())
+            }
+            for index, fields in sorted(grouped.items())
+        },
+    }
+
+
 def _read_trace(path: Path) -> dict[str, Any] | list[Any]:
     opener = gzip.open if path.suffix == ".gz" else open
     with opener(path, "rt") as handle:
@@ -228,5 +302,6 @@ def analyze_run(run_root: Path, *, top_n: int = 25) -> dict[str, object]:
         "run_root": str(run_root.resolve()),
         "manifest": validate_manifest(run_root),
         "telemetry": summarize_telemetry(telemetry_path),
+        "gpu_sampler": summarize_gpu_sampler(run_root / "gpu-sampler.log"),
         "traces": [summarize_trace(path, top_n=top_n) for path in trace_paths],
     }
