@@ -22,6 +22,7 @@ BASE_IMAGE = "lmsysorg/sglang@sha256:b90c0d760a65bc4dbbe4520bea966c437cc40391dcb
 SPECFORGE_REVISION = "e6440f09a8574b35f894608559fd3d165971e488"
 TARGET_MODEL = "thinkingmachines/Inkling-Small-NVFP4"
 TARGET_REVISION = "b6a99534467840620d411e4cd4ad5819b2610d9c"
+INDUCTOR_COMPILE_THREADS = 8
 GPU_QUERY_FIELDS = (
     "index",
     "uuid",
@@ -181,6 +182,16 @@ def should_commit_while_running(run_root: Path) -> bool:
     return not (run_root / "inference.ready").exists()
 
 
+def process_thread_environment(rank: int) -> dict[str, str]:
+    return {
+        "OMP_NUM_THREADS": "16" if rank == 0 else "4",
+        "TORCHINDUCTOR_COMPILE_THREADS": str(INDUCTOR_COMPILE_THREADS),
+        "MKL_NUM_THREADS": "1",
+        "OPENBLAS_NUM_THREADS": "1",
+        "NUMEXPR_NUM_THREADS": "1",
+    }
+
+
 def persist_run_snapshot(
     run_root: Path,
     persistent_root: Path,
@@ -292,10 +303,6 @@ def launch_rank(
             "TORCHINDUCTOR_CACHE_DIR": "/opjax-volume/torchinductor",
             "SGLANG_CACHE_DIR": "/opjax-volume/sglang",
             "TVM_FFI_CACHE_DIR": "/opjax-volume/tvm-ffi",
-            "OMP_NUM_THREADS": "16" if rank == 0 else "4",
-            "MKL_NUM_THREADS": "1",
-            "OPENBLAS_NUM_THREADS": "1",
-            "NUMEXPR_NUM_THREADS": "1",
             "TOKENIZERS_PARALLELISM": "false",
             "APPLY_SGLANG_CAPTURE_PATCH": "1",
             "INFERENCE_NODE_IP": "127.0.0.1",
@@ -315,6 +322,7 @@ def launch_rank(
             ),
         }
     )
+    environment.update(process_thread_environment(rank))
     log_path = run_root.parent / f"{run_root.name}-rank{rank}.log"
     log_handle = log_path.open("w")
     return subprocess.Popen(
@@ -415,6 +423,7 @@ def write_runtime_artifacts(
         "target_revision": TARGET_REVISION,
         "specforge_revision": SPECFORGE_REVISION,
         "base_image": BASE_IMAGE,
+        "inductor_compile_threads": INDUCTOR_COMPILE_THREADS,
         "python": sys.version,
         "platform": platform.platform(),
         "hostname": socket.gethostname(),

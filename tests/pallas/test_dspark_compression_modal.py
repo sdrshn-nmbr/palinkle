@@ -34,6 +34,16 @@ def test_config_enables_one_bounded_profile_step(tmp_path: Path) -> None:
     assert "profiling:\n  enabled: true\n  start_step: 5\n  num_steps: 1" in full_text
 
 
+def test_compile_parallelism_leaves_host_capacity_for_orchestration() -> None:
+    rank0 = training.process_thread_environment(0)
+    rank1 = training.process_thread_environment(1)
+
+    assert rank0["TORCHINDUCTOR_COMPILE_THREADS"] == "8"
+    assert rank1["TORCHINDUCTOR_COMPILE_THREADS"] == "8"
+    assert rank0["OMP_NUM_THREADS"] == "16"
+    assert rank1["OMP_NUM_THREADS"] == "4"
+
+
 def test_heartbeat_is_structured_and_durable(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
