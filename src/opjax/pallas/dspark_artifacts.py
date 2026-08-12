@@ -30,7 +30,21 @@ def validate_manifest(run_root: Path) -> dict[str, object]:
     mismatched: list[dict[str, object]] = []
     for relative, expected in sorted(artifacts.items()):
         path = run_root / relative
-        if not path.is_file():
+        if expected.get("kind") == "symlink":
+            if not path.is_symlink():
+                missing.append(relative)
+                continue
+            actual_target = path.readlink().as_posix()
+            if actual_target != expected.get("target"):
+                mismatched.append(
+                    {
+                        "path": relative,
+                        "expected_target": expected.get("target"),
+                        "actual_target": actual_target,
+                    }
+                )
+            continue
+        if not path.is_file() or path.is_symlink():
             missing.append(relative)
             continue
         actual_size = path.stat().st_size

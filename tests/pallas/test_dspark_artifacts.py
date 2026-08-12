@@ -35,6 +35,19 @@ def test_validate_manifest_detects_mutation(tmp_path: Path) -> None:
     assert result["mismatched"][0]["path"] == "checkpoint.pt"
 
 
+def test_validate_manifest_checks_symlink_target(tmp_path: Path) -> None:
+    (tmp_path / "actual").write_text("artifact")
+    (tmp_path / "latest").symlink_to("actual")
+    (tmp_path / "artifact-manifest.json").write_text(
+        json.dumps({"artifacts": {"latest": {"kind": "symlink", "target": "actual"}}})
+    )
+    assert validate_manifest(tmp_path)["valid"] is True
+
+    (tmp_path / "latest").unlink()
+    (tmp_path / "latest").symlink_to("missing")
+    assert validate_manifest(tmp_path)["valid"] is False
+
+
 def test_summarize_telemetry_reports_stage_and_gpu_metrics(tmp_path: Path) -> None:
     telemetry = tmp_path / "runtime-telemetry.jsonl"
     rows = [
