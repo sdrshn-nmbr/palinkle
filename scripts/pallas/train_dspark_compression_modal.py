@@ -178,10 +178,6 @@ def run_text_command(command: list[str], *, timeout: float = 10) -> dict[str, ob
     }
 
 
-def should_commit_while_running(run_root: Path) -> bool:
-    return not (run_root / "inference.ready").exists()
-
-
 def process_thread_environment(rank: int) -> dict[str, str]:
     return {
         "OMP_NUM_THREADS": "16" if rank == 0 else "4",
@@ -571,7 +567,6 @@ def run_training(
         )
         processes = [rank0, rank1]
         next_status_at = 0.0
-        next_commit_at = time.monotonic() + 60
         while any(process.poll() is None for process in processes):
             failed = [
                 process
@@ -601,40 +596,6 @@ def run_training(
                         flush=True,
                     )
                 next_status_at = time.monotonic() + 30
-            if time.monotonic() >= next_commit_at and should_commit_while_running(
-                run_root
-            ):
-                try:
-                    persist_run_snapshot(
-                        run_root,
-                        persistent_root,
-                        replace=True,
-                    )
-                    artifacts.commit()
-                    print(
-                        json.dumps(
-                            {
-                                "event": "opjax_dspark_artifacts_committed",
-                                "run": run_root.name,
-                                "timestamp": datetime.now(UTC).isoformat(),
-                            },
-                            sort_keys=True,
-                        ),
-                        flush=True,
-                    )
-                except Exception as exc:
-                    print(
-                        json.dumps(
-                            {
-                                "event": "opjax_dspark_artifact_commit_error",
-                                "error": f"{type(exc).__name__}: {exc}",
-                                "run": run_root.name,
-                            },
-                            sort_keys=True,
-                        ),
-                        flush=True,
-                    )
-                next_commit_at = time.monotonic() + 60
             time.sleep(1)
     finally:
         for process in [rank0, rank1, gpu_sampler]:
