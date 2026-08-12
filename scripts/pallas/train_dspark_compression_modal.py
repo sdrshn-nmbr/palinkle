@@ -355,7 +355,6 @@ def launch_rank(
                 + " --cuda-graph-backend-decode disabled"
                 + " --cuda-graph-backend-prefill disabled"
                 + " --skip-server-warmup"
-                + " --disable-flashinfer-autotune"
             ),
         }
     )
