@@ -646,7 +646,7 @@ FUNCTION_OPTIONS = {
     "volumes": {"/opjax-volume": hf_cache, "/artifacts": artifacts},
     "secrets": [secret],
     "cpu": 64.0,
-    "memory": 262144,
+    "memory": 524288,
     "timeout": 24 * 60 * 60,
 }
 
