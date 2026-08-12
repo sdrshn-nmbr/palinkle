@@ -34,9 +34,7 @@ def test_config_enables_one_bounded_profile_step(tmp_path: Path) -> None:
     assert "profiling:\n  enabled: true\n  start_step: 5\n  num_steps: 1" in full_text
 
 
-def test_heartbeat_is_structured_and_durable(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_heartbeat_is_structured_and_durable(tmp_path: Path, monkeypatch) -> None:
     responses = iter(
         [
             {
@@ -58,7 +56,9 @@ def test_heartbeat_is_structured_and_durable(
             },
         ]
     )
-    monkeypatch.setattr(training, "run_text_command", lambda *args, **kwargs: next(responses))
+    monkeypatch.setattr(
+        training, "run_text_command", lambda *args, **kwargs: next(responses)
+    )
 
     training.emit_runtime_status(
         run_root=tmp_path,
@@ -92,3 +92,10 @@ def test_manifest_hashes_all_frozen_files(tmp_path: Path) -> None:
     )
     assert artifacts["output/training_state.pt"]["size"] == len(b"checkpoint")
     assert "artifact-manifest.json" not in artifacts
+
+
+def test_volume_commits_stop_before_training_writes_begin(tmp_path: Path) -> None:
+    assert training.should_commit_while_running(tmp_path) is True
+
+    (tmp_path / "inference.ready").touch()
+    assert training.should_commit_while_running(tmp_path) is False

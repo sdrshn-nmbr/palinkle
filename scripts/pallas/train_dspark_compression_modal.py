@@ -177,13 +177,19 @@ def run_text_command(command: list[str], *, timeout: float = 10) -> dict[str, ob
     }
 
 
-def parse_csv_rows(fields: tuple[str, ...], result: dict[str, object]) -> list[dict[str, str]]:
+def parse_csv_rows(
+    fields: tuple[str, ...], result: dict[str, object]
+) -> list[dict[str, str]]:
     rows = []
     for line in result["lines"]:
         values = [value.strip() for value in str(line).split(",")]
         if len(values) == len(fields):
             rows.append(dict(zip(fields, values, strict=True)))
     return rows
+
+
+def should_commit_while_running(run_root: Path) -> bool:
+    return not (run_root / "inference.ready").exists()
 
 
 def launch_rank(
@@ -236,8 +242,10 @@ def launch_rank(
             "START_TIMEOUT_S": "3600",
             "PEER_TIMEOUT_S": "3600",
             "SERVER_EXTRA_ARGS": (
-                "--revision " + TARGET_REVISION
-                + " --dtype bfloat16 --attention-backend " + attention_backend
+                "--revision "
+                + TARGET_REVISION
+                + " --dtype bfloat16 --attention-backend "
+                + attention_backend
                 + " --context-length 4096 --quantization modelopt_fp4"
                 + server_backend_args
                 + " --page-size 128 --mamba-radix-cache-strategy extra_buffer"
@@ -474,9 +482,7 @@ def run_training(
         raise ValueError(f"unknown student: {student}")
     if max_steps <= 0:
         raise ValueError("max_steps must be positive")
-    run_name = (
-        f"{student}-steps{max_steps}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
-    )
+    run_name = f"{student}-steps{max_steps}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
     run_root = Path("/artifacts/runs") / run_name
     run_root.parent.mkdir(parents=True, exist_ok=True)
     config = write_config(
@@ -551,7 +557,9 @@ def run_training(
                         flush=True,
                     )
                 next_status_at = time.monotonic() + 30
-            if time.monotonic() >= next_commit_at:
+            if time.monotonic() >= next_commit_at and should_commit_while_running(
+                run_root
+            ):
                 try:
                     artifacts.commit()
                     print(
@@ -656,9 +664,7 @@ def train_h200(student: str, max_steps: int = 1) -> dict[str, object]:
         trainer_nproc=2,
         accumulation_steps=32,
         moe_backend="marlin",
-        server_backend_args=(
-            " --fp4-gemm-backend marlin --moe-runner-backend marlin"
-        ),
+        server_backend_args=(" --fp4-gemm-backend marlin --moe-runner-backend marlin"),
         server_mem_fraction=0.70,
     )
 
@@ -693,9 +699,7 @@ def train_canary_2h200(student: str, max_steps: int = 1) -> dict[str, object]:
         trainer_nproc=1,
         accumulation_steps=64,
         moe_backend="marlin",
-        server_backend_args=(
-            " --fp4-gemm-backend marlin --moe-runner-backend marlin"
-        ),
+        server_backend_args=(" --fp4-gemm-backend marlin --moe-runner-backend marlin"),
     )
 
 
@@ -712,9 +716,7 @@ def train_canary_2h100(student: str, max_steps: int = 1) -> dict[str, object]:
         trainer_nproc=1,
         accumulation_steps=64,
         moe_backend="marlin",
-        server_backend_args=(
-            " --fp4-gemm-backend marlin --moe-runner-backend marlin"
-        ),
+        server_backend_args=(" --fp4-gemm-backend marlin --moe-runner-backend marlin"),
     )
 
 
@@ -793,8 +795,6 @@ def train_canary_l40s(student: str, max_steps: int = 1) -> dict[str, object]:
         trainer_nproc=1,
         accumulation_steps=64,
         moe_backend="marlin",
-        server_backend_args=(
-            " --fp4-gemm-backend marlin --moe-runner-backend marlin"
-        ),
+        server_backend_args=(" --fp4-gemm-backend marlin --moe-runner-backend marlin"),
         attention_backend="flashinfer",
     )

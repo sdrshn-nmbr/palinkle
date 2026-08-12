@@ -1,0 +1,93 @@
+from __future__ import annotations
+
+import gzip
+import json
+from hashlib import sha256
+from pathlib import Path
+
+from opjax.pallas.dspark_artifacts import (
+    summarize_telemetry,
+    summarize_trace,
+    validate_manifest,
+)
+
+
+def test_validate_manifest_detects_mutation(tmp_path: Path) -> None:
+    artifact = tmp_path / "checkpoint.pt"
+    artifact.write_bytes(b"valid")
+    (tmp_path / "artifact-manifest.json").write_text(
+        json.dumps(
+            {
+                "artifacts": {
+                    "checkpoint.pt": {
+                        "size": 5,
+                        "sha256": sha256(b"valid").hexdigest(),
+                    }
+                }
+            }
+        )
+    )
+    assert validate_manifest(tmp_path)["valid"] is True
+
+    artifact.write_bytes(b"changed")
+    result = validate_manifest(tmp_path)
+    assert result["valid"] is False
+    assert result["mismatched"][0]["path"] == "checkpoint.pt"
+
+
+def test_summarize_telemetry_reports_stage_and_gpu_metrics(tmp_path: Path) -> None:
+    telemetry = tmp_path / "runtime-telemetry.jsonl"
+    rows = [
+        {
+            "event": "opjax_dspark_heartbeat",
+            "timestamp": "2026-08-12T01:00:00+00:00",
+            "elapsed_s": 0,
+            "rank0_status": None,
+            "rank1_status": None,
+            "files": {"inference.ready": {"exists": False}},
+            "checkpoint_states": [],
+            "gpus": [{"index": "0", "memory.used": "100", "utilization.gpu": "0"}],
+        },
+        {
+            "event": "opjax_dspark_heartbeat",
+            "timestamp": "2026-08-12T01:00:30+00:00",
+            "elapsed_s": 30,
+            "rank0_status": 0,
+            "rank1_status": 0,
+            "files": {"inference.ready": {"exists": True}},
+            "checkpoint_states": ["output/run-step1/training_state.pt"],
+            "gpus": [{"index": "0", "memory.used": "300", "utilization.gpu": "80"}],
+        },
+    ]
+    telemetry.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    result = summarize_telemetry(telemetry)
+    assert result["sample_count"] == 2
+    assert result["stage_first_seen_s"]["inference.ready"] == 30
+    assert result["checkpoint_first_seen_s"] == 30
+    assert result["gpus"]["0"]["memory.used"]["max"] == 300
+    assert result["gpus"]["0"]["utilization.gpu"]["mean"] == 40
+
+
+def test_summarize_trace_aggregates_complete_events(tmp_path: Path) -> None:
+    trace = tmp_path / "profile_rank0_1.trace.json.gz"
+    document = {
+        "traceEvents": [
+            {"ph": "X", "cat": "cpu_op", "name": "forward", "dur": 10},
+            {"ph": "X", "cat": "cpu_op", "name": "forward", "dur": 20},
+            {"ph": "i", "cat": "meta", "name": "ignored"},
+        ]
+    }
+    with gzip.open(trace, "wt") as handle:
+        json.dump(document, handle)
+
+    result = summarize_trace(trace)
+    assert result["complete_event_count"] == 2
+    assert result["summed_complete_event_duration_us"] == 30
+    assert result["top_complete_events"][0] == {
+        "category": "cpu_op",
+        "name": "forward",
+        "count": 2,
+        "total_duration_us": 30,
+        "mean_duration_us": 15,
+    }
