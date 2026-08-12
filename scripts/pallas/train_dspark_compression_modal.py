@@ -667,7 +667,7 @@ def train(student: str, max_steps: int = 1) -> dict[str, object]:
         accumulation_steps=32,
         moe_backend="flashinfer_trtllm_routed",
         server_backend_args=" --moe-runner-backend flashinfer_trtllm_routed",
-        server_mem_fraction=0.80,
+        server_mem_fraction=0.90,
     )
 
 

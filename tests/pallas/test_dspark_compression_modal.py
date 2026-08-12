@@ -77,7 +77,7 @@ def test_b200_topology_uses_one_target_process(monkeypatch) -> None:
     assert captured["server_tp"] == 1
     assert captured["trainer_gpus"] == "2,3"
     assert captured["trainer_nproc"] == 2
-    assert captured["server_mem_fraction"] == 0.80
+    assert captured["server_mem_fraction"] == 0.90
 
 
 def test_server_disables_decode_and_prefill_cuda_graphs(
