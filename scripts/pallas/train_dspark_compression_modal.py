@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import signal
 import socket
 import subprocess
+import sys
 import time
 import uuid
+from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
 
 import modal
@@ -17,6 +21,22 @@ BASE_IMAGE = "lmsysorg/sglang@sha256:b90c0d760a65bc4dbbe4520bea966c437cc40391dcb
 SPECFORGE_REVISION = "e6440f09a8574b35f894608559fd3d165971e488"
 TARGET_MODEL = "thinkingmachines/Inkling-Small-NVFP4"
 TARGET_REVISION = "b6a99534467840620d411e4cd4ad5819b2610d9c"
+GPU_QUERY_FIELDS = (
+    "index",
+    "uuid",
+    "name",
+    "pstate",
+    "memory.used",
+    "memory.total",
+    "utilization.gpu",
+    "utilization.memory",
+    "power.draw",
+    "power.limit",
+    "temperature.gpu",
+    "clocks.sm",
+    "clocks.mem",
+)
+COMPUTE_PROCESS_FIELDS = ("pid", "gpu_uuid", "used_memory", "process_name")
 
 app = modal.App(APP_NAME)
 hf_cache = modal.Volume.from_name(
@@ -105,6 +125,11 @@ training:
   log_interval: 1
   dist_timeout: 30
   seed: 42
+profiling:
+  enabled: true
+  start_step: {0 if max_steps == 1 else min(5, max_steps - 1)}
+  num_steps: 1
+  record_shapes: false
 run_id: {run_root.name}
 output_dir: {run_root}/output
 deployment:
@@ -124,6 +149,41 @@ deployment:
     config_path = Path("/tmp") / f"{run_root.name}.yaml"
     config_path.write_text(config + "\n")
     return config_path
+
+
+def file_sha256(path: Path) -> str:
+    digest = sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def run_text_command(command: list[str], *, timeout: float = 10) -> dict[str, object]:
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"status": f"{type(exc).__name__}: {exc}", "lines": []}
+    return {
+        "status": result.returncode,
+        "lines": [line for line in result.stdout.splitlines() if line.strip()],
+        "stderr": result.stderr.strip(),
+    }
+
+
+def parse_csv_rows(fields: tuple[str, ...], result: dict[str, object]) -> list[dict[str, str]]:
+    rows = []
+    for line in result["lines"]:
+        values = [value.strip() for value in str(line).split(",")]
+        if len(values) == len(fields):
+            rows.append(dict(zip(fields, values, strict=True)))
+    return rows
 
 
 def launch_rank(
@@ -220,30 +280,37 @@ def emit_runtime_status(
         run_root / "consumer.done",
         run_root / "inference.done",
     ]
-    try:
-        gpu_query = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=index,memory.used,utilization.gpu",
-                "--format=csv,noheader,nounits",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        gpu_lines = [
-            line.strip()
-            for line in gpu_query.stdout.splitlines()
-            if line.strip()
-        ]
-        gpu_query_status: int | str = gpu_query.returncode
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        gpu_lines = []
-        gpu_query_status = f"{type(exc).__name__}: {exc}"
+    gpu_query = run_text_command(
+        [
+            "nvidia-smi",
+            f"--query-gpu={','.join(GPU_QUERY_FIELDS)}",
+            "--format=csv,noheader,nounits",
+        ],
+        timeout=5,
+    )
+    process_query = run_text_command(
+        [
+            "nvidia-smi",
+            f"--query-compute-apps={','.join(COMPUTE_PROCESS_FIELDS)}",
+            "--format=csv,noheader,nounits",
+        ],
+        timeout=5,
+    )
+    process_snapshot = run_text_command(
+        [
+            "ps",
+            "-eo",
+            "pid,ppid,stat,pcpu,pmem,rss,etime,args",
+            "--sort=-pcpu",
+        ],
+        timeout=5,
+    )
+    load_average = Path("/proc/loadavg")
+    memory_info = Path("/proc/meminfo")
     status = {
         "event": "opjax_dspark_heartbeat",
         "run": run_root.name,
+        "timestamp": datetime.now(UTC).isoformat(),
         "elapsed_s": round(time.monotonic() - started_at, 1),
         "rank0_status": rank0.poll(),
         "rank1_status": None if rank1 is None else rank1.poll(),
@@ -254,10 +321,97 @@ def emit_runtime_status(
             for path in tracked_files
         },
         "checkpoint_states": checkpoint_states,
-        "gpus": gpu_lines,
-        "gpu_query_status": gpu_query_status,
+        "gpus": parse_csv_rows(GPU_QUERY_FIELDS, gpu_query),
+        "gpu_processes": parse_csv_rows(COMPUTE_PROCESS_FIELDS, process_query),
+        "gpu_query_status": gpu_query["status"],
+        "gpu_process_query_status": process_query["status"],
+        "load_average": (
+            load_average.read_text().strip() if load_average.exists() else None
+        ),
+        "memory": (
+            {
+                key: value.strip()
+                for line in memory_info.read_text().splitlines()
+                if ":" in line
+                for key, value in [line.split(":", 1)]
+                if key in {"MemAvailable", "MemFree", "MemTotal", "SwapFree"}
+            }
+            if memory_info.exists()
+            else {}
+        ),
+        "top_processes": process_snapshot["lines"][:25],
+        "process_query_status": process_snapshot["status"],
     }
-    print(json.dumps(status, sort_keys=True), flush=True)
+    encoded = json.dumps(status, sort_keys=True)
+    print(encoded, flush=True)
+    if run_root.exists():
+        with (run_root / "runtime-telemetry.jsonl").open("a") as handle:
+            handle.write(encoded + "\n")
+
+
+def write_runtime_artifacts(
+    *,
+    run_root: Path,
+    config: Path,
+    result: dict[str, object],
+) -> None:
+    run_root.mkdir(parents=True, exist_ok=True)
+    (run_root / "config.yaml").write_text(config.read_text())
+    pip_freeze = run_text_command(
+        [sys.executable, "-m", "pip", "freeze", "--all"], timeout=60
+    )
+    (run_root / "runtime-pip-freeze.txt").write_text(
+        "\n".join(str(line) for line in pip_freeze["lines"]) + "\n"
+    )
+    nvidia_smi = run_text_command(["nvidia-smi", "-q"], timeout=30)
+    (run_root / "runtime-nvidia-smi.txt").write_text(
+        "\n".join(str(line) for line in nvidia_smi["lines"]) + "\n"
+    )
+    source_path = Path(__file__)
+    runtime = {
+        "generated_at": datetime.now(UTC).isoformat(),
+        "result": result,
+        "target_model": TARGET_MODEL,
+        "target_revision": TARGET_REVISION,
+        "specforge_revision": SPECFORGE_REVISION,
+        "base_image": BASE_IMAGE,
+        "python": sys.version,
+        "platform": platform.platform(),
+        "hostname": socket.gethostname(),
+        "launcher_sha256": file_sha256(source_path),
+        "config_sha256": file_sha256(run_root / "config.yaml"),
+        "pip_freeze_status": pip_freeze["status"],
+        "nvidia_smi_status": nvidia_smi["status"],
+    }
+    (run_root / "runtime.json").write_text(
+        json.dumps(runtime, indent=2, sort_keys=True) + "\n"
+    )
+
+
+def write_artifact_manifest(run_root: Path) -> None:
+    artifacts_by_path: dict[str, dict[str, object]] = {}
+    manifest_path = run_root / "artifact-manifest.json"
+    for path in sorted(run_root.rglob("*")):
+        relative = str(path.relative_to(run_root))
+        if path == manifest_path:
+            continue
+        if path.is_symlink():
+            artifacts_by_path[relative] = {
+                "kind": "symlink",
+                "target": os.readlink(path),
+            }
+        elif path.is_file():
+            artifacts_by_path[relative] = {
+                "kind": "file",
+                "size": path.stat().st_size,
+                "sha256": file_sha256(path),
+            }
+    manifest = {
+        "generated_at": datetime.now(UTC).isoformat(),
+        "run": run_root.name,
+        "artifacts": artifacts_by_path,
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 
 
 @app.function(image=image, timeout=900, secrets=[secret])
@@ -367,6 +521,7 @@ def run_training(
         )
         processes = [rank0, rank1]
         next_status_at = 0.0
+        next_commit_at = time.monotonic() + 60
         while any(process.poll() is None for process in processes):
             failed = [
                 process
@@ -396,6 +551,33 @@ def run_training(
                         flush=True,
                     )
                 next_status_at = time.monotonic() + 30
+            if time.monotonic() >= next_commit_at:
+                try:
+                    artifacts.commit()
+                    print(
+                        json.dumps(
+                            {
+                                "event": "opjax_dspark_artifacts_committed",
+                                "run": run_root.name,
+                                "timestamp": datetime.now(UTC).isoformat(),
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+                except Exception as exc:
+                    print(
+                        json.dumps(
+                            {
+                                "event": "opjax_dspark_artifact_commit_error",
+                                "error": f"{type(exc).__name__}: {exc}",
+                                "run": run_root.name,
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+                next_commit_at = time.monotonic() + 60
             time.sleep(1)
     finally:
         for process in [rank0, rank1]:
@@ -410,23 +592,28 @@ def run_training(
                     process.wait()
     rank0_status = rank0.returncode
     rank1_status = None if rank1 is None else rank1.returncode
-    artifacts.commit()
-    gpu_names = subprocess.run(
-        ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.splitlines()
+    gpu_name_query = run_text_command(
+        ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], timeout=10
+    )
     result = {
         "run": run_name,
         "rank0_status": rank0_status,
         "rank1_status": rank1_status,
         "run_root": str(run_root),
-        "gpu_names": gpu_names,
+        "gpu_names": gpu_name_query["lines"],
+        "gpu_name_query_status": gpu_name_query["status"],
+        "student": student,
+        "max_steps": max_steps,
+        "elapsed_s": round(time.monotonic() - started_at, 1),
     }
-    (run_root.parent / f"{run_name}-result.json").write_text(
-        json.dumps(result, indent=2) + "\n"
+    (run_root / "result.json").write_text(
+        json.dumps(result, indent=2, sort_keys=True) + "\n"
     )
+    (run_root.parent / f"{run_name}-result.json").write_text(
+        json.dumps(result, indent=2, sort_keys=True) + "\n"
+    )
+    write_runtime_artifacts(run_root=run_root, config=config, result=result)
+    write_artifact_manifest(run_root)
     artifacts.commit()
     if rank0_status != 0 or rank1_status != 0:
         raise RuntimeError(json.dumps(result))
