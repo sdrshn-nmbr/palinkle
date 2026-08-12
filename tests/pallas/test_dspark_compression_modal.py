@@ -125,6 +125,7 @@ def test_server_disables_decode_and_prefill_cuda_graphs(
     assert "--cuda-graph-backend-decode disabled" in environment["SERVER_EXTRA_ARGS"]
     assert "--cuda-graph-backend-prefill disabled" in environment["SERVER_EXTRA_ARGS"]
     assert "--skip-server-warmup" in environment["SERVER_EXTRA_ARGS"]
+    assert "--disable-flashinfer-autotune" in environment["SERVER_EXTRA_ARGS"]
     assert "--disable-cuda-graph" not in environment["SERVER_EXTRA_ARGS"]
 
 
