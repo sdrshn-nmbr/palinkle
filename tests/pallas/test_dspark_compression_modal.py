@@ -63,6 +63,23 @@ def test_h200_topology_fits_target_and_separates_trainers(monkeypatch) -> None:
     assert captured["server_mem_fraction"] == 0.64
 
 
+def test_b200_topology_uses_one_target_process(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_training(student: str, max_steps: int, **kwargs) -> dict[str, object]:
+        captured.update(student=student, max_steps=max_steps, **kwargs)
+        return captured
+
+    monkeypatch.setattr(training, "run_training", fake_run_training)
+    training.train.local("dspark-500m", 1)
+
+    assert captured["server_gpus"] == "0"
+    assert captured["server_tp"] == 1
+    assert captured["trainer_gpus"] == "2,3"
+    assert captured["trainer_nproc"] == 2
+    assert captured["server_mem_fraction"] == 0.80
+
+
 def test_server_disables_decode_and_prefill_cuda_graphs(
     tmp_path: Path, monkeypatch
 ) -> None:
