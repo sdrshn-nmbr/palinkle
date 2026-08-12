@@ -74,7 +74,7 @@ def test_h200_topology_fits_target_and_separates_trainers(monkeypatch) -> None:
     assert captured["server_mem_fraction"] == 0.64
 
 
-def test_b200_topology_uses_one_target_process(monkeypatch) -> None:
+def test_b200_topology_separates_proven_target_from_trainers(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
     def fake_run_training(student: str, max_steps: int, **kwargs) -> dict[str, object]:
@@ -84,11 +84,15 @@ def test_b200_topology_uses_one_target_process(monkeypatch) -> None:
     monkeypatch.setattr(training, "run_training", fake_run_training)
     training.train.local("dspark-500m", 1)
 
-    assert captured["server_gpus"] == "0"
-    assert captured["server_tp"] == 1
-    assert captured["trainer_gpus"] == "2,3"
-    assert captured["trainer_nproc"] == 2
-    assert captured["server_mem_fraction"] == 0.90
+    assert captured["server_gpus"] == "0,1,2,3"
+    assert captured["server_tp"] == 4
+    assert captured["trainer_gpus"] == "4,5,6,7"
+    assert captured["trainer_nproc"] == 4
+    assert captured["accumulation_steps"] == 16
+    assert captured["moe_backend"] == "marlin"
+    assert captured["server_mem_fraction"] == 0.60
+    assert "--fp4-gemm-backend marlin" in captured["server_backend_args"]
+    assert "--enable-torch-symm-mem" in captured["server_backend_args"]
 
 
 def test_server_disables_decode_and_prefill_cuda_graphs(

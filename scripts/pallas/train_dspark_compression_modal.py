@@ -709,19 +709,22 @@ FUNCTION_OPTIONS = {
 }
 
 
-@app.function(gpu="B200:4", **FUNCTION_OPTIONS)
+@app.function(gpu="B200:8", **FUNCTION_OPTIONS)
 def train(student: str, max_steps: int = 1) -> dict[str, object]:
     return run_training(
         student,
         max_steps,
-        server_gpus="0",
-        server_tp=1,
-        trainer_gpus="2,3",
-        trainer_nproc=2,
-        accumulation_steps=32,
-        moe_backend="flashinfer_trtllm_routed",
-        server_backend_args=" --moe-runner-backend flashinfer_trtllm_routed",
-        server_mem_fraction=0.90,
+        server_gpus="0,1,2,3",
+        server_tp=4,
+        trainer_gpus="4,5,6,7",
+        trainer_nproc=4,
+        accumulation_steps=16,
+        moe_backend="marlin",
+        server_backend_args=(
+            " --fp4-gemm-backend marlin --moe-runner-backend marlin"
+            " --enable-torch-symm-mem"
+        ),
+        server_mem_fraction=0.60,
     )
 
 
