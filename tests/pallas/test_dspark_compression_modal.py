@@ -161,6 +161,24 @@ def test_heartbeat_is_structured_and_durable(
     assert logged["gpu_sampler_tail"][-1] == "0, GPU-1, NVIDIA H200"
 
 
+def test_host_sampler_captures_cgroup_memory_and_processes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_popen(command, **kwargs):
+        captured.update(command=command, **kwargs)
+        return FakeProcess(None)
+
+    monkeypatch.setattr(training.subprocess, "Popen", fake_popen)
+    training.launch_host_sampler(tmp_path)
+
+    command = captured["command"][-1]
+    assert "/sys/fs/cgroup/memory.current" in command
+    assert "/proc/meminfo" in command
+    assert "ps -eo" in command
+
+
 def test_manifest_hashes_all_frozen_files(tmp_path: Path) -> None:
     (tmp_path / "trace.json.gz").write_bytes(b"trace")
     output = tmp_path / "output"

@@ -241,6 +241,76 @@ def summarize_gpu_sampler(path: Path) -> dict[str, object]:
     }
 
 
+def summarize_host_sampler(path: Path) -> dict[str, object]:
+    samples: list[dict[str, int | str]] = []
+    current: dict[str, int | str] | None = None
+    process_max_rss_kib: dict[str, int] = {}
+    for raw_line in path.read_text(errors="replace").splitlines():
+        line = raw_line.strip()
+        if len(line) >= 19 and line[:4].isdigit() and "T" in line:
+            if current is not None:
+                samples.append(current)
+            current = {"timestamp": line}
+            continue
+        if current is None:
+            continue
+        if line.startswith("cgroup-memory-current="):
+            value = line.partition("=")[2]
+            if value.isdigit():
+                current["cgroup_memory_current_bytes"] = int(value)
+            continue
+        if line.startswith("cgroup-memory-max="):
+            value = line.partition("=")[2]
+            if value.isdigit():
+                current["cgroup_memory_max_bytes"] = int(value)
+            continue
+        if line.startswith("MemAvailable:"):
+            value = line.split()[1]
+            if value.isdigit():
+                current["mem_available_kib"] = int(value)
+            continue
+        columns = line.split(maxsplit=9)
+        if len(columns) == 10 and columns[0].isdigit() and columns[4].isdigit():
+            command = columns[8]
+            rss_kib = int(columns[4])
+            process_max_rss_kib[command] = max(
+                process_max_rss_kib.get(command, 0), rss_kib
+            )
+    if current is not None:
+        samples.append(current)
+
+    current_values = [
+        int(sample["cgroup_memory_current_bytes"])
+        for sample in samples
+        if "cgroup_memory_current_bytes" in sample
+    ]
+    available_values = [
+        int(sample["mem_available_kib"])
+        for sample in samples
+        if "mem_available_kib" in sample
+    ]
+    return {
+        "sample_count": len(samples),
+        "first_timestamp": samples[0]["timestamp"] if samples else None,
+        "last_timestamp": samples[-1]["timestamp"] if samples else None,
+        "cgroup_memory_current_bytes": {
+            "max": max(current_values) if current_values else None,
+            "last": current_values[-1] if current_values else None,
+        },
+        "mem_available_kib": {
+            "min": min(available_values) if available_values else None,
+            "last": available_values[-1] if available_values else None,
+        },
+        "process_max_rss_kib": dict(
+            sorted(
+                process_max_rss_kib.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )[:20]
+        ),
+    }
+
+
 def _read_trace(path: Path) -> dict[str, Any] | list[Any]:
     opener = gzip.open if path.suffix == ".gz" else open
     with opener(path, "rt") as handle:
@@ -303,5 +373,6 @@ def analyze_run(run_root: Path, *, top_n: int = 25) -> dict[str, object]:
         "manifest": validate_manifest(run_root),
         "telemetry": summarize_telemetry(telemetry_path),
         "gpu_sampler": summarize_gpu_sampler(run_root / "gpu-sampler.log"),
+        "host_sampler": summarize_host_sampler(run_root / "host-sampler.log"),
         "traces": [summarize_trace(path, top_n=top_n) for path in trace_paths],
     }

@@ -224,6 +224,9 @@ def collect_rank_logs(run_root: Path) -> None:
     sampler = run_root.parent / f"{run_root.name}-gpu-sampler.log"
     if sampler.is_file():
         shutil.copy2(sampler, run_root / "gpu-sampler.log")
+    host_sampler = run_root.parent / f"{run_root.name}-host-sampler.log"
+    if host_sampler.is_file():
+        shutil.copy2(host_sampler, run_root / "host-sampler.log")
 
 
 def launch_gpu_sampler(run_root: Path) -> subprocess.Popen:
@@ -236,6 +239,31 @@ def launch_gpu_sampler(run_root: Path) -> subprocess.Popen:
         f"--query-gpu={','.join(GPU_QUERY_FIELDS)} "
         "--format=csv,noheader,nounits || echo nvidia-smi-status=$?; "
         "sleep 5; "
+        "done"
+    )
+    return subprocess.Popen(
+        ["bash", "-lc", command],
+        stdout=handle,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+
+
+def launch_host_sampler(run_root: Path) -> subprocess.Popen:
+    output = run_root.parent / f"{run_root.name}-host-sampler.log"
+    handle = output.open("w")
+    command = (
+        "while true; do "
+        "date -Ins; "
+        "printf 'cgroup-memory-current='; "
+        "cat /sys/fs/cgroup/memory.current 2>/dev/null || true; "
+        "printf 'cgroup-memory-max='; "
+        "cat /sys/fs/cgroup/memory.max 2>/dev/null || true; "
+        "awk '/^(MemTotal|MemFree|MemAvailable|SwapTotal|SwapFree):/ {print}' "
+        "/proc/meminfo; "
+        "ps -eo pid,ppid,stat,nlwp,rss,vsz,pcpu,pmem,comm,args --sort=-rss "
+        "| head -n 30; "
+        "sleep 10; "
         "done"
     )
     return subprocess.Popen(
@@ -559,6 +587,7 @@ def run_training(
         server_mem_fraction=server_mem_fraction,
     )
     gpu_sampler = launch_gpu_sampler(run_root)
+    host_sampler = launch_host_sampler(run_root)
     rank1 = None
     started_at = time.monotonic()
     try:
@@ -578,6 +607,7 @@ def run_training(
         )
         processes = [rank0, rank1]
         next_status_at = 0.0
+        next_snapshot_at = 0.0
         while any(process.poll() is None for process in processes):
             failed = [
                 process
@@ -607,12 +637,27 @@ def run_training(
                         flush=True,
                     )
                 next_status_at = time.monotonic() + 30
+            if time.monotonic() >= next_snapshot_at:
+                persist_run_snapshot(run_root, persistent_root, replace=False)
+                artifacts.commit()
+                print(
+                    json.dumps(
+                        {
+                            "event": "opjax_dspark_snapshot_committed",
+                            "run": run_root.name,
+                            "timestamp": datetime.now(UTC).isoformat(),
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+                next_snapshot_at = time.monotonic() + 60
             time.sleep(1)
     finally:
-        for process in [rank0, rank1, gpu_sampler]:
+        for process in [rank0, rank1, gpu_sampler, host_sampler]:
             if process is not None and process.poll() is None:
                 os.killpg(process.pid, signal.SIGTERM)
-        for process in [rank0, rank1, gpu_sampler]:
+        for process in [rank0, rank1, gpu_sampler, host_sampler]:
             if process is not None and process.poll() is None:
                 try:
                     process.wait(timeout=30)
