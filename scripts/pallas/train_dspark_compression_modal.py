@@ -165,7 +165,7 @@ def launch_rank(
             "TORCHINDUCTOR_CACHE_DIR": "/opjax-volume/torchinductor",
             "SGLANG_CACHE_DIR": "/opjax-volume/sglang",
             "TVM_FFI_CACHE_DIR": "/opjax-volume/tvm-ffi",
-            "OMP_NUM_THREADS": "4",
+            "OMP_NUM_THREADS": "16" if rank == 0 else "4",
             "MKL_NUM_THREADS": "1",
             "OPENBLAS_NUM_THREADS": "1",
             "NUMEXPR_NUM_THREADS": "1",
@@ -195,6 +195,69 @@ def launch_rank(
         stderr=subprocess.STDOUT,
         start_new_session=True,
     )
+
+
+def emit_runtime_status(
+    *,
+    run_root: Path,
+    rank0: subprocess.Popen,
+    rank1: subprocess.Popen | None,
+    started_at: float,
+) -> None:
+    output_root = run_root / "output"
+    checkpoint_states = (
+        sorted(
+            str(path.relative_to(run_root))
+            for path in output_root.glob("**/training_state*.pt")
+        )
+        if output_root.exists()
+        else []
+    )
+    tracked_files = [
+        run_root / "inference.ready",
+        run_root / "producer.log",
+        run_root / "consumer.log",
+        run_root / "consumer.done",
+        run_root / "inference.done",
+    ]
+    try:
+        gpu_query = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,memory.used,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        gpu_lines = [
+            line.strip()
+            for line in gpu_query.stdout.splitlines()
+            if line.strip()
+        ]
+        gpu_query_status: int | str = gpu_query.returncode
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        gpu_lines = []
+        gpu_query_status = f"{type(exc).__name__}: {exc}"
+    status = {
+        "event": "opjax_dspark_heartbeat",
+        "run": run_root.name,
+        "elapsed_s": round(time.monotonic() - started_at, 1),
+        "rank0_status": rank0.poll(),
+        "rank1_status": None if rank1 is None else rank1.poll(),
+        "files": {
+            path.name: {"exists": path.exists(), "size": path.stat().st_size}
+            if path.exists()
+            else {"exists": False, "size": 0}
+            for path in tracked_files
+        },
+        "checkpoint_states": checkpoint_states,
+        "gpus": gpu_lines,
+        "gpu_query_status": gpu_query_status,
+    }
+    print(json.dumps(status, sort_keys=True), flush=True)
 
 
 @app.function(image=image, timeout=900, secrets=[secret])
@@ -286,6 +349,7 @@ def run_training(
         server_mem_fraction=server_mem_fraction,
     )
     rank1 = None
+    started_at = time.monotonic()
     try:
         time.sleep(5)
         rank1 = launch_rank(
@@ -302,6 +366,7 @@ def run_training(
             server_mem_fraction=server_mem_fraction,
         )
         processes = [rank0, rank1]
+        next_status_at = 0.0
         while any(process.poll() is None for process in processes):
             failed = [
                 process
@@ -310,6 +375,27 @@ def run_training(
             ]
             if failed:
                 break
+            if time.monotonic() >= next_status_at:
+                try:
+                    emit_runtime_status(
+                        run_root=run_root,
+                        rank0=rank0,
+                        rank1=rank1,
+                        started_at=started_at,
+                    )
+                except Exception as exc:
+                    print(
+                        json.dumps(
+                            {
+                                "event": "opjax_dspark_heartbeat_error",
+                                "error": f"{type(exc).__name__}: {exc}",
+                                "run": run_root.name,
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+                next_status_at = time.monotonic() + 30
             time.sleep(1)
     finally:
         for process in [rank0, rank1]:
@@ -351,7 +437,7 @@ FUNCTION_OPTIONS = {
     "image": image,
     "volumes": {"/opjax-volume": hf_cache, "/artifacts": artifacts},
     "secrets": [secret],
-    "cpu": 16.0,
+    "cpu": 32.0,
     "memory": 65536,
     "timeout": 24 * 60 * 60,
 }
