@@ -5,6 +5,7 @@ import concurrent.futures
 import hashlib
 import json
 from pathlib import Path
+import random
 import statistics
 from typing import Any
 import urllib.request
@@ -73,14 +74,45 @@ def _distribution(values: list[float]) -> dict[str, float]:
     }
 
 
+def _cluster_bootstrap_latency_ratio(
+    *,
+    plain_rows: dict[str, dict[str, Any]],
+    arm_rows: dict[str, dict[str, Any]],
+    prompt_ids: list[str],
+    samples: int = 10_000,
+) -> dict[str, float]:
+    grouped: dict[str, list[str]] = {}
+    for prompt_id in prompt_ids:
+        grouped.setdefault(plain_rows[prompt_id]["trajectory"], []).append(prompt_id)
+    trajectories = sorted(grouped)
+    if not trajectories:
+        return {"clusters": 0.0, "samples": float(samples)}
+
+    def ratio(selected: list[str]) -> float:
+        selected_ids = [prompt_id for name in selected for prompt_id in grouped[name]]
+        return sum(
+            plain_rows[prompt_id]["elapsed_s"] for prompt_id in selected_ids
+        ) / sum(arm_rows[prompt_id]["elapsed_s"] for prompt_id in selected_ids)
+
+    rng = random.Random(0)
+    draws = sorted(
+        ratio([rng.choice(trajectories) for _ in trajectories]) for _ in range(samples)
+    )
+    return {
+        "clusters": float(len(trajectories)),
+        "samples": float(samples),
+        "plain_over_cell_point_estimate": ratio(trajectories),
+        "ci95_low": _percentile(draws, 0.025),
+        "ci95_high": _percentile(draws, 0.975),
+    }
+
+
 def _summary(root: Path, corpus: dict[str, Any]) -> dict[str, Any]:
     cells = {
         cell: json.loads((root / f"{cell}.json").read_text(encoding="utf-8"))
         for cell in CELLS
     }
-    plain_rows = {
-        row["prompt_id"]: row for row in cells["plain"]["records"]
-    }
+    plain_rows = {row["prompt_id"]: row for row in cells["plain"]["records"]}
     measurements: dict[str, Any] = {}
     for cell, result in cells.items():
         rows = result["records"]
@@ -94,6 +126,8 @@ def _summary(root: Path, corpus: dict[str, Any]) -> dict[str, Any]:
             if row["completion_token_ids"]
             == plain_rows[row["prompt_id"]]["completion_token_ids"]
         ]
+        arm_rows = {row["prompt_id"]: row for row in rows}
+        match_ids = [row["prompt_id"] for row in matches]
         measurements[cell] = {
             "requests": len(rows),
             "wall_s": result["wall_s"],
@@ -114,10 +148,27 @@ def _summary(root: Path, corpus: dict[str, Any]) -> dict[str, Any]:
                 if cell == "plain" or not matches
                 else _distribution(
                     [
-                        plain_rows[row["prompt_id"]]["elapsed_s"]
-                        / row["elapsed_s"]
+                        plain_rows[row["prompt_id"]]["elapsed_s"] / row["elapsed_s"]
                         for row in matches
                     ]
+                )
+            ),
+            "cluster_bootstrap_all_request_latency": (
+                None
+                if cell == "plain"
+                else _cluster_bootstrap_latency_ratio(
+                    plain_rows=plain_rows,
+                    arm_rows=arm_rows,
+                    prompt_ids=sorted(plain_rows),
+                )
+            ),
+            "cluster_bootstrap_exact_match_latency": (
+                None
+                if cell == "plain"
+                else _cluster_bootstrap_latency_ratio(
+                    plain_rows=plain_rows,
+                    arm_rows=arm_rows,
+                    prompt_ids=match_ids,
                 )
             ),
             "speculation": {
@@ -223,7 +274,9 @@ def main() -> None:
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(selected)) as executor:
         for cell, output_tps in executor.map(run_cell, selected):
             print(f"CELL={cell} OUTPUT_TPS={output_tps:.6f}", flush=True)
-    missing = [cell for cell in CELLS if not (args.output_root / f"{cell}.json").is_file()]
+    missing = [
+        cell for cell in CELLS if not (args.output_root / f"{cell}.json").is_file()
+    ]
     if not missing:
         summary = _summary(args.output_root, corpus)
         _write(args.output_root / "summary.json", summary)
