@@ -7,11 +7,14 @@ import os
 import platform
 import subprocess
 import sys
+import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any
 
 from huggingface_hub import snapshot_download
+import modal
 
 from opjax.pallas.laguna_speculative import (
     DSPARK_ID,
@@ -76,6 +79,30 @@ def _start_gpu_telemetry(*, artifact_dir: Path) -> None:
     subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT)
 
 
+def _start_artifact_commits() -> None:
+    volume_name = os.environ["OPJAX_SPEC_ARTIFACT_VOLUME"]
+    environment_name = os.environ["OPJAX_SPEC_MODAL_ENVIRONMENT"]
+    volume = modal.Volume.from_name(
+        volume_name,
+        environment_name=environment_name,
+        version=1,
+    )
+
+    def commit_forever() -> None:
+        while True:
+            time.sleep(60)
+            try:
+                volume.commit()
+            except Exception as exc:
+                print(
+                    f"LAGUNA_ARTIFACT_COMMIT_FAILED:{type(exc).__name__}:{exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+    threading.Thread(target=commit_forever, daemon=True).start()
+
+
 def _write_runtime_fingerprint(*, artifact_dir: Path, arm: str) -> None:
     artifact_dir.mkdir(parents=True, exist_ok=True)
     version_result = subprocess.run(
@@ -114,6 +141,7 @@ def main() -> None:
     artifact_dir = artifact_root / arm / run_id
     _write_runtime_fingerprint(artifact_dir=artifact_dir, arm=arm)
     _start_gpu_telemetry(artifact_dir=artifact_dir)
+    _start_artifact_commits()
     os.execvp("vllm", ["vllm", "serve", *arguments])
 
 

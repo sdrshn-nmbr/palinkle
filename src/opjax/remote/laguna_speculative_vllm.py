@@ -44,7 +44,14 @@ image = (
     modal.Image.from_registry(VLLM_IMAGE, add_python="3.12")
     .entrypoint([])
     .uv_pip_install("huggingface-hub==1.4.1")
-    .env({**REMOTE_ENV, "OPJAX_SPEC_ARTIFACT_ROOT": ARTIFACT_ROOT})
+    .env(
+        {
+            **REMOTE_ENV,
+            "OPJAX_SPEC_ARTIFACT_ROOT": ARTIFACT_ROOT,
+            "OPJAX_SPEC_ARTIFACT_VOLUME": "opjax-laguna-speculative-artifacts-v1",
+            "OPJAX_SPEC_MODAL_ENVIRONMENT": MODAL_ENVIRONMENT,
+        }
+    )
     .add_local_python_source("opjax")
 )
 
