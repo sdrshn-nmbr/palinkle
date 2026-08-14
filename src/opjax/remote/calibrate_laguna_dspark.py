@@ -90,6 +90,8 @@ def calibrate(*, checkpoint: Path, cache: Path, output: Path) -> dict[str, objec
         .eval()
     )
     raw_logits, targets, batches = _collect(model, cache)
+    raw_logits = raw_logits.clone()
+    targets = targets.clone()
     scale_parameter = torch.tensor(0.5413248546, requires_grad=True)
     offset = torch.tensor(0.0, requires_grad=True)
     optimizer = torch.optim.LBFGS(
