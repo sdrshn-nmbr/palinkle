@@ -56,8 +56,11 @@ def _public_message(message: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def build_rows(sample_root: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def build_rows(
+    sample_root: Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     train: list[dict[str, Any]] = []
+    calibration: list[dict[str, Any]] = []
     heldout: list[dict[str, Any]] = []
     trajectories = sorted(sample_root.glob("runs/*/trajectory.json"))
     if not trajectories:
@@ -72,38 +75,52 @@ def build_rows(sample_root: Path) -> tuple[list[dict[str, Any]], list[dict[str, 
             raise ValueError(f"LAGUNA_TRAJECTORY_SEED_INVALID:{path}:{seed}")
         parsed.append((path, match.group("task"), seed))
     tasks = sorted({task for _, task, _ in parsed})
-    heldout_tasks = set(tasks[::4])
+    reserved_tasks = tasks[::4]
+    calibration_tasks = set(reserved_tasks[::2])
+    heldout_tasks = set(reserved_tasks[1::2])
     for path, task, seed in parsed:
         payload = json.loads(path.read_text(encoding="utf-8"))
         messages = payload.get("messages")
         if not isinstance(messages, list) or not messages:
             raise ValueError(f"LAGUNA_TRAJECTORY_MESSAGES_INVALID:{path}")
         public: list[dict[str, Any]] = []
-        assistant_index = 0
         for message in messages:
             if not isinstance(message, dict):
                 raise ValueError(f"LAGUNA_TRAJECTORY_MESSAGE_INVALID:{path}")
             public.append(_public_message(message))
-            if message.get("role") != "assistant":
-                continue
-            assistant_index += 1
-            row = {
-                "id": f"{path.parent.name}--call-{assistant_index}",
-                "trajectory": path.parent.name,
-                "task": task,
-                "seed": seed,
-                "call": assistant_index,
-                "conversations": list(public),
-                "tools": [BASH_TOOL],
-            }
-            (heldout if task in heldout_tasks else train).append(row)
-    if not train or not heldout:
+        assistant_calls = sum(message.get("role") == "assistant" for message in messages)
+        if assistant_calls == 0:
+            raise ValueError(f"LAGUNA_TRAJECTORY_ASSISTANT_MISSING:{path}")
+        row = {
+            "id": path.parent.name,
+            "trajectory": path.parent.name,
+            "task": task,
+            "seed": seed,
+            "assistant_calls": assistant_calls,
+            "conversations": public,
+            "tools": [BASH_TOOL],
+        }
+        destination = (
+            calibration
+            if task in calibration_tasks
+            else heldout
+            if task in heldout_tasks
+            else train
+        )
+        destination.append(row)
+    if not train or not calibration or not heldout:
         raise ValueError("LAGUNA_TRAINING_SPLIT_EMPTY")
-    if {row["trajectory"] for row in train} & {
-        row["trajectory"] for row in heldout
-    }:
+    split_trajectories = [
+        {row["trajectory"] for row in rows}
+        for rows in (train, calibration, heldout)
+    ]
+    if any(
+        left & right
+        for index, left in enumerate(split_trajectories)
+        for right in split_trajectories[index + 1 :]
+    ):
         raise ValueError("LAGUNA_TRAINING_TRAJECTORY_LEAKAGE")
-    return train, heldout
+    return train, calibration, heldout
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -125,28 +142,39 @@ def main() -> None:
         default=Path("data/pallas/corpora/laguna-speculator-v1"),
     )
     args = parser.parse_args()
-    train, heldout = build_rows(args.sample_root.resolve())
+    train, calibration, heldout = build_rows(args.sample_root.resolve())
     args.output_root.mkdir(parents=True, exist_ok=False)
     paths = {
         "train": args.output_root / "train.jsonl",
+        "calibration": args.output_root / "calibration.jsonl",
         "heldout": args.output_root / "heldout.jsonl",
     }
     _write_jsonl(paths["train"], train)
+    _write_jsonl(paths["calibration"], calibration)
     _write_jsonl(paths["heldout"], heldout)
     manifest: dict[str, Any] = {
         "schema_version": 1,
         "kind": "opjax_laguna_speculator_training_corpus",
         "source_root": str(args.sample_root.resolve()),
-        "split_policy": "sorted_task_id_every_fourth_heldout_all_seeds_and_turns",
+        "split_policy": (
+            "one_complete_trajectory_per_row; sorted_task_id_every_fourth_reserved; "
+            "alternating_reserved_tasks_calibration_and_final_heldout"
+        ),
         "max_training_context": MAX_TRAINING_CONTEXT,
         "tool_schema_sha256": canonical_sha256(BASH_TOOL),
-        "rows": {"train": len(train), "heldout": len(heldout)},
+        "rows": {
+            "train": len(train),
+            "calibration": len(calibration),
+            "heldout": len(heldout),
+        },
         "trajectories": {
             "train": len({row["trajectory"] for row in train}),
+            "calibration": len({row["trajectory"] for row in calibration}),
             "heldout": len({row["trajectory"] for row in heldout}),
         },
         "tasks": {
             "train": len({row["task"] for row in train}),
+            "calibration": len({row["task"] for row in calibration}),
             "heldout": len({row["task"] for row in heldout}),
         },
         "files": {

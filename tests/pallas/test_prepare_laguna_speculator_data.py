@@ -61,22 +61,34 @@ def _rows(path: Path) -> list[dict[str, object]]:
 
 
 def test_build_rows_keeps_complete_trajectory_splits(tmp_path: Path) -> None:
-    for task in ("a", "b", "c", "d"):
+    for task in ("a", "b", "c", "d", "e", "f", "g", "h"):
         for seed in (0, 1, 2):
             _write_trajectory(tmp_path, task=task, seed=seed)
     output = tmp_path / "output"
     result = _run_builder(tmp_path, output)
     assert result.returncode == 0, result.stderr
     train = _rows(output / "train.jsonl")
+    calibration = _rows(output / "calibration.jsonl")
     heldout = _rows(output / "heldout.jsonl")
     assert len(train) == 18
-    assert len(heldout) == 6
+    assert len(calibration) == 3
+    assert len(heldout) == 3
     assert {row["seed"] for row in train} == {0, 1, 2}
     assert {row["seed"] for row in heldout} == {0, 1, 2}
-    assert {row["task"] for row in train} == {"b", "c", "d"}
-    assert {row["task"] for row in heldout} == {"a"}
-    assert not ({row["trajectory"] for row in train} & {row["trajectory"] for row in heldout})
-    arguments = train[0]["conversations"][-1]["tool_calls"][0]["function"]["arguments"]
+    assert {row["task"] for row in train} == {"b", "c", "d", "f", "g", "h"}
+    assert {row["task"] for row in calibration} == {"a"}
+    assert {row["task"] for row in heldout} == {"e"}
+    assert not (
+        {row["trajectory"] for row in train}
+        & {row["trajectory"] for row in calibration}
+    )
+    assert not (
+        {row["trajectory"] for row in train}
+        & {row["trajectory"] for row in heldout}
+    )
+    assert all(row["assistant_calls"] == 2 for row in train)
+    assert len(train[0]["conversations"]) == 5
+    arguments = train[0]["conversations"][-2]["tool_calls"][0]["function"]["arguments"]
     assert arguments == {"command": "pwd"}
     assert train[0]["tools"][0]["function"]["name"] == "bash"
 

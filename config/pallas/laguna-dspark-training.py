@@ -44,7 +44,6 @@ train = {
     "local_batch_size": 1,
     "global_batch_size": 8,
     "num_train_epochs": 10,
-    "max_train_steps": 720,
     "max_grad_norm": 1.0,
     "sharding_strategy": "no_shard",
     "torch_compile": False,
@@ -52,7 +51,7 @@ train = {
 
 logging = {
     "logging_steps": 1,
-    "checkpointing_steps": 72,
+    "checkpointing_steps": 13,
     "checkpoint_dir": "/mnt/training/checkpoints/dspark",
     "tensorboard_dir": "/mnt/training/tensorboard/dspark",
 }

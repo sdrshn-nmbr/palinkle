@@ -26,8 +26,10 @@ def _forward(model, batch):
 
 
 def evaluate(
-    *, checkpoint: Path, cache: Path, output: Path, num_anchors: int
+    *, checkpoint: Path, cache: Path, output: Path, num_anchors: int, seed: int
 ) -> dict[str, object]:
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
     device = torch.device("cuda")
     model = LagunaDSparkModel.from_pretrained(
         checkpoint,
@@ -129,6 +131,7 @@ def evaluate(
         "checkpoint": str(checkpoint),
         "cache": str(cache),
         "batches": batches,
+        "seed": seed,
         "loss": {
             "cross_entropy": totals["ce_loss_num"] / max(totals["ce_loss_den"], 1e-9),
             "l1": totals["l1_loss_num"] / max(totals["l1_loss_den"], 1e-9),
@@ -155,6 +158,7 @@ def main() -> None:
     parser.add_argument("--cache", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--num-anchors", type=int, default=64)
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
     print(json.dumps(evaluate(**vars(args)), indent=2, sort_keys=True))
 

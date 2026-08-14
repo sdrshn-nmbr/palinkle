@@ -207,7 +207,7 @@ def initialize(arm: str) -> dict[str, object]:
 
 @app.function(gpu="H200:4", **OPTIONS)
 def prepare_cache(split: str) -> dict[str, object]:
-    if split not in {"train", "heldout"}:
+    if split not in {"train", "calibration", "heldout"}:
         raise ValueError(f"LAGUNA_CACHE_SPLIT_INVALID:{split}")
     output = ROOT / "cache" / split
     command = [
@@ -259,15 +259,17 @@ def train_arm(arm: str) -> dict[str, object]:
 
 
 @app.function(gpu="H200", **OPTIONS)
-def evaluate_arm(arm: str, step: int) -> dict[str, object]:
+def evaluate_arm(arm: str, step: int, split: str = "calibration") -> dict[str, object]:
     if arm not in {"dflash", "dspark"}:
         raise ValueError(f"LAGUNA_EVAL_ARM_INVALID:{arm}")
+    if split not in {"calibration", "heldout"}:
+        raise ValueError(f"LAGUNA_EVAL_SPLIT_INVALID:{split}")
     checkpoint = (
         ROOT / "initialized" / arm
         if step == 0
         else ROOT / "checkpoints" / arm / f"step_{step}"
     )
-    run_root = ROOT / "runs" / "eval" / arm / f"step_{step}"
+    run_root = ROOT / "runs" / "eval" / split / arm / f"step_{step}"
     command = [
         "python",
         "-m",
@@ -275,16 +277,19 @@ def evaluate_arm(arm: str, step: int) -> dict[str, object]:
         "--checkpoint",
         str(checkpoint),
         "--cache",
-        str(ROOT / "cache" / "heldout"),
+        str(ROOT / "cache" / split),
         "--output",
         str(run_root),
         "--num-anchors",
         "64",
+        "--seed",
+        "42",
     ]
     runtime = _run_observed(command, run_root)
     payload = json.loads((run_root / "evaluation.json").read_text(encoding="utf-8"))
     payload["arm"] = arm
     payload["step"] = step
+    payload["split"] = split
     payload["runtime"] = runtime
     (run_root / "result.json").write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"

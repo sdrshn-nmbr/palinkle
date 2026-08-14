@@ -25,6 +25,7 @@ DSPARK_KEYS = {
     "confidence_head.proj.weight",
     "confidence_head.proj.bias",
 }
+INITIALIZATION_SEED = 42
 
 
 def _sha256(path: Path) -> str:
@@ -52,6 +53,7 @@ def _target_tensors(target_dir: Path) -> dict[str, torch.Tensor]:
 def initialize(*, arm: str, output_root: Path) -> dict[str, object]:
     if arm not in {"dflash", "dspark"}:
         raise ValueError(f"LAGUNA_SPECULATOR_ARM_INVALID:{arm}")
+    torch.manual_seed(INITIALIZATION_SEED)
     source_dir = Path(
         snapshot_download(
             DFLASH,
@@ -120,6 +122,7 @@ def initialize(*, arm: str, output_root: Path) -> dict[str, object]:
         "source": {"repo": DFLASH, "revision": DFLASH_REVISION},
         "source_tensor_count": len(source_state),
         "randomly_initialized": sorted(expected_missing),
+        "initialization_seed": INITIALIZATION_SEED,
         "total_parameters": sum(p.numel() for p in model.parameters()),
         "trainable_parameters": sum(
             p.numel() for p in model.parameters() if p.requires_grad
