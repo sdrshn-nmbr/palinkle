@@ -6,6 +6,7 @@ import concurrent.futures
 import hashlib
 import json
 import statistics
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -449,21 +450,33 @@ def _request(
         "chat_template_kwargs": {"enable_thinking": True},
         "return_token_ids": True,
     }
-    request = urllib.request.Request(
-        f"{base_url.rstrip('/')}/v1/chat/completions",
-        data=json.dumps(body, sort_keys=True).encode(),
-        headers={"Content-Type": "application/json", **headers},
-        method="POST",
-    )
     started = time.perf_counter()
-    try:
-        with urllib.request.urlopen(request, timeout=1800) as response:
-            payload = json.load(response)
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode(errors="replace")
-        raise LagunaSpeculativeError(
-            f"LAGUNA_BENCHMARK_HTTP_ERROR:{exc.code}:{detail[:1000]}"
-        ) from exc
+    errors = []
+    for attempt in range(1, 4):
+        request = urllib.request.Request(
+            f"{base_url.rstrip('/')}/v1/chat/completions",
+            data=json.dumps(body, sort_keys=True).encode(),
+            headers={"Content-Type": "application/json", **headers},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=1800) as response:
+                payload = json.load(response)
+            break
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode(errors="replace")
+            errors.append({"attempt": attempt, "status": exc.code, "detail": detail[:1000]})
+            if exc.code not in {502, 503, 504} or attempt == 3:
+                raise LagunaSpeculativeError(
+                    f"LAGUNA_BENCHMARK_HTTP_ERROR:{exc.code}:{detail[:1000]}"
+                ) from exc
+            print(
+                "LAGUNA_BENCHMARK_TRANSIENT_RETRY "
+                f"prompt={record['prompt_id']} attempt={attempt} status={exc.code}",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(attempt)
     elapsed = time.perf_counter() - started
     usage = payload.get("usage") or {}
     choice = (payload.get("choices") or [{}])[0]
@@ -480,6 +493,8 @@ def _request(
         "trajectory": record["trajectory"],
         "call": record["call"],
         "historical_completion_tokens": record["historical_completion_tokens"],
+        "request_attempts": attempt,
+        "transient_errors": errors,
         "elapsed_s": elapsed,
         "prompt_tokens": int(usage.get("prompt_tokens") or 0),
         "completion_tokens": completion_tokens,
