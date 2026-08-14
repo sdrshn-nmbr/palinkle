@@ -44,6 +44,7 @@ train = {
     "local_batch_size": 1,
     "global_batch_size": 8,
     "num_train_epochs": 10,
+    "max_train_steps": None,
     "max_grad_norm": 1.0,
     "sharding_strategy": "no_shard",
     "torch_compile": False,
