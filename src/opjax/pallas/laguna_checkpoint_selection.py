@@ -10,7 +10,8 @@ from opjax.pallas.laguna_dspark_conformance import canonical_sha256
 
 def select_checkpoint(root: Path, arm: str) -> dict[str, Any]:
     rows = []
-    for path in sorted((root / arm).glob("step_*/result.json")):
+    arm_root = root / arm / "raw"
+    for path in sorted(arm_root.glob("step_*/result.json")):
         payload = json.loads(path.read_text())
         if payload.get("arm") != arm or payload.get("split") != "calibration":
             raise ValueError(f"LAGUNA_CHECKPOINT_RESULT_INVALID:{path}")

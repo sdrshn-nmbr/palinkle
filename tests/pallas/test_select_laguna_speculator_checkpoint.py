@@ -7,7 +7,7 @@ from opjax.pallas.laguna_checkpoint_selection import select_checkpoint
 
 
 def _write(root: Path, step: int, tau: float, cross_entropy: float) -> None:
-    path = root / "dflash" / f"step_{step}" / "result.json"
+    path = root / "dflash" / "raw" / f"step_{step}" / "result.json"
     path.parent.mkdir(parents=True)
     path.write_text(
         json.dumps(
