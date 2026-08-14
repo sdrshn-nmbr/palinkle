@@ -13,7 +13,10 @@ from opjax.pallas.laguna_speculative import (
     PLAIN,
     build_replay_corpus,
     canonical_sha256,
+    canonical_response_signature,
     normalize_dspark_config,
+    partition_replay_records,
+    select_parity_panel,
     server_command,
     validate_model_manifest,
 )
@@ -123,6 +126,8 @@ def test_replay_corpus_preserves_native_structured_history(tmp_path: Path) -> No
     assert second[2]["reasoning_content"] == "inspect"
     assert second[3]["tool_call_id"] == "call-1"
     assert all("extra" not in message for message in second)
+    panel = select_parity_panel(corpus=corpus, size=2)
+    assert len(panel["records"]) == 2
 
 
 def test_replay_corpus_rejects_broken_tool_link(tmp_path: Path) -> None:
@@ -138,3 +143,52 @@ def test_replay_corpus_rejects_broken_tool_link(tmp_path: Path) -> None:
     )
     with pytest.raises(LagunaSpeculativeError, match="REPLAY_TOOL_RESULT_ORPHANED"):
         build_replay_corpus(sample_root=root)
+
+
+def test_response_signature_ignores_random_tool_call_id() -> None:
+    def payload(call_id: str) -> dict[str, object]:
+        return {
+            "choices": [
+                {
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": call_id,
+                                "function": {
+                                    "name": "bash",
+                                    "arguments": '{"command":"pwd"}',
+                                },
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
+
+    assert canonical_response_signature(payload("a")) == canonical_response_signature(
+        payload("b")
+    )
+
+
+def test_replay_partition_preserves_trajectory_order() -> None:
+    records = [
+        {"trajectory": "b", "call": 2},
+        {"trajectory": "a", "call": 2},
+        {"trajectory": "b", "call": 1},
+        {"trajectory": "a", "call": 1},
+        {"trajectory": "c", "call": 1},
+    ]
+    lanes = partition_replay_records(records, concurrency=2)
+    assert lanes == [
+        [
+            {"trajectory": "a", "call": 1},
+            {"trajectory": "a", "call": 2},
+            {"trajectory": "c", "call": 1},
+        ],
+        [
+            {"trajectory": "b", "call": 1},
+            {"trajectory": "b", "call": 2},
+        ],
+    ]

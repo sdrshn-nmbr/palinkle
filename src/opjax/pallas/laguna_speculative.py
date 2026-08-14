@@ -51,7 +51,7 @@ DFLASH_REVISION = "5c36361aab23c8ed3afbd079c10c426b677bc607"
 DSPARK_ID = "RespectMathias/Laguna-XS-2.1-DSpark"
 DSPARK_REVISION = "308567e50847b641e6dabcf82010d3b465b36cc2"
 VLLM_IMAGE = "vllm/vllm-openai:nightly@sha256:df1979d8cfbc7e09da32ee568e2c189a76378db7894c5ae55d8eeb99e2be8f1b"
-VLLM_SOURCE_REVISION = "38f097fab8f6d58e3b3f57bded1d98f5b48d3f6d"
+VLLM_OBSERVED_BUILD = "0.27.2rc1.dev18+g3d204dfda"
 
 
 def validate_model_manifest() -> dict[str, Any]:
@@ -72,7 +72,8 @@ def validate_model_manifest() -> dict[str, Any]:
         },
         "runtime": {
             "image": VLLM_IMAGE,
-            "source_revision": VLLM_SOURCE_REVISION,
+            "observed_build": VLLM_OBSERVED_BUILD,
+            "source_revision": "unavailable_in_image_build_metadata",
             "hardware": "H200:1",
             "tensor_parallel_size": 1,
         },
@@ -293,6 +294,12 @@ def build_replay_corpus(*, sample_root: Path) -> dict[str, Any]:
                         "trajectory": trajectory_path.parent.name,
                         "call": assistant_index,
                         "messages": list(public),
+                        "historical_completion_tokens": int(
+                            (
+                                (message.get("extra") or {}).get("response") or {}
+                            ).get("usage", {}).get("completion_tokens")
+                            or 0
+                        ),
                     }
                 )
             public.append(_public_message(message))
@@ -315,6 +322,59 @@ def _percentile(values: list[float], quantile: float) -> float:
     return ordered[max(0, min(len(ordered) - 1, position))]
 
 
+def select_parity_panel(
+    *, corpus: dict[str, Any], size: int = 48
+) -> dict[str, Any]:
+    records = sorted(
+        corpus["records"],
+        key=lambda record: (
+            record["historical_completion_tokens"],
+            record["prompt_id"],
+        ),
+    )
+    if size < 1 or size > len(records):
+        raise LagunaSpeculativeError("LAGUNA_PARITY_PANEL_SIZE_INVALID")
+    indices = (
+        [len(records) // 2]
+        if size == 1
+        else [
+            round(index * (len(records) - 1) / (size - 1))
+            for index in range(size)
+        ]
+    )
+    selected = [records[index] for index in indices]
+    panel: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "opjax_laguna_speculative_parity_panel",
+        "source_corpus_sha256": corpus["release_sha256"],
+        "selection": "even_historical_completion_token_quantiles",
+        "records": selected,
+    }
+    panel["release_sha256"] = canonical_sha256(panel)
+    return panel
+
+
+def canonical_response_signature(payload: dict[str, Any]) -> dict[str, Any]:
+    choice = (payload.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    tools = []
+    for call in message.get("tool_calls") or []:
+        function = call.get("function") or {}
+        arguments = function.get("arguments")
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except json.JSONDecodeError:
+                pass
+        tools.append({"name": function.get("name"), "arguments": arguments})
+    return {
+        "finish_reason": choice.get("finish_reason"),
+        "content": message.get("content") or "",
+        "reasoning": message.get("reasoning") or message.get("reasoning_content") or "",
+        "tool_calls": tools,
+    }
+
+
 def _request(
     *,
     base_url: str,
@@ -330,6 +390,7 @@ def _request(
         "max_tokens": max_tokens,
         "seed": 0,
         "chat_template_kwargs": {"enable_thinking": True},
+        "return_token_ids": True,
     }
     request = urllib.request.Request(
         f"{base_url.rstrip('/')}/v1/chat/completions",
@@ -350,6 +411,7 @@ def _request(
     usage = payload.get("usage") or {}
     choice = (payload.get("choices") or [{}])[0]
     message = choice.get("message") or {}
+    signature = canonical_response_signature(payload)
     completion_tokens = int(usage.get("completion_tokens") or 0)
     if completion_tokens <= 0:
         raise LagunaSpeculativeError(
@@ -358,10 +420,16 @@ def _request(
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return {
         "prompt_id": record["prompt_id"],
+        "trajectory": record["trajectory"],
+        "call": record["call"],
+        "historical_completion_tokens": record["historical_completion_tokens"],
         "elapsed_s": elapsed,
         "prompt_tokens": int(usage.get("prompt_tokens") or 0),
         "completion_tokens": completion_tokens,
         "finish_reason": choice.get("finish_reason"),
+        "completion_token_ids": choice.get("token_ids"),
+        "response_signature": signature,
+        "response_signature_sha256": canonical_sha256(signature),
         "response_sha256": hashlib.sha256(raw).hexdigest(),
         "content_sha256": hashlib.sha256(
             str(message.get("content") or "").encode()
@@ -374,6 +442,40 @@ def _request(
     }
 
 
+def partition_replay_records(
+    records: list[dict[str, Any]], *, concurrency: int
+) -> list[list[dict[str, Any]]]:
+    if concurrency < 1:
+        raise LagunaSpeculativeError("LAGUNA_BENCHMARK_CONCURRENCY_INVALID")
+    trajectories: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        trajectories.setdefault(record["trajectory"], []).append(record)
+    lanes: list[list[dict[str, Any]]] = [[] for _ in range(concurrency)]
+    for index, trajectory in enumerate(sorted(trajectories)):
+        lanes[index % concurrency].extend(
+            sorted(trajectories[trajectory], key=lambda record: record["call"])
+        )
+    return lanes
+
+
+def warm_replay_endpoint(
+    *,
+    base_url: str,
+    headers: dict[str, str],
+    corpus: dict[str, Any],
+    max_tokens: int,
+) -> None:
+    records = corpus.get("records") or []
+    if not records:
+        raise LagunaSpeculativeError("LAGUNA_BENCHMARK_CORPUS_EMPTY")
+    _request(
+        base_url=base_url,
+        headers=headers,
+        record=records[0],
+        max_tokens=min(32, max_tokens),
+    )
+
+
 def run_replay_benchmark(
     *,
     arm: str,
@@ -383,31 +485,37 @@ def run_replay_benchmark(
     concurrency: int,
     max_tokens: int,
     limit: int | None = None,
+    warmup: bool = True,
 ) -> dict[str, Any]:
     if arm not in ARMS or concurrency < 1 or max_tokens < 1:
         raise LagunaSpeculativeError("LAGUNA_BENCHMARK_CONFIG_INVALID")
     records = list(corpus["records"][:limit])
     if not records:
         raise LagunaSpeculativeError("LAGUNA_BENCHMARK_CORPUS_EMPTY")
-    _request(
-        base_url=base_url,
-        headers=headers,
-        record=records[0],
-        max_tokens=min(32, max_tokens),
-    )
-    started = time.perf_counter()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
-        rows = list(
-            executor.map(
-                lambda record: _request(
-                    base_url=base_url,
-                    headers=headers,
-                    record=record,
-                    max_tokens=max_tokens,
-                ),
-                records,
-            )
+    if warmup:
+        warm_replay_endpoint(
+            base_url=base_url,
+            headers=headers,
+            corpus={"records": records},
+            max_tokens=max_tokens,
         )
+    started = time.perf_counter()
+    lanes = partition_replay_records(records, concurrency=concurrency)
+
+    def run_lane(lane: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            _request(
+                base_url=base_url,
+                headers=headers,
+                record=record,
+                max_tokens=max_tokens,
+            )
+            for record in lane
+        ]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+        rows = [row for lane_rows in executor.map(run_lane, lanes) for row in lane_rows]
+    rows.sort(key=lambda row: row["prompt_id"])
     wall_s = time.perf_counter() - started
     completion_tokens = sum(row["completion_tokens"] for row in rows)
     latencies = [row["elapsed_s"] for row in rows]
@@ -427,6 +535,7 @@ def run_replay_benchmark(
             "mean": statistics.mean(latencies),
             "p50": _percentile(latencies, 0.5),
             "p95": _percentile(latencies, 0.95),
+            "p99": _percentile(latencies, 0.99),
         },
         "records": rows,
     }

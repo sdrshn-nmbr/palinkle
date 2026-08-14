@@ -55,7 +55,7 @@ FUNCTION_OPTIONS = {
     "secrets": [secret],
     "timeout": 3600,
     "startup_timeout": 3600,
-    "scaledown_window": 300,
+    "scaledown_window": 1800,
     "max_containers": 1,
 }
 

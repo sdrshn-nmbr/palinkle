@@ -17,7 +17,7 @@ from opjax.pallas.laguna_speculative import (
     DSPARK_ID,
     DSPARK_REVISION,
     VLLM_IMAGE,
-    VLLM_SOURCE_REVISION,
+    VLLM_OBSERVED_BUILD,
     canonical_sha256,
     normalize_dspark_config,
 )
@@ -78,11 +78,24 @@ def _start_gpu_telemetry(*, artifact_dir: Path) -> None:
 
 def _write_runtime_fingerprint(*, artifact_dir: Path, arm: str) -> None:
     artifact_dir.mkdir(parents=True, exist_ok=True)
+    version_result = subprocess.run(
+        ["vllm", "--version"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    observed_build = version_result.stdout.strip()
+    if observed_build != VLLM_OBSERVED_BUILD:
+        raise RuntimeError(
+            "LAGUNA_VLLM_BUILD_MISMATCH:"
+            f"expected={VLLM_OBSERVED_BUILD}:observed={observed_build}"
+        )
     fingerprint: dict[str, Any] = {
         "schema_version": 1,
         "arm": arm,
         "image": VLLM_IMAGE,
-        "vllm_source_revision": VLLM_SOURCE_REVISION,
+        "vllm_observed_build": observed_build,
+        "vllm_source_revision": "unavailable_in_image_build_metadata",
         "python": sys.version,
         "platform": platform.platform(),
         "argv": sys.argv,
