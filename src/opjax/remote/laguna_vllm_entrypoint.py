@@ -157,6 +157,11 @@ def _write_runtime_fingerprint(
             "LAGUNA_VLLM_BUILD_MISMATCH:"
             f"expected={VLLM_OBSERVED_BUILD}:observed={observed_build}"
         )
+    source_files = [
+        Path(__file__),
+        Path(__file__).with_name("laguna_dspark_vllm_model.py"),
+        Path(__file__).parents[1] / "pallas" / "laguna_speculative.py",
+    ]
     fingerprint: dict[str, Any] = {
         "schema_version": 1,
         "arm": arm,
@@ -168,6 +173,12 @@ def _write_runtime_fingerprint(
         "argv": sys.argv,
         "resolved_arguments": arguments,
         "draft_checkpoint": _checkpoint_identity(arguments),
+        "execution_sources": {
+            str(path.relative_to(Path(__file__).parents[2])): hashlib.sha256(
+                path.read_bytes()
+            ).hexdigest()
+            for path in source_files
+        },
     }
     fingerprint["sha256"] = canonical_sha256(fingerprint)
     (artifact_dir / "runtime.json").write_text(
