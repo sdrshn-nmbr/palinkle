@@ -83,7 +83,14 @@ vllm_image = (
     )
     .entrypoint([])
     .uv_pip_install("huggingface-hub==1.4.1", "numpy==2.4.4")
-    .env(REMOTE_ENV)
+    .env(
+        {
+            **REMOTE_ENV,
+            "OPJAX_SPEC_ARTIFACT_ROOT": str(ARTIFACT_ROOT / "runtime"),
+            "OPJAX_SPEC_ARTIFACT_VOLUME": "opjax-laguna-trained-conformance-v1",
+            "OPJAX_SPEC_MODAL_ENVIRONMENT": MODAL_ENVIRONMENT,
+        }
+    )
     .add_local_python_source("opjax")
 )
 VOLUMES = {
