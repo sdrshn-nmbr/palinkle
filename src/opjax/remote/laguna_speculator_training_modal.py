@@ -108,6 +108,20 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _execution_hashes() -> dict[str, str]:
+    paths = {
+        "native_tools_patch": Path("/opt/deepspec-native-tools.patch"),
+        "dspark_config": CONFIG_ROOT / "laguna-dspark-training.py",
+        "dflash_config": CONFIG_ROOT / "laguna-dflash-training.py",
+        "corpus_manifest": DATA_ROOT / "manifest.json",
+        "training_driver": Path(__file__),
+    }
+    missing = [name for name, path in paths.items() if not path.is_file()]
+    if missing:
+        raise RuntimeError(f"LAGUNA_EXECUTION_FILES_MISSING:{','.join(missing)}")
+    return {name: _sha256(path) for name, path in paths.items()}
+
+
 def _telemetry(path: Path) -> tuple[subprocess.Popen[bytes], object]:
     output = path.open("wb")
     process = subprocess.Popen(
@@ -158,6 +172,10 @@ def _run_observed(command: list[str], run_root: Path) -> dict[str, object]:
             ["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"],
             text=True,
         ).strip(),
+        "execution_files": _execution_hashes(),
+        "deepspec_diff_sha256": hashlib.sha256(
+            subprocess.check_output(["git", "-C", str(DEEPSPEC), "diff", "--binary"])
+        ).hexdigest(),
     }
     (run_root / "runtime.json").write_text(
         json.dumps(runtime, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -289,3 +307,20 @@ def export_dflash(step: int) -> dict[str, object]:
         subprocess.run(command, cwd=DEEPSPEC, check=True, stdout=log, stderr=subprocess.STDOUT)
     training.commit()
     return json.loads((output / "export.json").read_text(encoding="utf-8"))
+
+
+@app.function(image=image, volumes=VOLUMES, secrets=[secret], timeout=300)
+def audit_inputs() -> dict[str, object]:
+    result: dict[str, object] = {
+        "schema_version": 1,
+        "deepspec_revision": DEEPSPEC_REVISION,
+        "execution_files": _execution_hashes(),
+        "deepspec_diff_sha256": hashlib.sha256(
+            subprocess.check_output(["git", "-C", str(DEEPSPEC), "diff", "--binary"])
+        ).hexdigest(),
+    }
+    output = ROOT / "runs" / "input-audit.json"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    training.commit()
+    return result
