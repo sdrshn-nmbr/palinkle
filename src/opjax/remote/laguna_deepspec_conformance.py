@@ -498,7 +498,12 @@ def main() -> None:
     args = parser.parse_args()
     print(
         json.dumps(
-            run_capture(output_root=args.output_root, prompt=args.prompt),
+            run_capture(
+                output_root=args.output_root,
+                prompt=args.prompt,
+                target_path=args.target_path,
+                draft_path=args.draft_path,
+            ),
             sort_keys=True,
         )
     )

@@ -95,7 +95,13 @@ OPTIONS = {"volumes": VOLUMES, "secrets": [secret], "timeout": 3600}
 
 
 def _target_path() -> Path:
-    return Path(snapshot_download(TARGET_ID, revision=TARGET_REVISION))
+    return Path(
+        snapshot_download(
+            TARGET_ID,
+            revision=TARGET_REVISION,
+            local_dir="/tmp/opjax-laguna-target",
+        )
+    )
 
 
 @app.function(image=deepspec_image, gpu="H200", **OPTIONS)
@@ -103,7 +109,12 @@ def capture_source(run_id: str, arm: str) -> dict[str, object]:
     if arm not in {"dflash", "dspark"}:
         raise ValueError(f"LAGUNA_CONFORMANCE_ARM_INVALID:{arm}")
     output = ARTIFACT_ROOT / run_id / "source"
-    draft = ROOT / "selected" / arm
+    selection = json.loads((ROOT / "selected" / f"{arm}.json").read_text())
+    draft = (
+        ROOT / "checkpoints" / "dflash" / f"step_{selection['step']}"
+        if arm == "dflash"
+        else ROOT / "selected" / "dspark"
+    )
     module = (
         "opjax.remote.laguna_deepspec_dflash_conformance"
         if arm == "dflash"
