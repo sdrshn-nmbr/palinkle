@@ -202,6 +202,7 @@ def server_command(
     adaptive_verification: bool | None = None,
     draft_model: str | None = None,
     draft_revision: str | None = None,
+    capture_dflash: bool = False,
 ) -> list[str]:
     speculative = _speculative_config(
         arm,
@@ -245,7 +246,17 @@ def server_command(
             {
                 "Qwen3DSparkModel": (
                     "opjax.remote.laguna_dspark_vllm_model:LagunaDSparkForCausalLM"
-                )
+                ),
+                **(
+                    {
+                        "DFlashDraftModel": (
+                            "opjax.remote.laguna_dflash_capture_model:"
+                            "CapturedLagunaDFlashForCausalLM"
+                        )
+                    }
+                    if capture_dflash
+                    else {}
+                ),
             },
             sort_keys=True,
             separators=(",", ":"),

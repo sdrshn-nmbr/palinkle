@@ -10,6 +10,8 @@ import torch
 from opjax.pallas.laguna_dspark_conformance import (
     BOUNDARY_ORDER,
     ConformanceError,
+    DFLASH_BOUNDARIES,
+    build_dflash_conformance_report,
     build_conformance_report,
     canonical_sha256,
     finalize_conformance,
@@ -92,6 +94,41 @@ def test_exact_differential_capture_passes(tmp_path: Path) -> None:
     )
 
 
+def test_dflash_requires_exact_proposal_tokens(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    adapter_root = tmp_path / "adapter"
+    source = _capture(source_root)
+    adapter = _capture(adapter_root)
+    source["boundaries"] = {
+        name: source["boundaries"][name] for name in DFLASH_BOUNDARIES
+    }
+    adapter["boundaries"] = {
+        name: adapter["boundaries"][name] for name in DFLASH_BOUNDARIES
+    }
+    source["manifest_sha256"] = "a" * 64
+    adapter["manifest_sha256"] = "b" * 64
+    report = build_dflash_conformance_report(
+        source_root=source_root,
+        source_capture=source,
+        adapter_root=adapter_root,
+        adapter_capture=adapter,
+    )
+    assert report["passed"] is True
+    proposal = adapter_root / "proposal_token_ids.npy"
+    values = np.load(proposal)
+    np.save(proposal, values + 1)
+    adapter["boundaries"]["proposal_token_ids"]["sha256"] = (
+        __import__("hashlib").sha256(proposal.read_bytes()).hexdigest()
+    )
+    report = build_dflash_conformance_report(
+        source_root=source_root,
+        source_capture=source,
+        adapter_root=adapter_root,
+        adapter_capture=adapter,
+    )
+    assert report["passed"] is False
+
+
 def test_token_mismatch_fails_closed(tmp_path: Path) -> None:
     source_root = tmp_path / "deepspec"
     adapter_root = tmp_path / "vllm"
@@ -120,16 +157,16 @@ def test_bfloat16_close_logits_allow_near_tie_but_final_tokens_remain_exact(
     source_base = np.load(source_base_path)
     source_base[0] = [2.0, 2.01, 0.0, 0.0]
     np.save(source_base_path, source_base)
-    source["boundaries"]["base_logits"]["sha256"] = __import__(
-        "hashlib"
-    ).sha256(source_base_path.read_bytes()).hexdigest()
+    source["boundaries"]["base_logits"]["sha256"] = (
+        __import__("hashlib").sha256(source_base_path.read_bytes()).hexdigest()
+    )
     base_path = adapter_root / "base_logits.npy"
     base = np.load(base_path)
     base[0] = [2.01, 2.0, 0.0, 0.0]
     np.save(base_path, base)
-    adapter["boundaries"]["base_logits"]["sha256"] = __import__(
-        "hashlib"
-    ).sha256(base_path.read_bytes()).hexdigest()
+    adapter["boundaries"]["base_logits"]["sha256"] = (
+        __import__("hashlib").sha256(base_path.read_bytes()).hexdigest()
+    )
     report = build_conformance_report(
         source_root=source_root,
         source_capture=source,
@@ -233,16 +270,15 @@ def test_frozen_hardware_conformance_evidence_is_bound() -> None:
         {key: value for key, value in report.items() if key != "report_sha256"}
     )
     assert report["comparisons"]["proposal_token_ids"]["exact_match"] is True
-    assert all(
-        comparison["passed"] for comparison in report["comparisons"].values()
-    )
+    assert all(comparison["passed"] for comparison in report["comparisons"].values())
     assert report["mutation_controls"]["markov_matrix_swap"]["detected"] is True
 
     remote = json.loads((EVIDENCE_ROOT / "remote.json").read_text(encoding="utf-8"))
     index_path = EVIDENCE_ROOT / "artifact-index.json"
-    assert remote["hf_artifact_index_sha256"] == __import__("hashlib").sha256(
-        index_path.read_bytes()
-    ).hexdigest()
+    assert (
+        remote["hf_artifact_index_sha256"]
+        == __import__("hashlib").sha256(index_path.read_bytes()).hexdigest()
+    )
     index = json.loads(index_path.read_text(encoding="utf-8"))
     assert remote["hf_file_count"] == len(index["files"]) + 1
     assert remote["modal_runs"] == index["modal_runs"]
@@ -269,7 +305,10 @@ def test_runtime_capture_is_explicit_and_hash_bound(
         (capture_root / "case-0" / "ledger.jsonl").read_text(encoding="utf-8")
     )
     assert ledger["source_dtype"] == "torch.bfloat16"
-    assert ledger["sha256"] == __import__("hashlib").sha256(output.read_bytes()).hexdigest()
+    assert (
+        ledger["sha256"]
+        == __import__("hashlib").sha256(output.read_bytes()).hexdigest()
+    )
 
 
 def test_vllm_capture_reconstructs_the_exact_markov_chain(tmp_path: Path) -> None:

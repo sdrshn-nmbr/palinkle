@@ -16,7 +16,9 @@ import urllib.request
 import numpy as np
 
 from opjax.pallas.laguna_speculative import (
+    DFLASH,
     DSPARK,
+    DSPARK_ID,
     DSPARK_REVISION,
     TARGET_ID,
     TARGET_REVISION,
@@ -62,9 +64,7 @@ def _request(
         return response.read()
 
 
-def _wait_ready(
-    port: int, process: subprocess.Popen[bytes], *, log_path: Path
-) -> None:
+def _wait_ready(port: int, process: subprocess.Popen[bytes], *, log_path: Path) -> None:
     deadline = time.monotonic() + 1800
     while time.monotonic() < deadline:
         if process.poll() is not None:
@@ -110,7 +110,9 @@ def _load_records(root: Path) -> dict[str, list[tuple[dict[str, Any], np.ndarray
     return records
 
 
-def _one(records: dict[str, list[tuple[dict[str, Any], np.ndarray]]], name: str) -> np.ndarray:
+def _one(
+    records: dict[str, list[tuple[dict[str, Any], np.ndarray]]], name: str
+) -> np.ndarray:
     values = records.get(name, [])
     if len(values) != 1:
         raise RuntimeError(f"VLLM_CAPTURE_CARDINALITY:{name}:{len(values)}")
@@ -177,12 +179,12 @@ def _canonicalize_capture(
     markov_embeddings = np.concatenate(
         [value.reshape(-1, value.shape[-1]) for value in embedding_values], axis=0
     )
-    confidence_weight = _one(
-        static_records, "confidence_head_proj_weight"
-    ).astype(np.float32)
-    confidence_bias = _one(
-        static_records, "confidence_head_proj_bias"
-    ).astype(np.float32)
+    confidence_weight = _one(static_records, "confidence_head_proj_weight").astype(
+        np.float32
+    )
+    confidence_bias = _one(static_records, "confidence_head_proj_bias").astype(
+        np.float32
+    )
     confidence_features = np.concatenate(
         [hidden.reshape(-1, hidden.shape[-1]), markov_embeddings], axis=-1
     ).astype(np.float32)
@@ -195,9 +197,9 @@ def _canonicalize_capture(
     arrays = {
         "draft_input_ids": _first(records, "draft_input_ids").reshape(-1),
         "draft_positions": _first(records, "draft_positions").reshape(-1),
-        "draft_input_embeddings": _first(
-            records, "draft_input_embeddings"
-        ).reshape(-1, hidden.shape[-1]),
+        "draft_input_embeddings": _first(records, "draft_input_embeddings").reshape(
+            -1, hidden.shape[-1]
+        ),
         **{
             f"draft_layer_{layer_id}_output": _first(
                 records, f"draft_layer_{layer_id}_output"
@@ -231,7 +233,9 @@ def _canonicalize_capture(
         "confidence_logits": confidence,
         "proposal_token_ids": proposal_tokens,
     }
-    return {name: _save_array(output_root, name, value) for name, value in arrays.items()}
+    return {
+        name: _save_array(output_root, name, value) for name, value in arrays.items()
+    }
 
 
 def run_capture(
@@ -239,6 +243,7 @@ def run_capture(
     output_root: Path,
     prompt: str,
     target_feature_override: Path,
+    draft_model: str = DSPARK_ID,
     port: int = 8000,
 ) -> dict[str, Any]:
     output_root.mkdir(parents=True, exist_ok=False)
@@ -246,7 +251,7 @@ def run_capture(
     profile_root = output_root / "profiles"
     raw_capture_root.mkdir()
     profile_root.mkdir()
-    command = server_command(DSPARK, port=port)
+    command = server_command(DSPARK, port=port, draft_model=draft_model)
     _replace_argument(command, "--max-model-len", "4096")
     _replace_argument(command, "--max-num-seqs", "1")
     _disable_adaptive_verification(command)
@@ -360,7 +365,11 @@ def run_capture(
             "revision": VLLM_OBSERVED_BUILD,
             "source_sha256": _adapter_source_sha256(),
             "target_revision": TARGET_REVISION,
-            "draft_revision": DSPARK_REVISION,
+            "draft_revision": (
+                DSPARK_REVISION
+                if draft_model == DSPARK_ID
+                else _sha256(Path(draft_model) / "model.safetensors")
+            ),
             "command": command,
             "target_feature_override": {
                 "path": str(target_feature_override),
@@ -381,6 +390,153 @@ def run_capture(
             "sha256": _sha256(log_path),
             "bytes": log_path.stat().st_size,
         },
+    }
+    manifest["manifest_sha256"] = canonical_sha256(manifest)
+    (output_root / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return manifest
+
+
+def run_dflash_capture(
+    *,
+    output_root: Path,
+    prompt: str,
+    target_feature_override: Path,
+    draft_model: str,
+    port: int = 8000,
+) -> dict[str, Any]:
+    output_root.mkdir(parents=True, exist_ok=False)
+    raw_capture_root = output_root / "raw"
+    profile_root = output_root / "profiles"
+    raw_capture_root.mkdir()
+    profile_root.mkdir()
+    command = server_command(
+        DFLASH,
+        port=port,
+        draft_model=draft_model,
+        proposal_tokens=15,
+        capture_dflash=True,
+    )
+    _replace_argument(command, "--max-model-len", "4096")
+    _replace_argument(command, "--max-num-seqs", "1")
+    command.extend(
+        [
+            "--enforce-eager",
+            "--profiler-config",
+            json.dumps(
+                {
+                    "profiler": "torch",
+                    "torch_profiler_dir": str(profile_root),
+                    "torch_profiler_with_stack": False,
+                    "torch_profiler_record_shapes": True,
+                    "torch_profiler_with_memory": True,
+                    "torch_profiler_use_gzip": True,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        ]
+    )
+    environment = {
+        **os.environ,
+        "OPJAX_DSPARK_CAPTURE_ROOT": str(raw_capture_root),
+        "OPJAX_DSPARK_TARGET_FEATURE_OVERRIDE": str(target_feature_override),
+        "OPJAX_SPEC_RUN_ID": output_root.name,
+    }
+    log_path = output_root / "server.log"
+    with log_path.open("wb") as server_log:
+        process = subprocess.Popen(
+            command,
+            env=environment,
+            stdout=server_log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        try:
+            _wait_ready(port, process, log_path=log_path)
+            prompt_token_ids = json.loads(
+                _request(
+                    f"http://127.0.0.1:{port}/tokenize",
+                    payload={
+                        "model": TARGET_ID,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "add_generation_prompt": True,
+                        "chat_template_kwargs": {"enable_thinking": True},
+                    },
+                )
+            )["tokens"]
+            session = "first-proposal"
+            (raw_capture_root / "active.json").write_text(
+                json.dumps({"session": session}), encoding="utf-8"
+            )
+            _request(f"http://127.0.0.1:{port}/start_profile", payload={})
+            response = json.loads(
+                _request(
+                    f"http://127.0.0.1:{port}/v1/chat/completions",
+                    payload={
+                        "model": TARGET_ID,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "chat_template_kwargs": {"enable_thinking": True},
+                        "temperature": 0.0,
+                        "max_tokens": 1,
+                        "seed": 0,
+                    },
+                    timeout=600,
+                )
+            )
+            _request(f"http://127.0.0.1:{port}/stop_profile", payload={}, timeout=600)
+            (raw_capture_root / "active.json").unlink()
+            time.sleep(2)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=30)
+    records = _load_records(raw_capture_root / "first-proposal")
+    combined = _first(records, "combined_target_feature")
+    hidden = _first(records, "draft_backbone_hidden_state")
+    logits = _first(records, "base_logits")
+    logits = logits.reshape(-1, logits.shape[-1])[:15]
+    proposal_tokens = logits.argmax(axis=-1).astype(np.int64)
+    boundaries = {
+        "combined_target_feature": _save_array(
+            output_root,
+            "combined_target_feature",
+            combined.reshape(-1, combined.shape[-1]),
+        ),
+        "draft_backbone_hidden_state": _save_array(
+            output_root,
+            "draft_backbone_hidden_state",
+            hidden.reshape(-1, hidden.shape[-1])[:15],
+        ),
+        "base_logits": _save_array(output_root, "base_logits", logits),
+        "proposal_token_ids": _save_array(
+            output_root, "proposal_token_ids", proposal_tokens
+        ),
+    }
+    manifest: dict[str, Any] = {
+        "schema_version": 1,
+        "implementation": "vllm_dflash_capture",
+        "vllm_build": VLLM_OBSERVED_BUILD,
+        "draft_model": str(Path(draft_model).resolve()),
+        "prompt": prompt,
+        "prompt_token_ids": prompt_token_ids,
+        "response": response,
+        "boundaries": boundaries,
+        "server_log": {"path": log_path.name, "sha256": _sha256(log_path)},
+        "profiles": [
+            {
+                "path": str(path.relative_to(output_root)),
+                "sha256": _sha256(path),
+                "bytes": path.stat().st_size,
+            }
+            for path in sorted(profile_root.rglob("*"))
+            if path.is_file()
+        ],
     }
     manifest["manifest_sha256"] = canonical_sha256(manifest)
     (output_root / "manifest.json").write_text(

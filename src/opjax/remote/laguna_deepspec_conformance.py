@@ -71,7 +71,9 @@ def _stage_snapshot(*, repo_id: str, revision: str, destination: Path) -> Path:
     return destination
 
 
-def _capture_target_layers(target_model: object, layer_ids: list[int]) -> tuple[dict[int, torch.Tensor], list[object]]:
+def _capture_target_layers(
+    target_model: object, layer_ids: list[int]
+) -> tuple[dict[int, torch.Tensor], list[object]]:
     captured: dict[int, torch.Tensor] = {}
     handles: list[object] = []
     backbone = getattr(target_model, "model", target_model)
@@ -124,6 +126,7 @@ def _capture_first_layer_operations(
             captured.setdefault(name, []).append(value.detach())
 
         handles.append(module.register_forward_hook(capture))
+
     def capture_gated_attention(_module, inputs) -> None:
         captured.setdefault("layer0_gated_attention", []).append(inputs[0].detach())
 
@@ -134,32 +137,46 @@ def _capture_first_layer_operations(
 
 
 @torch.inference_mode()
-def run_capture(*, output_root: Path, prompt: str) -> dict[str, object]:
+def run_capture(
+    *,
+    output_root: Path,
+    prompt: str,
+    target_path: Path | None = None,
+    draft_path: Path | None = None,
+) -> dict[str, object]:
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
     output_root.mkdir(parents=True, exist_ok=False)
     staging_root = Path("/tmp/opjax-conformance-models")
-    target_path = _stage_snapshot(
+    target_path = target_path or _stage_snapshot(
         repo_id=TARGET_ID,
         revision=TARGET_REVISION,
         destination=staging_root / "target",
     )
-    draft_path = _stage_snapshot(
+    draft_path = draft_path or _stage_snapshot(
         repo_id=DSPARK_ID,
         revision=DSPARK_REVISION,
         destination=staging_root / "draft",
     )
-    target_model = load_laguna_target_model_strict(
-        target_path,
-        trust_remote_code=True,
-        dtype=torch.bfloat16,
-        attn_implementation="sdpa",
-    ).to("cuda").eval()
-    draft_model = LagunaDSparkModel.from_pretrained(
-        draft_path,
-        dtype=torch.bfloat16,
-        attn_implementation="sdpa",
-    ).to("cuda").eval()
+    target_model = (
+        load_laguna_target_model_strict(
+            target_path,
+            trust_remote_code=True,
+            dtype=torch.bfloat16,
+            attn_implementation="sdpa",
+        )
+        .to("cuda")
+        .eval()
+    )
+    draft_model = (
+        LagunaDSparkModel.from_pretrained(
+            draft_path,
+            dtype=torch.bfloat16,
+            attn_implementation="sdpa",
+        )
+        .to("cuda")
+        .eval()
+    )
     tokenizer = AutoTokenizer.from_pretrained(
         target_path,
         trust_remote_code=True,
@@ -188,7 +205,9 @@ def run_capture(*, output_root: Path, prompt: str) -> dict[str, object]:
             target_cache = DynamicCache()
             target_output = target_model(
                 input_ids=input_ids,
-                position_ids=torch.arange(input_ids.shape[1], device="cuda").unsqueeze(0),
+                position_ids=torch.arange(input_ids.shape[1], device="cuda").unsqueeze(
+                    0
+                ),
                 past_key_values=target_cache,
                 use_cache=True,
                 output_hidden_states=True,
@@ -218,7 +237,9 @@ def run_capture(*, output_root: Path, prompt: str) -> dict[str, object]:
         position_ids = torch.arange(
             input_ids.shape[1] + block_size + 1, device="cuda"
         ).unsqueeze(0)
-        draft_positions = position_ids[:, input_ids.shape[1] : input_ids.shape[1] + block_size]
+        draft_positions = position_ids[
+            :, input_ids.shape[1] : input_ids.shape[1] + block_size
+        ]
         draft_input_embeddings = draft_model.embed_tokens(draft_input_ids)
         with record_function("deepspec_draft_backbone"):
             block_hidden = forward_dspark_draft_block(
@@ -291,9 +312,11 @@ def run_capture(*, output_root: Path, prompt: str) -> dict[str, object]:
     num_q_heads = int(draft_model.config.num_attention_heads)
     num_kv_heads = int(draft_model.config.num_key_value_heads)
     head_dim = int(draft_model.config.head_dim)
-    query_q = draft_model.layers[0].self_attn.q_norm(
-        query_q.view(1, block_size, num_q_heads, head_dim)
-    ).transpose(1, 2)
+    query_q = (
+        draft_model.layers[0]
+        .self_attn.q_norm(query_q.view(1, block_size, num_q_heads, head_dim))
+        .transpose(1, 2)
+    )
     all_k = torch.cat([context_k, query_k], dim=1).view(
         1, input_ids.shape[1] + block_size, num_kv_heads, head_dim
     )
@@ -307,9 +330,7 @@ def run_capture(*, output_root: Path, prompt: str) -> dict[str, object]:
         draft_input_embeddings,
         position_ids[:, : input_ids.shape[1] + block_size],
     )
-    query_q, all_k = apply_rotary_pos_emb(
-        query_q, all_k, *position_embeddings
-    )
+    query_q, all_k = apply_rotary_pos_emb(query_q, all_k, *position_embeddings)
 
     stacked_bias = torch.stack(biases, dim=1)
     stacked_corrected = torch.stack(corrected, dim=1)
@@ -343,7 +364,9 @@ def run_capture(*, output_root: Path, prompt: str) -> dict[str, object]:
         "combined_target_feature": _save_tensor(
             output_root, "combined_target_feature", combined_target_feature.squeeze(0)
         ),
-        "draft_input_ids": _save_tensor(output_root, "draft_input_ids", draft_input_ids),
+        "draft_input_ids": _save_tensor(
+            output_root, "draft_input_ids", draft_input_ids
+        ),
         "draft_positions": _save_tensor(
             output_root, "draft_positions", draft_positions
         ),
@@ -405,9 +428,7 @@ def run_capture(*, output_root: Path, prompt: str) -> dict[str, object]:
             "draft_backbone_hidden_state_exact_width",
             exact_width_hidden.squeeze(0),
         ),
-        "base_logits": _save_tensor(
-            output_root, "base_logits", base_logits.squeeze(0)
-        ),
+        "base_logits": _save_tensor(output_root, "base_logits", base_logits.squeeze(0)),
         "markov_embedding": _save_tensor(
             output_root, "markov_embedding", stacked_embeddings.squeeze(0)
         ),
@@ -430,7 +451,11 @@ def run_capture(*, output_root: Path, prompt: str) -> dict[str, object]:
         "provenance": {
             "revision": "787db11ea347ac3944233e5aa9c7f1bd8a9b5ced",
             "target_revision": TARGET_REVISION,
-            "draft_revision": DSPARK_REVISION,
+            "draft_revision": (
+                DSPARK_REVISION
+                if str(draft_path).startswith(str(staging_root))
+                else _sha256(draft_path / "model.safetensors")
+            ),
             "source_sha256": _sha256(Path(__file__)),
         },
         "prompt": prompt,
@@ -448,7 +473,9 @@ def run_capture(*, output_root: Path, prompt: str) -> dict[str, object]:
                     proposal_token_ids, mutated_tokens
                 ),
                 "max_abs_bias_delta": float(
-                    torch.max(torch.abs(stacked_bias.float() - mutated_bias.float())).item()
+                    torch.max(
+                        torch.abs(stacked_bias.float() - mutated_bias.float())
+                    ).item()
                 ),
             }
         },
@@ -466,6 +493,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--prompt", required=True)
+    parser.add_argument("--target-path", type=Path)
+    parser.add_argument("--draft-path", type=Path)
     args = parser.parse_args()
     print(
         json.dumps(

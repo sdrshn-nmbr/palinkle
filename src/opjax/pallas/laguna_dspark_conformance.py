@@ -33,6 +33,12 @@ _NUMERIC_TOLERANCES = {
     "corrected_logits": {"rtol": 0.05, "atol": 0.125},
     "confidence_logits": {"rtol": 0.05, "atol": 0.0625},
 }
+DFLASH_BOUNDARIES = (
+    "combined_target_feature",
+    "draft_backbone_hidden_state",
+    "base_logits",
+    "proposal_token_ids",
+)
 
 
 def canonical_sha256(value: Any) -> str:
@@ -81,7 +87,11 @@ def _tensor_metrics(reference: np.ndarray, candidate: np.ndarray) -> dict[str, A
     reference_flat = reference.astype(np.float64).reshape(-1)
     candidate_flat = candidate.astype(np.float64).reshape(-1)
     denominator = np.linalg.norm(reference_flat) * np.linalg.norm(candidate_flat)
-    cosine = float(np.dot(reference_flat, candidate_flat) / denominator) if denominator else 1.0
+    cosine = (
+        float(np.dot(reference_flat, candidate_flat) / denominator)
+        if denominator
+        else 1.0
+    )
     return {
         "reference_shape": list(reference.shape),
         "candidate_shape": list(candidate.shape),
@@ -93,7 +103,9 @@ def _tensor_metrics(reference: np.ndarray, candidate: np.ndarray) -> dict[str, A
     }
 
 
-def _compare_boundary(name: str, reference: np.ndarray, candidate: np.ndarray) -> dict[str, Any]:
+def _compare_boundary(
+    name: str, reference: np.ndarray, candidate: np.ndarray
+) -> dict[str, Any]:
     metrics = _tensor_metrics(reference, candidate)
     if "reason" in metrics:
         return metrics
@@ -125,6 +137,47 @@ def _bound_artifact(root_name: str, item: dict[str, Any]) -> dict[str, Any]:
         **item,
         "path": f"{root_name}/{item['path']}",
     }
+
+
+def build_dflash_conformance_report(
+    *,
+    source_root: Path,
+    source_capture: dict[str, Any],
+    adapter_root: Path,
+    adapter_capture: dict[str, Any],
+) -> dict[str, Any]:
+    if source_capture.get("prompt_token_ids") != adapter_capture.get(
+        "prompt_token_ids"
+    ):
+        raise ConformanceError("DFLASH_PROMPT_TOKEN_IDS_MISMATCH")
+    comparisons: dict[str, dict[str, Any]] = {}
+    for name in DFLASH_BOUNDARIES:
+        source_item = source_capture.get("boundaries", {}).get(name)
+        adapter_item = adapter_capture.get("boundaries", {}).get(name)
+        if source_item is None or adapter_item is None:
+            raise ConformanceError(f"DFLASH_BOUNDARY_MISSING:{name}")
+        source_path = source_root / source_item["path"]
+        adapter_path = adapter_root / adapter_item["path"]
+        if file_sha256(source_path) != source_item["sha256"]:
+            raise ConformanceError(f"DFLASH_SOURCE_HASH_MISMATCH:{name}")
+        if file_sha256(adapter_path) != adapter_item["sha256"]:
+            raise ConformanceError(f"DFLASH_ADAPTER_HASH_MISMATCH:{name}")
+        comparisons[name] = _compare_boundary(
+            name,
+            np.load(source_path, allow_pickle=False),
+            np.load(adapter_path, allow_pickle=False),
+        )
+    report: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "opjax_laguna_dflash_differential_conformance",
+        "boundaries": list(DFLASH_BOUNDARIES),
+        "comparisons": comparisons,
+        "passed": all(value["passed"] for value in comparisons.values()),
+        "source_manifest_sha256": source_capture["manifest_sha256"],
+        "adapter_manifest_sha256": adapter_capture["manifest_sha256"],
+    }
+    report["sha256"] = canonical_sha256(report)
+    return report
 
 
 def build_conformance_report(
@@ -214,9 +267,7 @@ def finalize_conformance(
     *, source_root: Path, adapter_root: Path, output_path: Path
 ) -> dict[str, Any]:
     source = json.loads((source_root / "manifest.json").read_text(encoding="utf-8"))
-    adapter = json.loads(
-        (adapter_root / "manifest.json").read_text(encoding="utf-8")
-    )
+    adapter = json.loads((adapter_root / "manifest.json").read_text(encoding="utf-8"))
     report = build_conformance_report(
         source_root=source_root,
         source_capture=source,
