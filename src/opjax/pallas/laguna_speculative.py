@@ -532,6 +532,7 @@ def run_replay_benchmark(
     max_tokens: int,
     limit: int | None = None,
     warmup: bool = True,
+    model_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if arm not in ARMS or concurrency < 1 or max_tokens < 1:
         raise LagunaSpeculativeError("LAGUNA_BENCHMARK_CONFIG_INVALID")
@@ -569,7 +570,8 @@ def run_replay_benchmark(
         "schema_version": 1,
         "kind": "opjax_laguna_speculative_replay_result",
         "arm": arm,
-        "model_manifest_sha256": validate_model_manifest()["manifest_sha256"],
+        "model_identity": model_identity
+        or {"released_manifest_sha256": validate_model_manifest()["manifest_sha256"]},
         "corpus_sha256": corpus["release_sha256"],
         "concurrency": concurrency,
         "max_tokens": max_tokens,

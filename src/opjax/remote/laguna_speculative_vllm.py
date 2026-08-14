@@ -158,7 +158,7 @@ def _trained_dflash(depth: int) -> None:
     _launch(
         DFLASH,
         proposal_tokens=depth,
-        draft_model=f"{TRAINING_ROOT}/exports/dflash/step_720",
+        draft_model=f"{TRAINING_ROOT}/selected/dflash",
     )
 
 
@@ -167,7 +167,7 @@ def _trained_dspark(depth: int, *, adaptive: bool = False) -> None:
         DSPARK,
         proposal_tokens=depth,
         adaptive_verification=adaptive,
-        draft_model=f"{TRAINING_ROOT}/checkpoints/dspark/step_720",
+        draft_model=f"{TRAINING_ROOT}/selected/dspark",
     )
 
 

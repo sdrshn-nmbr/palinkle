@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import platform
 import subprocess
@@ -112,7 +113,37 @@ def _start_artifact_commits() -> None:
     threading.Thread(target=commit_forever, daemon=True).start()
 
 
-def _write_runtime_fingerprint(*, artifact_dir: Path, arm: str) -> None:
+def _checkpoint_identity(arguments: list[str]) -> dict[str, Any] | None:
+    if "--speculative-config" not in arguments:
+        return None
+    config = json.loads(arguments[arguments.index("--speculative-config") + 1])
+    path = Path(str(config["model"]))
+    if not path.is_dir():
+        return {"model": str(config["model"]), "revision": config.get("revision")}
+    files: dict[str, str] = {}
+    for candidate in sorted(path.rglob("*")):
+        if not candidate.is_file() or candidate.name not in {
+            "config.json",
+            "model.safetensors",
+        }:
+            continue
+        digest = hashlib.sha256()
+        with candidate.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                digest.update(chunk)
+        files[str(candidate.relative_to(path))] = digest.hexdigest()
+    if "config.json" not in files or "model.safetensors" not in files:
+        raise RuntimeError(f"LAGUNA_RUNTIME_CHECKPOINT_INCOMPLETE:{path}")
+    return {
+        "path": str(path.resolve()),
+        "files": files,
+        "sha256": canonical_sha256(files),
+    }
+
+
+def _write_runtime_fingerprint(
+    *, artifact_dir: Path, arm: str, arguments: list[str]
+) -> None:
     artifact_dir.mkdir(parents=True, exist_ok=True)
     version_result = subprocess.run(
         ["vllm", "--version"],
@@ -135,6 +166,8 @@ def _write_runtime_fingerprint(*, artifact_dir: Path, arm: str) -> None:
         "python": sys.version,
         "platform": platform.platform(),
         "argv": sys.argv,
+        "resolved_arguments": arguments,
+        "draft_checkpoint": _checkpoint_identity(arguments),
     }
     fingerprint["sha256"] = canonical_sha256(fingerprint)
     (artifact_dir / "runtime.json").write_text(
@@ -148,7 +181,7 @@ def main() -> None:
     artifact_root = Path(os.environ.get("OPJAX_SPEC_ARTIFACT_ROOT", "/tmp/opjax-spec"))
     run_id = os.environ.get("OPJAX_SPEC_RUN_ID") or uuid.uuid4().hex
     artifact_dir = artifact_root / arm / run_id
-    _write_runtime_fingerprint(artifact_dir=artifact_dir, arm=arm)
+    _write_runtime_fingerprint(artifact_dir=artifact_dir, arm=arm, arguments=arguments)
     _start_gpu_telemetry(artifact_dir=artifact_dir)
     _start_artifact_commits()
     os.execvp("vllm", ["vllm", "serve", *arguments])

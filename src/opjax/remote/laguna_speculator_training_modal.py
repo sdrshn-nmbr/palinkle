@@ -108,6 +108,24 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _checkpoint_identity(path: Path) -> dict[str, object]:
+    files = {
+        str(candidate.relative_to(path)): _sha256(candidate)
+        for candidate in sorted(path.rglob("*"))
+        if candidate.is_file()
+        and candidate.name in {"config.json", "model.safetensors"}
+    }
+    if "config.json" not in files or "model.safetensors" not in files:
+        raise RuntimeError(f"LAGUNA_CHECKPOINT_IDENTITY_INCOMPLETE:{path}")
+    return {
+        "path": str(path.resolve()),
+        "files": files,
+        "sha256": hashlib.sha256(
+            json.dumps(files, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+    }
+
+
 def _execution_hashes() -> dict[str, str]:
     paths = {
         "native_tools_patch": Path("/opt/deepspec-native-tools.patch"),
@@ -183,7 +201,9 @@ def _run_observed(command: list[str], run_root: Path) -> dict[str, object]:
     return runtime
 
 
-@app.function(image=image, volumes=VOLUMES, secrets=[secret], timeout=3600, memory=16384)
+@app.function(
+    image=image, volumes=VOLUMES, secrets=[secret], timeout=3600, memory=16384
+)
 def initialize(arm: str) -> dict[str, object]:
     output = ROOT / "initialized" / arm
     if output.exists():
@@ -200,7 +220,9 @@ def initialize(arm: str) -> dict[str, object]:
     run_root = ROOT / "runs" / "initialize" / arm
     run_root.mkdir(parents=True, exist_ok=True)
     with (run_root / "run.log").open("wb") as log:
-        subprocess.run(command, cwd=DEEPSPEC, check=True, stdout=log, stderr=subprocess.STDOUT)
+        subprocess.run(
+            command, cwd=DEEPSPEC, check=True, stdout=log, stderr=subprocess.STDOUT
+        )
     training.commit()
     return json.loads((output / "initialization.json").read_text(encoding="utf-8"))
 
@@ -298,7 +320,9 @@ def evaluate_arm(arm: str, step: int, split: str = "calibration") -> dict[str, o
     return payload
 
 
-@app.function(image=image, volumes=VOLUMES, secrets=[secret], timeout=3600, memory=16384)
+@app.function(
+    image=image, volumes=VOLUMES, secrets=[secret], timeout=3600, memory=16384
+)
 def export_dflash(step: int) -> dict[str, object]:
     output = ROOT / "exports" / "dflash" / f"step_{step}"
     command = [
@@ -313,9 +337,50 @@ def export_dflash(step: int) -> dict[str, object]:
     run_root = ROOT / "runs" / "export" / "dflash" / f"step_{step}"
     run_root.mkdir(parents=True, exist_ok=True)
     with (run_root / "run.log").open("wb") as log:
-        subprocess.run(command, cwd=DEEPSPEC, check=True, stdout=log, stderr=subprocess.STDOUT)
+        subprocess.run(
+            command, cwd=DEEPSPEC, check=True, stdout=log, stderr=subprocess.STDOUT
+        )
     training.commit()
     return json.loads((output / "export.json").read_text(encoding="utf-8"))
+
+
+@app.function(image=image, volumes=VOLUMES, timeout=300, memory=4096)
+def select_checkpoint(arm: str, step: int) -> dict[str, object]:
+    if arm not in {"dflash", "dspark"}:
+        raise ValueError(f"LAGUNA_SELECT_ARM_INVALID:{arm}")
+    evaluation = (
+        ROOT / "runs" / "eval" / "calibration" / arm / f"step_{step}" / "result.json"
+    )
+    if not evaluation.is_file():
+        raise RuntimeError(f"LAGUNA_SELECT_EVALUATION_MISSING:{evaluation}")
+    source = (
+        ROOT / "exports" / "dflash" / f"step_{step}"
+        if arm == "dflash"
+        else ROOT / "checkpoints" / "dspark" / f"step_{step}"
+    )
+    identity = _checkpoint_identity(source)
+    selected_root = ROOT / "selected"
+    selected_root.mkdir(parents=True, exist_ok=True)
+    destination = selected_root / arm
+    temporary = selected_root / f".{arm}.tmp"
+    temporary.unlink(missing_ok=True)
+    temporary.symlink_to(source, target_is_directory=True)
+    temporary.replace(destination)
+    payload = {
+        "schema_version": 1,
+        "arm": arm,
+        "step": step,
+        "evaluation_sha256": _sha256(evaluation),
+        "checkpoint": identity,
+    }
+    payload["sha256"] = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    (selected_root / f"{arm}.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    training.commit()
+    return payload
 
 
 @app.function(image=image, volumes=VOLUMES, secrets=[secret], timeout=300)
@@ -330,6 +395,8 @@ def audit_inputs() -> dict[str, object]:
     }
     output = ROOT / "runs" / "input-audit.json"
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    output.write_text(
+        json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     training.commit()
     return result

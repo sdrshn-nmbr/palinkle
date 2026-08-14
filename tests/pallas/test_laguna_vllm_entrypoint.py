@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from opjax.remote.laguna_vllm_entrypoint import _prepare_dspark_snapshot
+from opjax.remote.laguna_vllm_entrypoint import (
+    _checkpoint_identity,
+    _prepare_dspark_snapshot,
+)
 
 
 def test_prepare_dspark_snapshot_accepts_bound_local_checkpoint(tmp_path: Path) -> None:
@@ -23,10 +26,31 @@ def test_prepare_dspark_snapshot_accepts_bound_local_checkpoint(tmp_path: Path) 
     }
     (source / "config.json").write_text(json.dumps(config))
     (source / "model.safetensors").write_bytes(b"bound-checkpoint")
-    prepared = _prepare_dspark_snapshot(root=tmp_path / "prepared", model=str(source), revision=None)
+    prepared = _prepare_dspark_snapshot(
+        root=tmp_path / "prepared", model=str(source), revision=None
+    )
     normalized = json.loads((prepared / "config.json").read_text())
     assert normalized["model_type"] == "laguna"
     assert normalized["swa_rope_parameters"]["rope_theta"] == 500000.0
     assert (prepared / "model.safetensors").resolve() == (
         source / "model.safetensors"
     ).resolve()
+
+
+def test_checkpoint_identity_binds_config_and_weights(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text("{}")
+    (checkpoint / "model.safetensors").write_bytes(b"weights")
+    arguments = [
+        "target",
+        "--speculative-config",
+        json.dumps({"model": str(checkpoint), "method": "dflash"}),
+    ]
+    first = _checkpoint_identity(arguments)
+    assert first is not None
+    assert first["files"].keys() == {"config.json", "model.safetensors"}
+    (checkpoint / "model.safetensors").write_bytes(b"different")
+    second = _checkpoint_identity(arguments)
+    assert second is not None
+    assert first["sha256"] != second["sha256"]
