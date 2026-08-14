@@ -344,6 +344,31 @@ def export_dflash(step: int) -> dict[str, object]:
     return json.loads((output / "export.json").read_text(encoding="utf-8"))
 
 
+@app.function(gpu="H200", **OPTIONS)
+def calibrate_dspark(step: int) -> dict[str, object]:
+    output = ROOT / "calibrated" / "dspark" / f"step_{step}"
+    command = [
+        "python",
+        "-m",
+        "opjax.remote.calibrate_laguna_dspark",
+        "--checkpoint",
+        str(ROOT / "checkpoints" / "dspark" / f"step_{step}"),
+        "--cache",
+        str(ROOT / "cache" / "calibration"),
+        "--output",
+        str(output),
+    ]
+    run_root = ROOT / "runs" / "calibration" / "dspark" / f"step_{step}"
+    runtime = _run_observed(command, run_root)
+    payload = json.loads((output / "calibration.json").read_text(encoding="utf-8"))
+    payload["runtime"] = runtime
+    (run_root / "result.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    training.commit()
+    return payload
+
+
 @app.function(image=image, volumes=VOLUMES, timeout=300, memory=4096)
 def select_checkpoint(arm: str, step: int) -> dict[str, object]:
     if arm not in {"dflash", "dspark"}:
@@ -356,7 +381,7 @@ def select_checkpoint(arm: str, step: int) -> dict[str, object]:
     source = (
         ROOT / "exports" / "dflash" / f"step_{step}"
         if arm == "dflash"
-        else ROOT / "checkpoints" / "dspark" / f"step_{step}"
+        else ROOT / "calibrated" / "dspark" / f"step_{step}"
     )
     identity = _checkpoint_identity(source)
     selected_root = ROOT / "selected"
