@@ -8,6 +8,7 @@ import re
 from typing import Any
 
 from opjax.pallas.laguna_dspark_conformance import canonical_sha256
+from opjax.pallas.laguna_speculative import BASH_TOOL
 
 
 _RUN = re.compile(r"^(?P<model>.+)--(?P<task>.+)--seed-(?P<seed>\d+)$")
@@ -93,6 +94,7 @@ def build_rows(sample_root: Path) -> tuple[list[dict[str, Any]], list[dict[str, 
                 "seed": seed,
                 "call": assistant_index,
                 "conversations": list(public),
+                "tools": [BASH_TOOL],
             }
             (heldout if task in heldout_tasks else train).append(row)
     if not train or not heldout:
@@ -137,6 +139,7 @@ def main() -> None:
         "source_root": str(args.sample_root.resolve()),
         "split_policy": "sorted_task_id_every_fourth_heldout_all_seeds_and_turns",
         "max_training_context": MAX_TRAINING_CONTEXT,
+        "tool_schema_sha256": canonical_sha256(BASH_TOOL),
         "rows": {"train": len(train), "heldout": len(heldout)},
         "trajectories": {
             "train": len({row["trajectory"] for row in train}),

@@ -78,6 +78,7 @@ def test_build_rows_keeps_complete_trajectory_splits(tmp_path: Path) -> None:
     assert not ({row["trajectory"] for row in train} & {row["trajectory"] for row in heldout})
     arguments = train[0]["conversations"][-1]["tool_calls"][0]["function"]["arguments"]
     assert arguments == {"command": "pwd"}
+    assert train[0]["tools"][0]["function"]["name"] == "bash"
 
 
 def test_build_rows_rejects_unknown_seed(tmp_path: Path) -> None:

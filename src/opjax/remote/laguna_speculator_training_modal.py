@@ -66,6 +66,15 @@ image = (
         "git clone https://github.com/RespectMathias/DeepSpec.git /opt/deepspec",
         f"git -C /opt/deepspec checkout {DEEPSPEC_REVISION}",
     )
+    .add_local_file(
+        "scripts/pallas/deepspec_native_tools.patch",
+        "/opt/deepspec-native-tools.patch",
+        copy=True,
+    )
+    .run_commands(
+        "git -C /opt/deepspec apply --check /opt/deepspec-native-tools.patch",
+        "git -C /opt/deepspec apply /opt/deepspec-native-tools.patch",
+    )
     .env({**REMOTE_ENV, "PYTHONPATH": "/opt/deepspec"})
     .add_local_python_source("opjax")
     .add_local_file(
