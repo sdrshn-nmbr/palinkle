@@ -148,6 +148,10 @@ def normalize_dspark_config(config: dict[str, Any]) -> dict[str, Any]:
     normalized["model_type"] = "laguna"
     normalized["draft_vocab_size"] = int(config["vocab_size"])
     normalized["n_predict"] = int(config["proposal_length"])
+    rope_parameters = config.get("rope_parameters")
+    if not isinstance(rope_parameters, dict):
+        raise LagunaSpeculativeError("LAGUNA_DSPARK_ROPE_PARAMETERS_MISSING")
+    normalized["swa_rope_parameters"] = dict(rope_parameters)
     normalized["dflash_config"] = {
         "block_size": int(config["block_size"]),
         "mask_token_id": int(config["mask_token_id"]),

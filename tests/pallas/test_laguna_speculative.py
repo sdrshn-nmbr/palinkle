@@ -66,12 +66,24 @@ def test_normalize_dspark_config_preserves_laguna_contract() -> None:
         "num_target_layers": 40,
         "target_layer_ids": [1, 13, 25, 33, 39],
         "draft_causal": True,
+        "rope_parameters": {
+            "rope_theta": 500000.0,
+            "rope_type": "default",
+        },
+        "swa_rope_parameters": {
+            "rope_theta": 10000.0,
+            "rope_type": "default",
+        },
     }
     normalized = normalize_dspark_config(original)
     assert normalized["architectures"] == ["Qwen3DSparkModel"]
     assert normalized["model_type"] == "laguna"
     assert normalized["draft_vocab_size"] == 100352
     assert normalized["n_predict"] == 15
+    assert normalized["swa_rope_parameters"] == {
+        "rope_theta": 500000.0,
+        "rope_type": "default",
+    }
     assert normalized["dflash_config"] == {
         "block_size": 16,
         "mask_token_id": 12,

@@ -17,10 +17,19 @@ from vllm.model_executor.models.qwen3_dspark import (
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader, maybe_prefix
 
+from opjax.remote.laguna_dspark_capture import (
+    capture_is_active,
+    capture_is_configured,
+    capture_static_tensor,
+    capture_tensor,
+    load_target_feature_override,
+)
+
 
 class LagunaDSparkModel(DFlashLagunaModel):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self._capture_enabled = capture_is_configured()
         config = self.config
         causal = bool(config.dflash_config["causal"])
         for layer in self.layers:
@@ -43,6 +52,111 @@ class LagunaDSparkModel(DFlashLagunaModel):
                 bias=True,
                 with_markov=config.confidence_head_with_markov,
             )
+        if self._capture_enabled:
+            self._register_capture_hooks()
+
+    def _register_capture_hooks(self) -> None:
+        for layer_id, layer in enumerate(self.layers):
+            layer.register_forward_hook(self._capture_layer_output(layer_id))
+        layer = self.layers[0]
+        for name, module in {
+            "layer0_input_norm": layer.input_layernorm,
+            "layer0_qkv_projection": layer.self_attn.qkv_proj,
+            "layer0_q_norm": layer.self_attn.q_norm,
+            "layer0_k_norm": layer.self_attn.k_norm,
+            "layer0_gate_projection": layer.self_attn.g_proj,
+            "layer0_attention_output": layer.self_attn,
+            "layer0_post_attention_norm": layer.post_attention_layernorm,
+            "layer0_mlp_output": layer.mlp,
+        }.items():
+            module.register_forward_hook(self._capture_operation(name))
+        layer.self_attn.attn.register_forward_pre_hook(
+            self._capture_attention_inputs
+        )
+        layer.self_attn.o_proj.register_forward_pre_hook(
+            self._capture_gated_attention
+        )
+
+    @staticmethod
+    def _capture_layer_output(layer_id: int):
+        def capture(_module, _inputs, output) -> None:
+            if not isinstance(output, tuple) or len(output) != 2:
+                raise RuntimeError(
+                    f"LAGUNA_DSPARK_LAYER_OUTPUT_INVALID:{layer_id}"
+                )
+            hidden_states, residual = output
+            capture_tensor(
+                f"draft_layer_{layer_id}_output",
+                hidden_states if residual is None else hidden_states + residual,
+            )
+
+        return capture
+
+    @staticmethod
+    def _capture_operation(name: str):
+        def capture(_module, _inputs, output) -> None:
+            value = output[0] if isinstance(output, (tuple, list)) else output
+            capture_tensor(name, value)
+
+        return capture
+
+    @staticmethod
+    def _capture_attention_inputs(_module, inputs) -> None:
+        if len(inputs) < 3:
+            raise RuntimeError("LAGUNA_DSPARK_ATTENTION_INPUTS_INVALID")
+        capture_tensor("layer0_query_q_after_rope", inputs[0])
+        capture_tensor("layer0_query_k_after_rope", inputs[1])
+        capture_tensor("layer0_query_v", inputs[2])
+
+    @staticmethod
+    def _capture_gated_attention(_module, inputs) -> None:
+        capture_tensor("layer0_gated_attention", inputs[0])
+
+    def _project_context_kv(
+        self,
+        context_states: torch.Tensor,
+        num_ctx: int,
+        num_layers: int,
+        num_kv_heads: int,
+        head_dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        all_k, all_v = super()._project_context_kv(
+            context_states,
+            num_ctx,
+            num_layers,
+            num_kv_heads,
+            head_dim,
+        )
+        if self._capture_enabled:
+            capture_tensor("layer0_context_k_raw", all_k[0])
+            capture_tensor("layer0_context_v", all_v[0])
+        return all_k, all_v
+
+    def _normalize_context_k(self, all_k: torch.Tensor) -> torch.Tensor:
+        normalized = super()._normalize_context_k(all_k)
+        if self._capture_enabled:
+            capture_tensor("layer0_context_k_before_rope", normalized[0])
+        return normalized
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self._capture_enabled:
+            capture_tensor("draft_input_ids", input_ids)
+            capture_tensor("draft_positions", positions)
+            effective_input_embeddings = (
+                self.embed_input_ids(input_ids)
+                if inputs_embeds is None
+                else inputs_embeds
+            )
+            capture_tensor("draft_input_embeddings", effective_input_embeddings)
+        result = super().forward(input_ids, positions, inputs_embeds)
+        if self._capture_enabled:
+            capture_tensor("draft_backbone_hidden_state", result)
+        return result
 
 
 class LagunaDSparkForCausalLM(Qwen3DSparkForCausalLM):
@@ -82,8 +196,24 @@ class LagunaDSparkForCausalLM(Qwen3DSparkForCausalLM):
         )
         self.logits_processor = LogitsProcessor(self.config.draft_vocab_size)
         self.draft_id_to_target_id = None
+        self._target_feature_override = load_target_feature_override()
+        self._capture_enabled = capture_is_configured()
 
     def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._target_feature_override is not None and capture_is_active():
+            override = self._target_feature_override.to(
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+            if override.shape != hidden_states.shape:
+                raise RuntimeError(
+                    "LAGUNA_TARGET_FEATURE_OVERRIDE_SHAPE:"
+                    f"expected={tuple(hidden_states.shape)}:"
+                    f"observed={tuple(override.shape)}"
+                )
+            hidden_states = override
+        if self._capture_enabled:
+            capture_tensor("raw_target_features", hidden_states)
         needs_squeeze = hidden_states.dim() == 1
         if needs_squeeze:
             hidden_states = hidden_states.unsqueeze(0)
@@ -95,7 +225,44 @@ class LagunaDSparkForCausalLM(Qwen3DSparkForCausalLM):
             normalized[:, index, :] = norm(slices[:, index, :])
         combined = normalized.reshape(hidden_states.shape[0], -1)
         result = self.model.hidden_norm(self.model.fc(combined))
+        if self._capture_enabled:
+            capture_tensor("combined_target_feature", result)
         return result.squeeze(0) if needs_squeeze else result
+
+    def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._capture_enabled:
+            capture_tensor("draft_logits_hidden_state", hidden_states)
+        result = super().compute_draft_logits(hidden_states)
+        if self._capture_enabled:
+            capture_tensor("base_logits", result)
+        return result
+
+    def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
+        if self._capture_enabled:
+            capture_tensor("markov_input_token_ids", token_ids)
+        result = super().markov_embed(token_ids)
+        if self._capture_enabled:
+            capture_tensor("markov_embedding", result)
+        return result
+
+    def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
+        result = super().markov_bias(markov_embed)
+        if self._capture_enabled:
+            capture_tensor("markov_bias", result)
+        return result
+
+    def compute_confidence(
+        self, head_hidden: torch.Tensor, markov_embed: torch.Tensor
+    ) -> torch.Tensor:
+        if self.model.confidence_head is None:
+            raise RuntimeError("LAGUNA_DSPARK_CONFIDENCE_HEAD_MISSING")
+        logits = self.model.confidence_head(head_hidden, markov_embed)
+        if self._capture_enabled:
+            capture_tensor("confidence_logits", logits)
+        result = torch.sigmoid(logits)
+        if self._capture_enabled:
+            capture_tensor("confidence_probability", result)
+        return result
 
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
@@ -105,6 +272,13 @@ class LagunaDSparkForCausalLM(Qwen3DSparkForCausalLM):
         source_tensor_count = 0
         for name, loaded_weight in weights:
             source_tensor_count += 1
+            if name in {
+                "markov_head.markov_w1.weight",
+                "markov_head.markov_w2.weight",
+                "confidence_head.proj.weight",
+                "confidence_head.proj.bias",
+            }:
+                capture_static_tensor(name.replace(".", "_"), loaded_weight)
             if "t2d" in name or "d2t" in name:
                 continue
             if "embed_tokens" in name or "lm_head" in name:
