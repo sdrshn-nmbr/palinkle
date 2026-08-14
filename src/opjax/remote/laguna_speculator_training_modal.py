@@ -281,17 +281,29 @@ def train_arm(arm: str) -> dict[str, object]:
 
 
 @app.function(gpu="H200", **OPTIONS)
-def evaluate_arm(arm: str, step: int, split: str = "calibration") -> dict[str, object]:
+def evaluate_arm(
+    arm: str,
+    step: int,
+    split: str = "calibration",
+    variant: str = "raw",
+) -> dict[str, object]:
     if arm not in {"dflash", "dspark"}:
         raise ValueError(f"LAGUNA_EVAL_ARM_INVALID:{arm}")
     if split not in {"calibration", "heldout"}:
         raise ValueError(f"LAGUNA_EVAL_SPLIT_INVALID:{split}")
-    checkpoint = (
-        ROOT / "initialized" / arm
-        if step == 0
-        else ROOT / "checkpoints" / arm / f"step_{step}"
-    )
-    run_root = ROOT / "runs" / "eval" / split / arm / f"step_{step}"
+    if variant not in {"raw", "calibrated"}:
+        raise ValueError(f"LAGUNA_EVAL_VARIANT_INVALID:{variant}")
+    if variant == "calibrated" and (arm != "dspark" or step == 0):
+        raise ValueError(f"LAGUNA_EVAL_VARIANT_UNSUPPORTED:{arm}:{step}:{variant}")
+    if variant == "calibrated":
+        checkpoint = ROOT / "calibrated" / "dspark" / f"step_{step}"
+    else:
+        checkpoint = (
+            ROOT / "initialized" / arm
+            if step == 0
+            else ROOT / "checkpoints" / arm / f"step_{step}"
+        )
+    run_root = ROOT / "runs" / "eval" / split / arm / variant / f"step_{step}"
     command = [
         "python",
         "-m",
@@ -312,6 +324,8 @@ def evaluate_arm(arm: str, step: int, split: str = "calibration") -> dict[str, o
     payload["arm"] = arm
     payload["step"] = step
     payload["split"] = split
+    payload["variant"] = variant
+    payload["checkpoint"] = _checkpoint_identity(checkpoint)
     payload["runtime"] = runtime
     (run_root / "result.json").write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -374,7 +388,14 @@ def select_checkpoint(arm: str, step: int) -> dict[str, object]:
     if arm not in {"dflash", "dspark"}:
         raise ValueError(f"LAGUNA_SELECT_ARM_INVALID:{arm}")
     evaluation = (
-        ROOT / "runs" / "eval" / "calibration" / arm / f"step_{step}" / "result.json"
+        ROOT
+        / "runs"
+        / "eval"
+        / "calibration"
+        / arm
+        / "raw"
+        / f"step_{step}"
+        / "result.json"
     )
     if not evaluation.is_file():
         raise RuntimeError(f"LAGUNA_SELECT_EVALUATION_MISSING:{evaluation}")
