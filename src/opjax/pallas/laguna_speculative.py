@@ -21,6 +21,7 @@ def canonical_sha256(value: Any) -> str:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
 
+
 BASH_TOOL = {
     "type": "function",
     "function": {
@@ -107,23 +108,54 @@ def validate_model_manifest() -> dict[str, Any]:
     return value
 
 
-def _speculative_config(arm: str) -> dict[str, Any] | None:
+def _speculative_config(
+    arm: str,
+    *,
+    proposal_tokens: int | None = None,
+    adaptive_verification: bool | None = None,
+    draft_model: str | None = None,
+    draft_revision: str | None = None,
+) -> dict[str, Any] | None:
+    resolved_tokens = 15 if proposal_tokens is None else proposal_tokens
+    if resolved_tokens < 1 or resolved_tokens > 15:
+        raise LagunaSpeculativeError(
+            f"LAGUNA_SPECULATIVE_PROPOSAL_TOKENS_INVALID:{resolved_tokens}"
+        )
     if arm == PLAIN:
+        if (
+            proposal_tokens is not None
+            or adaptive_verification is not None
+            or draft_model is not None
+            or draft_revision is not None
+        ):
+            raise LagunaSpeculativeError("LAGUNA_PLAIN_SPECULATIVE_OPTIONS_INVALID")
         return None
     if arm == DFLASH:
+        if adaptive_verification is not None:
+            raise LagunaSpeculativeError("LAGUNA_DFLASH_ADAPTIVE_OPTION_INVALID")
         return {
             "method": "dflash",
-            "model": DFLASH_ID,
-            "revision": DFLASH_REVISION,
-            "num_speculative_tokens": 15,
+            "model": draft_model or DFLASH_ID,
+            **(
+                {"revision": draft_revision or DFLASH_REVISION}
+                if draft_model is None or draft_revision is not None
+                else {}
+            ),
+            "num_speculative_tokens": resolved_tokens,
         }
     if arm == DSPARK:
         return {
             "method": "dspark",
-            "model": DSPARK_ID,
-            "revision": DSPARK_REVISION,
-            "num_speculative_tokens": 15,
-            "enable_adaptive_verification": True,
+            "model": draft_model or DSPARK_ID,
+            **(
+                {"revision": draft_revision or DSPARK_REVISION}
+                if draft_model is None or draft_revision is not None
+                else {}
+            ),
+            "num_speculative_tokens": resolved_tokens,
+            "enable_adaptive_verification": (
+                True if adaptive_verification is None else adaptive_verification
+            ),
         }
     raise LagunaSpeculativeError(f"LAGUNA_SPECULATIVE_ARM_INVALID:{arm}")
 
@@ -162,8 +194,22 @@ def normalize_dspark_config(config: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-def server_command(arm: str, *, port: int) -> list[str]:
-    speculative = _speculative_config(arm)
+def server_command(
+    arm: str,
+    *,
+    port: int,
+    proposal_tokens: int | None = None,
+    adaptive_verification: bool | None = None,
+    draft_model: str | None = None,
+    draft_revision: str | None = None,
+) -> list[str]:
+    speculative = _speculative_config(
+        arm,
+        proposal_tokens=proposal_tokens,
+        adaptive_verification=adaptive_verification,
+        draft_model=draft_model,
+        draft_revision=draft_revision,
+    )
     command = [
         "python",
         "-m",
@@ -198,8 +244,7 @@ def server_command(arm: str, *, port: int) -> list[str]:
         json.dumps(
             {
                 "Qwen3DSparkModel": (
-                    "opjax.remote.laguna_dspark_vllm_model:"
-                    "LagunaDSparkForCausalLM"
+                    "opjax.remote.laguna_dspark_vllm_model:LagunaDSparkForCausalLM"
                 )
             },
             sort_keys=True,
@@ -256,9 +301,7 @@ def _validate_tool_links(messages: list[dict[str, Any]], *, source: str) -> None
             if not isinstance(arguments, dict) or not isinstance(
                 arguments.get("command"), str
             ):
-                raise LagunaSpeculativeError(
-                    f"REPLAY_TOOL_ARGUMENTS_INVALID:{source}"
-                )
+                raise LagunaSpeculativeError(f"REPLAY_TOOL_ARGUMENTS_INVALID:{source}")
         if message.get("role") == "tool":
             result_id = message.get("tool_call_id")
             if result_id not in call_ids:
@@ -286,11 +329,15 @@ def build_replay_corpus(*, sample_root: Path) -> dict[str, Any]:
         assistant_index = 0
         for message in messages:
             if not isinstance(message, dict):
-                raise LagunaSpeculativeError(f"REPLAY_MESSAGE_INVALID:{trajectory_path}")
+                raise LagunaSpeculativeError(
+                    f"REPLAY_MESSAGE_INVALID:{trajectory_path}"
+                )
             if message.get("role") == "assistant":
                 assistant_index += 1
                 if not public:
-                    raise LagunaSpeculativeError(f"REPLAY_PREFIX_EMPTY:{trajectory_path}")
+                    raise LagunaSpeculativeError(
+                        f"REPLAY_PREFIX_EMPTY:{trajectory_path}"
+                    )
                 _validate_tool_links(public, source=str(trajectory_path))
                 records.append(
                     {
@@ -299,9 +346,9 @@ def build_replay_corpus(*, sample_root: Path) -> dict[str, Any]:
                         "call": assistant_index,
                         "messages": list(public),
                         "historical_completion_tokens": int(
-                            (
-                                (message.get("extra") or {}).get("response") or {}
-                            ).get("usage", {}).get("completion_tokens")
+                            ((message.get("extra") or {}).get("response") or {})
+                            .get("usage", {})
+                            .get("completion_tokens")
                             or 0
                         ),
                     }
@@ -326,9 +373,7 @@ def _percentile(values: list[float], quantile: float) -> float:
     return ordered[max(0, min(len(ordered) - 1, position))]
 
 
-def select_parity_panel(
-    *, corpus: dict[str, Any], size: int = 48
-) -> dict[str, Any]:
+def select_parity_panel(*, corpus: dict[str, Any], size: int = 48) -> dict[str, Any]:
     records = sorted(
         corpus["records"],
         key=lambda record: (
@@ -341,10 +386,7 @@ def select_parity_panel(
     indices = (
         [len(records) // 2]
         if size == 1
-        else [
-            round(index * (len(records) - 1) / (size - 1))
-            for index in range(size)
-        ]
+        else [round(index * (len(records) - 1) / (size - 1)) for index in range(size)]
     )
     selected = [records[index] for index in indices]
     panel: dict[str, Any] = {

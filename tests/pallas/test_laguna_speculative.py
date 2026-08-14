@@ -56,6 +56,43 @@ def test_server_commands_share_runtime_and_target() -> None:
     assert '"num_speculative_tokens":15' in commands[DSPARK][-1]
 
 
+def test_dspark_fixed_proposal_depth_is_explicit() -> None:
+    command = server_command(
+        DSPARK,
+        port=8000,
+        proposal_tokens=8,
+        adaptive_verification=False,
+    )
+    config = json.loads(command[command.index("--speculative-config") + 1])
+    assert config["num_speculative_tokens"] == 8
+    assert config["enable_adaptive_verification"] is False
+
+
+@pytest.mark.parametrize("arm", [DFLASH, DSPARK])
+def test_trained_draft_path_does_not_invent_a_hub_revision(arm: str) -> None:
+    command = server_command(
+        arm,
+        port=8000,
+        proposal_tokens=4,
+        adaptive_verification=False if arm == DSPARK else None,
+        draft_model="/mnt/training/checkpoint",
+    )
+    config = json.loads(command[command.index("--speculative-config") + 1])
+    assert config["model"] == "/mnt/training/checkpoint"
+    assert "revision" not in config
+
+
+@pytest.mark.parametrize("proposal_tokens", [0, 16])
+def test_proposal_depth_outside_checkpoint_contract_fails(
+    proposal_tokens: int,
+) -> None:
+    with pytest.raises(
+        LagunaSpeculativeError,
+        match="LAGUNA_SPECULATIVE_PROPOSAL_TOKENS_INVALID",
+    ):
+        server_command(DSPARK, port=8000, proposal_tokens=proposal_tokens)
+
+
 def test_normalize_dspark_config_preserves_laguna_contract() -> None:
     original = {
         "architectures": ["LagunaDSparkModel"],

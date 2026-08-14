@@ -26,14 +26,19 @@ from opjax.pallas.laguna_speculative import (
 )
 
 
-def _prepare_dspark_snapshot(*, root: Path) -> Path:
-    source = Path(
-        snapshot_download(
-            repo_id=DSPARK_ID,
-            revision=DSPARK_REVISION,
-        )
+def _prepare_dspark_snapshot(
+    *, root: Path, model: str = DSPARK_ID, revision: str | None = DSPARK_REVISION
+) -> Path:
+    model_path = Path(model)
+    source = (
+        model_path
+        if model_path.is_dir()
+        else Path(snapshot_download(repo_id=model, revision=revision))
     )
-    destination = root / DSPARK_REVISION
+    identity = revision or canonical_sha256(
+        {"model": str(source.resolve()), "config": (source / "config.json").read_text()}
+    )
+    destination = root / identity
     destination.mkdir(parents=True, exist_ok=True)
     for source_path in source.iterdir():
         if source_path.name == "config.json":
@@ -60,7 +65,11 @@ def _rewrite_speculative_config(arguments: list[str]) -> tuple[list[str], str]:
     config: dict[str, Any] = json.loads(rewritten[index])
     method = str(config.get("method"))
     if method == "dspark":
-        snapshot = _prepare_dspark_snapshot(root=Path("/tmp/opjax-dspark"))
+        snapshot = _prepare_dspark_snapshot(
+            root=Path("/tmp/opjax-dspark"),
+            model=str(config["model"]),
+            revision=config.get("revision"),
+        )
         config["model"] = str(snapshot)
         config.pop("revision", None)
     rewritten[index] = json.dumps(config, sort_keys=True, separators=(",", ":"))
