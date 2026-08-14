@@ -91,6 +91,9 @@ def test_build_rows_keeps_complete_trajectory_splits(tmp_path: Path) -> None:
     arguments = train[0]["conversations"][-2]["tool_calls"][0]["function"]["arguments"]
     assert arguments == {"command": "pwd"}
     assert train[0]["tools"][0]["function"]["name"] == "bash"
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert manifest["task_ids"]["calibration"] == ["a"]
+    assert manifest["task_ids"]["heldout"] == ["e"]
 
 
 def test_build_rows_rejects_unknown_seed(tmp_path: Path) -> None:

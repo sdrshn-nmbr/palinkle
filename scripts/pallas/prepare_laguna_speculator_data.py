@@ -177,6 +177,11 @@ def main() -> None:
             "calibration": len({row["task"] for row in calibration}),
             "heldout": len({row["task"] for row in heldout}),
         },
+        "task_ids": {
+            "train": sorted({row["task"] for row in train}),
+            "calibration": sorted({row["task"] for row in calibration}),
+            "heldout": sorted({row["task"] for row in heldout}),
+        },
         "files": {
             split: {
                 "path": path.name,
