@@ -262,7 +262,11 @@ def train_arm(arm: str) -> dict[str, object]:
 def evaluate_arm(arm: str, step: int) -> dict[str, object]:
     if arm not in {"dflash", "dspark"}:
         raise ValueError(f"LAGUNA_EVAL_ARM_INVALID:{arm}")
-    checkpoint = ROOT / "checkpoints" / arm / f"step_{step}"
+    checkpoint = (
+        ROOT / "initialized" / arm
+        if step == 0
+        else ROOT / "checkpoints" / arm / f"step_{step}"
+    )
     run_root = ROOT / "runs" / "eval" / arm / f"step_{step}"
     command = [
         "python",
