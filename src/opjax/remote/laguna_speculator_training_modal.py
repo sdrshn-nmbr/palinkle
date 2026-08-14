@@ -187,7 +187,7 @@ def initialize(arm: str) -> dict[str, object]:
     return json.loads((output / "initialization.json").read_text(encoding="utf-8"))
 
 
-@app.function(gpu="H200", **OPTIONS)
+@app.function(gpu="H200:4", **OPTIONS)
 def prepare_cache(split: str) -> dict[str, object]:
     if split not in {"train", "heldout"}:
         raise ValueError(f"LAGUNA_CACHE_SPLIT_INVALID:{split}")
@@ -216,7 +216,7 @@ def prepare_cache(split: str) -> dict[str, object]:
     return manifest
 
 
-@app.function(gpu="H200", **OPTIONS)
+@app.function(gpu="H200:4", **OPTIONS)
 def train_arm(arm: str) -> dict[str, object]:
     if arm not in {"dflash", "dspark"}:
         raise ValueError(f"LAGUNA_TRAIN_ARM_INVALID:{arm}")
