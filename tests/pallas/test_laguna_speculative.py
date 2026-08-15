@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
+import urllib.error
 
 import pytest
 
@@ -16,6 +18,7 @@ from opjax.pallas.laguna_speculative import (
     canonical_response_signature,
     normalize_dspark_config,
     partition_replay_records,
+    _request,
     select_parity_panel,
     server_command,
     validate_model_manifest,
@@ -247,4 +250,49 @@ def test_replay_partition_preserves_trajectory_order() -> None:
             {"trajectory": "b", "call": 1},
             {"trajectory": "b", "call": 2},
         ],
+    ]
+
+
+def test_replay_request_retries_transport_failure(monkeypatch) -> None:
+    payload = {
+        "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+        "choices": [
+            {
+                "finish_reason": "stop",
+                "token_ids": [7],
+                "message": {"content": "done"},
+            }
+        ],
+    }
+    attempts = 0
+
+    def open_request(_request, timeout):
+        nonlocal attempts
+        assert timeout == 1800
+        attempts += 1
+        if attempts == 1:
+            raise urllib.error.URLError(TimeoutError("handshake timed out"))
+        return io.BytesIO(json.dumps(payload).encode())
+
+    monkeypatch.setattr("urllib.request.urlopen", open_request)
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+    result = _request(
+        base_url="https://example.invalid",
+        headers={},
+        record={
+            "prompt_id": "prompt-1",
+            "trajectory": "trajectory-1",
+            "call": 1,
+            "historical_completion_tokens": 1,
+            "messages": [{"role": "user", "content": "test"}],
+        },
+        max_tokens=8,
+    )
+    assert result["request_attempts"] == 2
+    assert result["transient_errors"] == [
+        {
+            "attempt": 1,
+            "status": "transport",
+            "detail": "<urlopen error handshake timed out>",
+        }
     ]
