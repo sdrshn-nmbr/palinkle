@@ -5,6 +5,7 @@ from pathlib import Path
 
 from opjax.remote.laguna_vllm_entrypoint import (
     _checkpoint_identity,
+    _find_vllm_utils_path,
     _patch_dflash_source_alignment,
     _prepare_dspark_snapshot,
     DFLASH_SAMPLE_REPLACEMENT,
@@ -84,3 +85,25 @@ def test_dflash_runtime_alignment_patch_fails_on_unknown_source(
         assert "LAGUNA_DFLASH_ALIGNMENT_SOURCE_MISMATCH" in str(exc)
     else:
         raise AssertionError("unknown vLLM source must fail closed")
+
+
+def test_vllm_source_discovery_uses_launcher_interpreter(tmp_path: Path) -> None:
+    prefix = tmp_path / "runtime"
+    launcher = prefix / "bin" / "vllm"
+    interpreter = prefix / "bin" / "python"
+    source = (
+        prefix
+        / "lib"
+        / "python3.12"
+        / "site-packages"
+        / "vllm"
+        / "v1"
+        / "spec_decode"
+        / "utils.py"
+    )
+    launcher.parent.mkdir(parents=True)
+    source.parent.mkdir(parents=True)
+    interpreter.write_text("")
+    launcher.write_text(f"#!{interpreter}\n")
+    source.write_text(DFLASH_SAMPLE_SOURCE)
+    assert _find_vllm_utils_path(launcher) == source

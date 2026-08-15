@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import json
 import hashlib
-import importlib.util
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import threading
@@ -180,13 +180,33 @@ def _patch_dflash_source_alignment(path: Path) -> dict[str, Any]:
     }
 
 
+def _find_vllm_utils_path(launcher: Path) -> Path:
+    first_line = launcher.read_text(encoding="utf-8").splitlines()[0]
+    if not first_line.startswith("#!"):
+        raise RuntimeError(f"LAGUNA_VLLM_LAUNCHER_SHEBANG_MISSING:{launcher}")
+    interpreter = Path(first_line[2:].strip()).resolve()
+    prefix = interpreter.parent.parent
+    candidates = sorted(
+        {
+            *prefix.glob("lib/python*/site-packages/vllm/v1/spec_decode/utils.py"),
+            *prefix.glob("lib/python*/dist-packages/vllm/v1/spec_decode/utils.py"),
+        }
+    )
+    if len(candidates) != 1:
+        raise RuntimeError(
+            "LAGUNA_VLLM_ALIGNMENT_SOURCE_COUNT_INVALID:"
+            f"launcher={launcher}:interpreter={interpreter}:candidates={candidates}"
+        )
+    return candidates[0]
+
+
 def _apply_runtime_alignment(arm: str) -> dict[str, Any] | None:
     if arm != DFLASH:
         return None
-    spec = importlib.util.find_spec("vllm.v1.spec_decode.utils")
-    if spec is None or spec.origin is None:
-        raise RuntimeError("LAGUNA_DFLASH_ALIGNMENT_SOURCE_NOT_FOUND")
-    return _patch_dflash_source_alignment(Path(spec.origin))
+    executable = shutil.which("vllm")
+    if executable is None:
+        raise RuntimeError("LAGUNA_VLLM_LAUNCHER_NOT_FOUND")
+    return _patch_dflash_source_alignment(_find_vllm_utils_path(Path(executable)))
 
 
 def _write_runtime_fingerprint(
