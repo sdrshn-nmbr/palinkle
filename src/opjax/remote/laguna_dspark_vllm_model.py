@@ -18,6 +18,8 @@ from vllm.model_executor.models.qwen3_dspark import (
 from vllm.model_executor.models.utils import AutoWeightsLoader, maybe_prefix
 
 from opjax.remote.laguna_dspark_capture import (
+    begin_capture_round,
+    capture_step,
     capture_is_active,
     capture_is_configured,
     capture_static_tensor,
@@ -196,12 +198,16 @@ class LagunaDSparkForCausalLM(Qwen3DSparkForCausalLM):
         )
         self.logits_processor = LogitsProcessor(self.config.draft_vocab_size)
         self.draft_id_to_target_id = None
-        self._target_feature_override = load_target_feature_override()
         self._capture_enabled = capture_is_configured()
 
     def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self._target_feature_override is not None and capture_is_active():
-            override = self._target_feature_override.to(
+        if capture_is_active():
+            begin_capture_round()
+        target_feature_override = (
+            load_target_feature_override() if capture_is_active() else None
+        )
+        if target_feature_override is not None:
+            override = target_feature_override.to(
                 device=hidden_states.device,
                 dtype=hidden_states.dtype,
             )
@@ -230,11 +236,15 @@ class LagunaDSparkForCausalLM(Qwen3DSparkForCausalLM):
         return result.squeeze(0) if needs_squeeze else result
 
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self._capture_enabled:
+        active = self._capture_enabled and capture_is_active()
+        if active:
             capture_tensor("draft_logits_hidden_state", hidden_states)
         result = super().compute_draft_logits(hidden_states)
-        if self._capture_enabled:
+        if active:
             capture_tensor("base_logits", result)
+            self._opjax_capture_hidden_states = hidden_states
+            self._opjax_capture_base_logits = result
+            self._opjax_capture_markov_step = 0
         return result
 
     def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
@@ -247,8 +257,21 @@ class LagunaDSparkForCausalLM(Qwen3DSparkForCausalLM):
 
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         result = super().markov_bias(markov_embed)
-        if self._capture_enabled:
+        if self._capture_enabled and capture_is_active():
             capture_tensor("markov_bias", result)
+            step = self._opjax_capture_markov_step
+            base = capture_step(self._opjax_capture_base_logits, step)
+            corrected = base + result
+            capture_tensor("corrected_logits_runtime", corrected)
+            capture_tensor(
+                "proposal_token_ids_runtime", torch.argmax(corrected, dim=-1)
+            )
+            hidden = capture_step(self._opjax_capture_hidden_states, step)
+            if self.model.confidence_head is None:
+                raise RuntimeError("LAGUNA_DSPARK_CONFIDENCE_HEAD_MISSING")
+            confidence = self.model.confidence_head(hidden, markov_embed)
+            capture_tensor("confidence_logits_instrumented", confidence)
+            self._opjax_capture_markov_step = step + 1
         return result
 
     def compute_confidence(

@@ -143,6 +143,7 @@ def run_capture(
     prompt: str,
     target_path: Path | None = None,
     draft_path: Path | None = None,
+    input_token_ids: list[int] | None = None,
 ) -> dict[str, object]:
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
@@ -182,12 +183,18 @@ def run_capture(
         trust_remote_code=True,
         fix_mistral_regex=True,
     )
-    input_ids = encode_chat_messages(
-        tokenizer,
-        [{"role": "user", "content": prompt}],
-        add_generation_prompt=True,
-        enable_thinking=True,
+    input_ids = (
+        torch.tensor([input_token_ids], dtype=torch.long)
+        if input_token_ids is not None
+        else encode_chat_messages(
+            tokenizer,
+            [{"role": "user", "content": prompt}],
+            add_generation_prompt=True,
+            enable_thinking=True,
+        )
     ).to("cuda")
+    if input_ids.shape[1] < 2:
+        raise RuntimeError(f"DEEPSPEC_CONTEXT_TOO_SHORT:{input_ids.shape[1]}")
     captured, target_handles = _capture_target_layers(
         target_model, [int(value) for value in draft_model.target_layer_ids]
     )
@@ -458,7 +465,8 @@ def run_capture(
             ),
             "source_sha256": _sha256(Path(__file__)),
         },
-        "prompt": prompt,
+        "prompt": prompt if input_token_ids is None else None,
+        "input_mode": "token_ids" if input_token_ids is not None else "chat",
         "prompt_token_ids": input_ids.cpu().tolist()[0],
         "boundaries": tensors,
         "trace": {
@@ -495,6 +503,7 @@ def main() -> None:
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--target-path", type=Path)
     parser.add_argument("--draft-path", type=Path)
+    parser.add_argument("--input-token-ids", type=Path)
     args = parser.parse_args()
     print(
         json.dumps(
@@ -503,6 +512,11 @@ def main() -> None:
                 prompt=args.prompt,
                 target_path=args.target_path,
                 draft_path=args.draft_path,
+                input_token_ids=(
+                    json.loads(args.input_token_ids.read_text(encoding="utf-8"))
+                    if args.input_token_ids is not None
+                    else None
+                ),
             ),
             sort_keys=True,
         )

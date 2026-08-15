@@ -15,9 +15,24 @@ import torch
 
 _LOCK = threading.Lock()
 _COUNTERS: dict[tuple[str, str], int] = {}
+_ACTIVE_ROUNDS: dict[str, int] = {}
 
 
-def _control() -> tuple[Path, str] | None:
+def capture_step(value: torch.Tensor, step: int) -> torch.Tensor:
+    if step < 0:
+        raise RuntimeError(f"LAGUNA_CAPTURE_STEP_RANGE:{step}:{tuple(value.shape)}")
+    if value.ndim == 2:
+        if step >= value.shape[0]:
+            raise RuntimeError(f"LAGUNA_CAPTURE_STEP_RANGE:{step}:{tuple(value.shape)}")
+        return value[step : step + 1, :]
+    if value.ndim == 3:
+        if step >= value.shape[1]:
+            raise RuntimeError(f"LAGUNA_CAPTURE_STEP_RANGE:{step}:{tuple(value.shape)}")
+        return value[:, step, :]
+    raise RuntimeError(f"LAGUNA_CAPTURE_STEP_RANK:{tuple(value.shape)}")
+
+
+def _control() -> tuple[Path, dict[str, Any]] | None:
     root_value = os.environ.get("OPJAX_DSPARK_CAPTURE_ROOT")
     if not root_value:
         return None
@@ -29,14 +44,16 @@ def _control() -> tuple[Path, str] | None:
     session = value.get("session")
     if not isinstance(session, str) or not session:
         raise RuntimeError("DSPARK_CAPTURE_SESSION_INVALID")
-    return root, session
+    return root, value
 
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _write_tensor(*, root: Path, session: str, name: str, value: torch.Tensor) -> None:
+def _write_tensor(
+    *, root: Path, session: str, name: str, value: torch.Tensor, round_id: int | None
+) -> None:
     with _LOCK:
         key = (session, name)
         index = _COUNTERS.get(key, 0)
@@ -59,6 +76,7 @@ def _write_tensor(*, root: Path, session: str, name: str, value: torch.Tensor) -
             "shape": list(array.shape),
             "dtype": str(array.dtype),
             "source_dtype": str(value.dtype),
+            "round": round_id,
             "sha256": _sha256(path),
         }
         ledger = session_root / "ledger.jsonl"
@@ -70,8 +88,15 @@ def capture_tensor(name: str, value: torch.Tensor) -> None:
     active = _control()
     if active is None:
         return
-    root, session = active
-    _write_tensor(root=root, session=session, name=name, value=value)
+    root, control = active
+    session = control["session"]
+    with _LOCK:
+        round_id = _ACTIVE_ROUNDS.get(session)
+    if round_id is None:
+        raise RuntimeError(f"DSPARK_CAPTURE_ROUND_NOT_STARTED:{session}:{name}")
+    _write_tensor(
+        root=root, session=session, name=name, value=value, round_id=round_id
+    )
 
 
 def capture_is_active() -> bool:
@@ -91,11 +116,52 @@ def capture_static_tensor(name: str, value: torch.Tensor) -> None:
         session="static",
         name=name,
         value=value,
+        round_id=None,
     )
 
 
+def begin_capture_round() -> int | None:
+    active = _control()
+    if active is None:
+        return None
+    session = active[1]["session"]
+    with _LOCK:
+        round_id = _ACTIVE_ROUNDS.get(session, -1) + 1
+        _ACTIVE_ROUNDS[session] = round_id
+    return round_id
+
+
 def load_target_feature_override() -> torch.Tensor | None:
-    path_value = os.environ.get("OPJAX_DSPARK_TARGET_FEATURE_OVERRIDE")
+    active = _control()
+    path_value = None
+    if active is not None:
+        control = active[1]
+        candidate = control.get("target_feature_override")
+        candidates = control.get("target_feature_overrides")
+        if candidate is not None and candidates is not None:
+            raise RuntimeError("DSPARK_TARGET_FEATURE_OVERRIDE_AMBIGUOUS")
+        if candidates is not None:
+            if not isinstance(candidates, list) or not all(
+                isinstance(item, str) for item in candidates
+            ):
+                raise RuntimeError("DSPARK_TARGET_FEATURE_OVERRIDES_CONTROL_INVALID")
+            with _LOCK:
+                index = _ACTIVE_ROUNDS.get(control["session"])
+            if index is None:
+                raise RuntimeError("DSPARK_TARGET_FEATURE_OVERRIDE_ROUND_MISSING")
+            if index >= len(candidates):
+                if control.get("allow_native_after_override_exhaustion") is True:
+                    return None
+                raise RuntimeError(
+                    "DSPARK_TARGET_FEATURE_OVERRIDE_EXHAUSTED:"
+                    f"{control['session']}:{index}"
+                )
+            candidate = candidates[index]
+        if candidate is not None and not isinstance(candidate, str):
+            raise RuntimeError("DSPARK_TARGET_FEATURE_OVERRIDE_CONTROL_INVALID")
+        path_value = candidate
+    if path_value is None:
+        path_value = os.environ.get("OPJAX_DSPARK_TARGET_FEATURE_OVERRIDE")
     if not path_value:
         return None
     path = Path(path_value)

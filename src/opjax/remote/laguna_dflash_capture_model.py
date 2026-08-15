@@ -4,6 +4,7 @@ import torch
 from vllm.model_executor.models.laguna_dflash import DFlashLagunaForCausalLM
 
 from opjax.remote.laguna_dspark_capture import (
+    begin_capture_round,
     capture_tensor,
     load_target_feature_override,
 )
@@ -11,6 +12,7 @@ from opjax.remote.laguna_dspark_capture import (
 
 class CapturedLagunaDFlashForCausalLM(DFlashLagunaForCausalLM):
     def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        begin_capture_round()
         override = load_target_feature_override()
         if override is not None:
             hidden_states = override.to(

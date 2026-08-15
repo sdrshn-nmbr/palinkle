@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -21,7 +22,9 @@ from opjax.pallas.laguna_dspark_conformance import (
     validate_target_feature_conformance_report,
 )
 from opjax.remote.laguna_dspark_capture import (
+    begin_capture_round,
     capture_is_configured,
+    capture_step,
     capture_tensor,
     load_target_feature_override,
 )
@@ -53,7 +56,7 @@ def _write_array(root: Path, name: str, value: np.ndarray) -> dict[str, object]:
     np.save(path, value)
     return {
         "path": path.name,
-        "sha256": __import__("hashlib").sha256(path.read_bytes()).hexdigest(),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
     }
 
 
@@ -79,7 +82,7 @@ def _capture(root: Path, *, token_delta: int = 0) -> dict[str, object]:
 def _write_array_bytes(path: Path) -> dict[str, object]:
     return {
         "path": path.name,
-        "sha256": __import__("hashlib").sha256(path.read_bytes()).hexdigest(),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         "bytes": path.stat().st_size,
     }
 
@@ -129,7 +132,7 @@ def test_dflash_requires_exact_proposal_tokens(tmp_path: Path) -> None:
     values = np.load(proposal)
     np.save(proposal, values + 1)
     adapter["boundaries"]["proposal_token_ids"]["sha256"] = (
-        __import__("hashlib").sha256(proposal.read_bytes()).hexdigest()
+        hashlib.sha256(proposal.read_bytes()).hexdigest()
     )
     report = build_dflash_conformance_report(
         source_root=source_root,
@@ -198,14 +201,14 @@ def test_bfloat16_close_logits_allow_near_tie_but_final_tokens_remain_exact(
     source_base[0] = [2.0, 2.01, 0.0, 0.0]
     np.save(source_base_path, source_base)
     source["boundaries"]["base_logits"]["sha256"] = (
-        __import__("hashlib").sha256(source_base_path.read_bytes()).hexdigest()
+        hashlib.sha256(source_base_path.read_bytes()).hexdigest()
     )
     base_path = adapter_root / "base_logits.npy"
     base = np.load(base_path)
     base[0] = [2.01, 2.0, 0.0, 0.0]
     np.save(base_path, base)
     adapter["boundaries"]["base_logits"]["sha256"] = (
-        __import__("hashlib").sha256(base_path.read_bytes()).hexdigest()
+        hashlib.sha256(base_path.read_bytes()).hexdigest()
     )
     report = build_conformance_report(
         source_root=source_root,
@@ -317,7 +320,7 @@ def test_frozen_hardware_conformance_evidence_is_bound() -> None:
     index_path = EVIDENCE_ROOT / "artifact-index.json"
     assert (
         remote["hf_artifact_index_sha256"]
-        == __import__("hashlib").sha256(index_path.read_bytes()).hexdigest()
+        == hashlib.sha256(index_path.read_bytes()).hexdigest()
     )
     index = json.loads(index_path.read_text(encoding="utf-8"))
     assert remote["hf_file_count"] == len(index["files"]) + 1
@@ -382,6 +385,7 @@ def test_runtime_capture_is_explicit_and_hash_bound(
     (capture_root / "active.json").write_text(
         json.dumps({"session": "case-0"}), encoding="utf-8"
     )
+    begin_capture_round()
     capture_tensor("hidden", torch.tensor([1.0], dtype=torch.bfloat16))
     output = capture_root / "case-0" / "hidden-000.npy"
     assert np.load(output, allow_pickle=False).dtype == np.float32
@@ -391,7 +395,7 @@ def test_runtime_capture_is_explicit_and_hash_bound(
     assert ledger["source_dtype"] == "torch.bfloat16"
     assert (
         ledger["sha256"]
-        == __import__("hashlib").sha256(output.read_bytes()).hexdigest()
+        == hashlib.sha256(output.read_bytes()).hexdigest()
     )
 
 
@@ -412,7 +416,7 @@ def test_vllm_capture_reconstructs_the_exact_markov_chain(tmp_path: Path) -> Non
                 "name": name,
                 "index": index,
                 "path": path.name,
-                "sha256": __import__("hashlib").sha256(path.read_bytes()).hexdigest(),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
             }
         )
 
@@ -454,8 +458,18 @@ def test_vllm_capture_reconstructs_the_exact_markov_chain(tmp_path: Path) -> Non
         record("markov_input_token_ids", step, np.array([previous], dtype=np.int64))
         record("markov_embedding", step, np.zeros((1, 4), dtype=np.float32))
         record("markov_bias", step, bias)
+        record("corrected_logits_runtime", step, bias)
+        record(
+            "proposal_token_ids_runtime",
+            step,
+            np.array([step], dtype=np.int64),
+        )
+        record(
+            "confidence_logits_instrumented",
+            step,
+            np.zeros((1,), dtype=np.float32),
+        )
         previous = step
-    record("confidence_logits", 0, np.zeros((15,), dtype=np.float32))
     (raw / "ledger.jsonl").write_text(
         "".join(json.dumps(value) + "\n" for value in records), encoding="utf-8"
     )
@@ -471,7 +485,7 @@ def test_vllm_capture_reconstructs_the_exact_markov_chain(tmp_path: Path) -> Non
                 "name": name,
                 "index": 0,
                 "path": path.name,
-                "sha256": __import__("hashlib").sha256(path.read_bytes()).hexdigest(),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
             }
         )
     (static / "ledger.jsonl").write_text(
@@ -514,6 +528,72 @@ def test_target_feature_override_normalizes_the_source_batch_axis(
     value = load_target_feature_override()
     assert value is not None
     assert tuple(value.shape) == (52, 10240)
+
+
+def test_target_feature_override_tracks_proposal_round(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture_root = tmp_path / "capture"
+    capture_root.mkdir()
+    first = tmp_path / "first.npy"
+    second = tmp_path / "second.npy"
+    np.save(first, np.full((1, 2, 4), 1.0, dtype=np.float32))
+    np.save(second, np.full((1, 2, 4), 2.0, dtype=np.float32))
+    monkeypatch.setenv("OPJAX_DSPARK_CAPTURE_ROOT", str(capture_root))
+    (capture_root / "active.json").write_text(
+        json.dumps(
+            {
+                "session": "round-overrides",
+                "target_feature_overrides": [str(first), str(second)],
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert begin_capture_round() == 0
+    assert torch.equal(load_target_feature_override(), torch.ones((2, 4)))
+    assert begin_capture_round() == 1
+    assert torch.equal(load_target_feature_override(), torch.full((2, 4), 2.0))
+
+
+def test_target_feature_override_exhaustion_is_explicitly_opt_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capture_root = tmp_path / "capture"
+    capture_root.mkdir()
+    feature = tmp_path / "feature.npy"
+    np.save(feature, np.ones((1, 2, 4), dtype=np.float32))
+    monkeypatch.setenv("OPJAX_DSPARK_CAPTURE_ROOT", str(capture_root))
+    control = {
+        "session": "exhaustion-policy",
+        "target_feature_overrides": [str(feature)],
+    }
+    (capture_root / "active.json").write_text(
+        json.dumps(control), encoding="utf-8"
+    )
+    assert begin_capture_round() == 0
+    assert load_target_feature_override() is not None
+    assert begin_capture_round() == 1
+    with pytest.raises(RuntimeError, match="DSPARK_TARGET_FEATURE_OVERRIDE_EXHAUSTED"):
+        load_target_feature_override()
+
+    control["allow_native_after_override_exhaustion"] = True
+    (capture_root / "active.json").write_text(
+        json.dumps(control), encoding="utf-8"
+    )
+    assert load_target_feature_override() is None
+
+
+def test_capture_step_supports_runtime_batched_and_unbatched_layouts() -> None:
+    unbatched = torch.arange(12).reshape(3, 4)
+    batched = torch.arange(24).reshape(2, 3, 4)
+    assert torch.equal(capture_step(unbatched, 1), unbatched[1:2, :])
+    assert torch.equal(capture_step(batched, 1), batched[:, 1, :])
+    with pytest.raises(RuntimeError, match="LAGUNA_CAPTURE_STEP_RANGE"):
+        capture_step(unbatched, 3)
+    with pytest.raises(RuntimeError, match="LAGUNA_CAPTURE_STEP_RANGE"):
+        capture_step(unbatched, -1)
+    with pytest.raises(RuntimeError, match="LAGUNA_CAPTURE_STEP_RANK"):
+        capture_step(torch.zeros(4), 0)
 
 
 def test_target_feature_conformance_accepts_numeric_drift_and_preserves_order(
