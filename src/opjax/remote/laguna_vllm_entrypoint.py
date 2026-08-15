@@ -185,7 +185,11 @@ def _find_vllm_utils_path(launcher: Path) -> Path:
     if not first_line.startswith("#!"):
         raise RuntimeError(f"LAGUNA_VLLM_LAUNCHER_SHEBANG_MISSING:{launcher}")
     interpreter = Path(first_line[2:].strip())
-    prefixes = {interpreter.parent.parent, interpreter.resolve().parent.parent}
+    prefixes = {
+        launcher.parent.parent,
+        interpreter.parent.parent,
+        interpreter.resolve().parent.parent,
+    }
     candidates = sorted(
         {
             candidate
