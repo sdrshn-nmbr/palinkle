@@ -184,12 +184,16 @@ def _find_vllm_utils_path(launcher: Path) -> Path:
     first_line = launcher.read_text(encoding="utf-8").splitlines()[0]
     if not first_line.startswith("#!"):
         raise RuntimeError(f"LAGUNA_VLLM_LAUNCHER_SHEBANG_MISSING:{launcher}")
-    interpreter = Path(first_line[2:].strip()).resolve()
-    prefix = interpreter.parent.parent
+    interpreter = Path(first_line[2:].strip())
+    prefixes = {interpreter.parent.parent, interpreter.resolve().parent.parent}
     candidates = sorted(
         {
-            *prefix.glob("lib/python*/site-packages/vllm/v1/spec_decode/utils.py"),
-            *prefix.glob("lib/python*/dist-packages/vllm/v1/spec_decode/utils.py"),
+            candidate
+            for prefix in prefixes
+            for package_dir in ("site-packages", "dist-packages")
+            for candidate in prefix.glob(
+                f"lib/python*/{package_dir}/vllm/v1/spec_decode/utils.py"
+            )
         }
     )
     if len(candidates) != 1:

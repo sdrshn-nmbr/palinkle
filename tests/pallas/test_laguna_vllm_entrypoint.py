@@ -107,3 +107,29 @@ def test_vllm_source_discovery_uses_launcher_interpreter(tmp_path: Path) -> None
     launcher.write_text(f"#!{interpreter}\n")
     source.write_text(DFLASH_SAMPLE_SOURCE)
     assert _find_vllm_utils_path(launcher) == source
+
+
+def test_vllm_source_discovery_preserves_symlink_prefix(tmp_path: Path) -> None:
+    system = tmp_path / "system"
+    system_python = system / "bin" / "python"
+    system_python.parent.mkdir(parents=True)
+    system_python.write_text("")
+    prefix = tmp_path / "runtime"
+    interpreter = prefix / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.symlink_to(system_python)
+    launcher = prefix / "bin" / "vllm"
+    launcher.write_text(f"#!{interpreter}\n")
+    source = (
+        prefix
+        / "lib"
+        / "python3.12"
+        / "dist-packages"
+        / "vllm"
+        / "v1"
+        / "spec_decode"
+        / "utils.py"
+    )
+    source.parent.mkdir(parents=True)
+    source.write_text(DFLASH_SAMPLE_SOURCE)
+    assert _find_vllm_utils_path(launcher) == source
