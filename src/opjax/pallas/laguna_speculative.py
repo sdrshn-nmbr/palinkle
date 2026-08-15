@@ -498,6 +498,34 @@ def bind_trained_runtime_identity(
     return bound
 
 
+def validate_bound_replay_result(
+    *, result: dict[str, Any], selection: dict[str, Any]
+) -> dict[str, Any]:
+    expected = canonical_sha256(
+        {key: value for key, value in result.items() if key != "result_sha256"}
+    )
+    if result.get("result_sha256") != expected:
+        raise LagunaSpeculativeError("LAGUNA_BOUND_REPLAY_HASH_MISMATCH")
+    arm = selection.get("arm")
+    if result.get("arm") != arm or result.get("model_identity") != selection:
+        raise LagunaSpeculativeError("LAGUNA_BOUND_REPLAY_SELECTION_MISMATCH")
+    evidence = result.get("runtime_evidence")
+    if not isinstance(evidence, dict) or not evidence.get("runtime_sha256"):
+        raise LagunaSpeculativeError("LAGUNA_BOUND_REPLAY_RUNTIME_MISSING")
+    checkpoint = evidence.get("draft_checkpoint") or {}
+    expected_checkpoint = selection.get("checkpoint") or {}
+    if checkpoint != expected_checkpoint:
+        if not (
+            arm == DSPARK
+            and evidence.get("checkpoint_transform")
+            == "normalized_dspark_serving_config"
+            and (checkpoint.get("files") or {}).get("model.safetensors")
+            == (expected_checkpoint.get("files") or {}).get("model.safetensors")
+        ):
+            raise LagunaSpeculativeError("LAGUNA_BOUND_REPLAY_CHECKPOINT_MISMATCH")
+    return evidence
+
+
 def _request(
     *,
     base_url: str,

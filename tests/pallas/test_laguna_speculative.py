@@ -23,6 +23,7 @@ from opjax.pallas.laguna_speculative import (
     select_parity_panel,
     server_command,
     validate_model_manifest,
+    validate_bound_replay_result,
 )
 
 
@@ -106,6 +107,23 @@ def test_runtime_identity_accepts_only_dspark_config_normalization() -> None:
         bound["runtime_evidence"]["checkpoint_transform"]
         == "normalized_dspark_serving_config"
     )
+
+
+def test_live_evidence_requires_hash_bound_replay() -> None:
+    checkpoint = {"sha256": "checkpoint", "files": {"model": "weights"}}
+    selection = {"arm": DFLASH, "checkpoint": checkpoint, "sha256": "selection"}
+    result = bind_trained_runtime_identity(
+        result={"arm": DFLASH, "model_identity": selection},
+        runtime=_runtime(DFLASH, checkpoint),
+        runtime_file_sha256="file",
+        selection=selection,
+    )
+    assert validate_bound_replay_result(result=result, selection=selection)[
+        "runtime_sha256"
+    ]
+    result["runtime_evidence"]["runtime_sha256"] = "drift"
+    with pytest.raises(LagunaSpeculativeError, match="BOUND_REPLAY_HASH_MISMATCH"):
+        validate_bound_replay_result(result=result, selection=selection)
 
 
 def test_model_manifest_pins_all_three_arms() -> None:
