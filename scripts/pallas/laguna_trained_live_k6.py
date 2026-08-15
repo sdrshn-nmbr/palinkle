@@ -7,16 +7,16 @@ from pathlib import Path
 from opjax.pallas.phase31_experiment import load_contract
 from opjax.pallas.phase32_experiment import validate_experiment
 from opjax.pallas.phase3_sampling import sample_sglang_matrix
-from opjax.pallas.laguna_speculative import validate_bound_replay_result
+from opjax.pallas.laguna_speculative import validate_live_serving_evidence
 from opjax.remote.config import modal_proxy_headers
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--endpoint", required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--serving-evidence", type=Path, required=True)
     parser.add_argument("--selection", type=Path, required=True)
+    parser.add_argument("--depth-selection", type=Path, required=True)
     parser.add_argument("--task-ids", default="")
     parser.add_argument("--seeds", default="0,1,2")
     parser.add_argument("--max-concurrency", type=int, default=1)
@@ -45,9 +45,11 @@ def main() -> None:
     args = parser.parse_args()
     selection = json.loads(args.selection.read_text(encoding="utf-8"))
     serving_result = json.loads(args.serving_evidence.read_text(encoding="utf-8"))
-    runtime_evidence = validate_bound_replay_result(
+    depth_selection = json.loads(args.depth_selection.read_text(encoding="utf-8"))
+    serving = validate_live_serving_evidence(
         result=serving_result,
         selection=selection,
+        depth_selection=depth_selection,
     )
     contract = load_contract(
         release_root=args.release_root.resolve(),
@@ -63,9 +65,9 @@ def main() -> None:
         experiment=experiment,
         provider="sglang_openai_laguna",
         output_root=args.output_root.resolve(),
-        base_url=args.endpoint,
+        base_url=serving["endpoint"],
         api_key="EMPTY",
-        runtime_revision=runtime_evidence["runtime_sha256"],
+        runtime_revision=serving["runtime_evidence"]["runtime_sha256"],
         precision="bfloat16",
         task_ids={item for item in args.task_ids.split(",") if item} or None,
         seeds={int(item) for item in args.seeds.split(",") if item},

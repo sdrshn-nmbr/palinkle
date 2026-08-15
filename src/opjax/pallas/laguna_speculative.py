@@ -489,6 +489,7 @@ def bind_trained_runtime_identity(
         "checkpoint_transform": checkpoint_transform,
         "runtime_alignment": alignment,
         "execution_sources": runtime.get("execution_sources"),
+        "resolved_arguments": runtime.get("resolved_arguments"),
         "image": runtime.get("image"),
         "vllm_observed_build": runtime.get("vllm_observed_build"),
     }
@@ -524,6 +525,45 @@ def validate_bound_replay_result(
         ):
             raise LagunaSpeculativeError("LAGUNA_BOUND_REPLAY_CHECKPOINT_MISMATCH")
     return evidence
+
+
+def validate_live_serving_evidence(
+    *,
+    result: dict[str, Any],
+    selection: dict[str, Any],
+    depth_selection: dict[str, Any],
+) -> dict[str, Any]:
+    evidence = validate_bound_replay_result(result=result, selection=selection)
+    expected_depth_hash = canonical_sha256(
+        {key: value for key, value in depth_selection.items() if key != "sha256"}
+    )
+    if depth_selection.get("sha256") != expected_depth_hash:
+        raise LagunaSpeculativeError("LAGUNA_DEPTH_SELECTION_HASH_MISMATCH")
+    arm = selection["arm"]
+    depth = depth_selection.get("selected_depth")
+    cell = f"{arm}-{depth}"
+    if depth_selection.get("arm") != arm or result.get("cell") != cell:
+        raise LagunaSpeculativeError("LAGUNA_LIVE_CELL_MISMATCH")
+    endpoint = result.get("endpoint")
+    if not isinstance(endpoint, str) or not endpoint.startswith("https://"):
+        raise LagunaSpeculativeError("LAGUNA_LIVE_ENDPOINT_INVALID")
+    arguments = evidence.get("resolved_arguments")
+    if not isinstance(arguments, list) or "--speculative-config" not in arguments:
+        raise LagunaSpeculativeError("LAGUNA_LIVE_SPECULATIVE_CONFIG_MISSING")
+    config = json.loads(arguments[arguments.index("--speculative-config") + 1])
+    if (
+        config.get("method") != arm
+        or config.get("num_speculative_tokens") != depth
+        or (arm == DSPARK and config.get("enable_adaptive_verification") is not False)
+    ):
+        raise LagunaSpeculativeError("LAGUNA_LIVE_SPECULATIVE_CONFIG_MISMATCH")
+    return {
+        "arm": arm,
+        "cell": cell,
+        "endpoint": endpoint,
+        "depth_selection_sha256": depth_selection["sha256"],
+        "runtime_evidence": evidence,
+    }
 
 
 def _request(

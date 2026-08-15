@@ -24,6 +24,7 @@ from opjax.pallas.laguna_speculative import (
     server_command,
     validate_model_manifest,
     validate_bound_replay_result,
+    validate_live_serving_evidence,
 )
 
 
@@ -40,6 +41,24 @@ def _runtime(arm: str, checkpoint: dict[str, object] | None) -> dict[str, object
         "execution_sources": {"entrypoint.py": "source"},
         "image": "image",
         "vllm_observed_build": "build",
+        "resolved_arguments": (
+            []
+            if arm == PLAIN
+            else [
+                "--speculative-config",
+                json.dumps(
+                    {
+                        "method": arm,
+                        "num_speculative_tokens": 8,
+                        **(
+                            {"enable_adaptive_verification": False}
+                            if arm == DSPARK
+                            else {}
+                        ),
+                    }
+                ),
+            ]
+        ),
     }
     runtime["sha256"] = canonical_sha256(runtime)
     return runtime
@@ -124,6 +143,40 @@ def test_live_evidence_requires_hash_bound_replay() -> None:
     result["runtime_evidence"]["runtime_sha256"] = "drift"
     with pytest.raises(LagunaSpeculativeError, match="BOUND_REPLAY_HASH_MISMATCH"):
         validate_bound_replay_result(result=result, selection=selection)
+
+
+def test_live_evidence_binds_selected_depth_and_endpoint() -> None:
+    checkpoint = {"sha256": "checkpoint", "files": {"model": "weights"}}
+    selection = {"arm": DFLASH, "checkpoint": checkpoint, "sha256": "selection"}
+    result = bind_trained_runtime_identity(
+        result={
+            "arm": DFLASH,
+            "cell": "dflash-8",
+            "endpoint": "https://dflash-8.example",
+            "model_identity": selection,
+        },
+        runtime=_runtime(DFLASH, checkpoint),
+        runtime_file_sha256="file",
+        selection=selection,
+    )
+    depth_selection = {"arm": DFLASH, "selected_depth": 8}
+    depth_selection["sha256"] = canonical_sha256(depth_selection)
+    serving = validate_live_serving_evidence(
+        result=result,
+        selection=selection,
+        depth_selection=depth_selection,
+    )
+    assert serving["endpoint"] == "https://dflash-8.example"
+    result["cell"] = "dflash-15"
+    result["result_sha256"] = canonical_sha256(
+        {key: value for key, value in result.items() if key != "result_sha256"}
+    )
+    with pytest.raises(LagunaSpeculativeError, match="LAGUNA_LIVE_CELL_MISMATCH"):
+        validate_live_serving_evidence(
+            result=result,
+            selection=selection,
+            depth_selection=depth_selection,
+        )
 
 
 def test_model_manifest_pins_all_three_arms() -> None:
