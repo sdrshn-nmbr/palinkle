@@ -15,6 +15,7 @@ from opjax.pallas.laguna_speculative import (
     PLAIN,
     build_replay_corpus,
     bind_trained_runtime_identity,
+    bind_released_runtime_identity,
     canonical_sha256,
     canonical_response_signature,
     normalize_dspark_config,
@@ -176,6 +177,47 @@ def test_live_evidence_binds_selected_depth_and_endpoint() -> None:
             result=result,
             selection=selection,
             depth_selection=depth_selection,
+        )
+
+
+def test_released_dflash_requires_unmodified_runtime() -> None:
+    manifest = validate_model_manifest()
+    source = {
+        "model": manifest["arms"][DFLASH]["draft_model_id"],
+        "revision": manifest["arms"][DFLASH]["revision"],
+    }
+    runtime = {
+        "arm": DFLASH,
+        "argv": ["--speculative-config", json.dumps(source)],
+        "draft_checkpoint": source,
+        "runtime_alignment": {
+            "state": "not_required_released_checkpoint",
+            "model": source["model"],
+        },
+        "resolved_arguments": [],
+    }
+    runtime["sha256"] = canonical_sha256(runtime)
+    result = {
+        "arm": DFLASH,
+        "model_identity": {"released_manifest_sha256": manifest["manifest_sha256"]},
+    }
+    bound = bind_released_runtime_identity(
+        result=result,
+        runtime=runtime,
+        runtime_file_sha256="file",
+    )
+    assert bound["runtime_evidence"]["draft_source"] == source
+    runtime["runtime_alignment"] = {"state": "applied"}
+    runtime["sha256"] = canonical_sha256(
+        {key: value for key, value in runtime.items() if key != "sha256"}
+    )
+    with pytest.raises(
+        LagunaSpeculativeError, match="LAGUNA_RELEASED_DFLASH_RUNTIME_INVALID"
+    ):
+        bind_released_runtime_identity(
+            result=result,
+            runtime=runtime,
+            runtime_file_sha256="file",
         )
 
 

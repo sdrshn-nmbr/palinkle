@@ -10,12 +10,15 @@ import statistics
 from typing import Any
 import urllib.request
 
+import modal
+
 from opjax.pallas.laguna_dspark_conformance import canonical_sha256
 from opjax.pallas.laguna_dspark_profile import prometheus_values
 from opjax.pallas.laguna_speculative import (
     DFLASH,
     DSPARK,
     PLAIN,
+    bind_released_runtime_identity,
     run_replay_benchmark,
     warm_replay_endpoint,
 )
@@ -36,6 +39,33 @@ CELLS = {
         for depth in (4, 8, 12, 15)
     },
 }
+ARTIFACT_VOLUME = "opjax-laguna-speculative-artifacts-v1"
+MODAL_ENVIRONMENT = "main"
+
+
+def _runtime_path(cell: str) -> str:
+    if cell == "plain":
+        return "plain/20260814-rope-corrected-released-plain/runtime.json"
+    arm, depth = cell.split("-", maxsplit=1)
+    if arm == DFLASH:
+        return "dflash/20260814-rope-corrected-released-dflash/runtime.json"
+    return f"dspark/20260814-rope-corrected-released-dspark-fixed-{depth}/runtime.json"
+
+
+def _bind_runtime(cell: str, result: dict[str, Any]) -> dict[str, Any]:
+    volume = modal.Volume.from_name(
+        ARTIFACT_VOLUME,
+        environment_name=MODAL_ENVIRONMENT,
+        version=1,
+    )
+    raw = b"".join(volume.read_file(_runtime_path(cell)))
+    if not raw:
+        raise ValueError(f"LAGUNA_RELEASED_RUNTIME_EVIDENCE_EMPTY:{cell}")
+    return bind_released_runtime_identity(
+        result=result,
+        runtime=json.loads(raw),
+        runtime_file_sha256=hashlib.sha256(raw).hexdigest(),
+    )
 
 
 def _write(path: Path, value: dict[str, Any]) -> None:
@@ -190,6 +220,7 @@ def _summary(root: Path, corpus: dict[str, Any]) -> dict[str, Any]:
             "file_sha256": hashlib.sha256(
                 (root / f"{cell}.json").read_bytes()
             ).hexdigest(),
+            "runtime_evidence": result["runtime_evidence"],
         }
     summary: dict[str, Any] = {
         "schema_version": 1,
@@ -227,8 +258,18 @@ def main() -> None:
         help="Comma-separated cells to execute. Summary is written only when all cells exist.",
     )
     parser.add_argument("--summarize-only", action="store_true")
+    parser.add_argument("--finalize-existing", action="store_true")
     args = parser.parse_args()
     corpus = json.loads(args.corpus.read_text(encoding="utf-8"))
+    if args.finalize_existing:
+        for cell in CELLS:
+            path = args.output_root / f"{cell}.json"
+            result = _bind_runtime(cell, json.loads(path.read_text()))
+            _write(path, result)
+        summary = _summary(args.output_root, corpus)
+        _write(args.output_root / "summary.json", summary)
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        return
     if args.summarize_only:
         summary = _summary(args.output_root, corpus)
         _write(args.output_root / "summary.json", summary)
@@ -264,9 +305,7 @@ def main() -> None:
         result["cell"] = cell
         result["endpoint"] = endpoint
         result["prometheus_delta"] = _delta(before, after)
-        result["result_sha256"] = canonical_sha256(
-            {key: value for key, value in result.items() if key != "result_sha256"}
-        )
+        result = _bind_runtime(cell, result)
         _write(args.output_root / f"{cell}.json", result)
         return cell, result["output_tps"]
 

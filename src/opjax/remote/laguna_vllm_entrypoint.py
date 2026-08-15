@@ -71,13 +71,19 @@ def _prepare_dspark_snapshot(
     return destination
 
 
-def _rewrite_speculative_config(arguments: list[str]) -> tuple[list[str], str]:
+def _rewrite_speculative_config(
+    arguments: list[str],
+) -> tuple[list[str], str, dict[str, Any] | None]:
     rewritten = list(arguments)
     if "--speculative-config" not in rewritten:
-        return rewritten, "plain"
+        return rewritten, "plain", None
     index = rewritten.index("--speculative-config") + 1
     config: dict[str, Any] = json.loads(rewritten[index])
     method = str(config.get("method"))
+    source = {
+        "model": str(config["model"]),
+        "revision": config.get("revision"),
+    }
     if method == "dspark":
         snapshot = _prepare_dspark_snapshot(
             root=Path("/tmp/opjax-dspark"),
@@ -87,7 +93,7 @@ def _rewrite_speculative_config(arguments: list[str]) -> tuple[list[str], str]:
         config["model"] = str(snapshot)
         config.pop("revision", None)
     rewritten[index] = json.dumps(config, sort_keys=True, separators=(",", ":"))
-    return rewritten, method
+    return rewritten, method, source
 
 
 def _start_gpu_telemetry(*, artifact_dir: Path) -> None:
@@ -232,6 +238,7 @@ def _write_runtime_fingerprint(
     arm: str,
     arguments: list[str],
     runtime_alignment: dict[str, Any] | None,
+    draft_source: dict[str, Any] | None,
 ) -> None:
     artifact_dir.mkdir(parents=True, exist_ok=True)
     version_result = subprocess.run(
@@ -262,6 +269,7 @@ def _write_runtime_fingerprint(
         "argv": sys.argv,
         "resolved_arguments": arguments,
         "draft_checkpoint": _checkpoint_identity(arguments),
+        "draft_source": draft_source,
         "runtime_alignment": runtime_alignment,
         "execution_sources": {
             str(path.relative_to(Path(__file__).parents[2])): hashlib.sha256(
@@ -278,7 +286,7 @@ def _write_runtime_fingerprint(
 
 
 def main() -> None:
-    arguments, arm = _rewrite_speculative_config(sys.argv[1:])
+    arguments, arm, draft_source = _rewrite_speculative_config(sys.argv[1:])
     runtime_alignment = _apply_runtime_alignment(arm, arguments)
     artifact_root = Path(os.environ.get("OPJAX_SPEC_ARTIFACT_ROOT", "/tmp/opjax-spec"))
     run_id = os.environ.get("OPJAX_SPEC_RUN_ID") or uuid.uuid4().hex
@@ -288,6 +296,7 @@ def main() -> None:
         arm=arm,
         arguments=arguments,
         runtime_alignment=runtime_alignment,
+        draft_source=draft_source,
     )
     _start_gpu_telemetry(artifact_dir=artifact_dir)
     _start_artifact_commits()

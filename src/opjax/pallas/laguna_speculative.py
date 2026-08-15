@@ -566,6 +566,74 @@ def validate_live_serving_evidence(
     }
 
 
+def bind_released_runtime_identity(
+    *,
+    result: dict[str, Any],
+    runtime: dict[str, Any],
+    runtime_file_sha256: str,
+) -> dict[str, Any]:
+    expected_runtime_sha256 = canonical_sha256(
+        {key: value for key, value in runtime.items() if key != "sha256"}
+    )
+    if runtime.get("sha256") != expected_runtime_sha256:
+        raise LagunaSpeculativeError("LAGUNA_RELEASED_RUNTIME_HASH_MISMATCH")
+    arm = result.get("arm")
+    if runtime.get("arm") != arm:
+        raise LagunaSpeculativeError("LAGUNA_RELEASED_RUNTIME_ARM_MISMATCH")
+    manifest = validate_model_manifest()
+    expected_identity = {"released_manifest_sha256": manifest["manifest_sha256"]}
+    if result.get("model_identity") != expected_identity:
+        raise LagunaSpeculativeError("LAGUNA_RELEASED_MODEL_IDENTITY_MISMATCH")
+    checkpoint = runtime.get("draft_checkpoint")
+    alignment = runtime.get("runtime_alignment")
+    argv = runtime.get("argv")
+    if arm == PLAIN:
+        if checkpoint is not None or alignment is not None:
+            raise LagunaSpeculativeError("LAGUNA_RELEASED_PLAIN_RUNTIME_INVALID")
+        source = None
+    else:
+        if not isinstance(argv, list) or "--speculative-config" not in argv:
+            raise LagunaSpeculativeError("LAGUNA_RELEASED_SOURCE_CONFIG_MISSING")
+        source_config = json.loads(argv[argv.index("--speculative-config") + 1])
+        expected_arm = manifest["arms"][arm]
+        source = {
+            "model": source_config.get("model"),
+            "revision": source_config.get("revision"),
+        }
+        if source != {
+            "model": expected_arm["draft_model_id"],
+            "revision": expected_arm["revision"],
+        }:
+            raise LagunaSpeculativeError("LAGUNA_RELEASED_SOURCE_IDENTITY_MISMATCH")
+        if arm == DFLASH:
+            if checkpoint != source or not isinstance(alignment, dict) or alignment.get(
+                "state"
+            ) != "not_required_released_checkpoint":
+                raise LagunaSpeculativeError("LAGUNA_RELEASED_DFLASH_RUNTIME_INVALID")
+        elif (
+            not isinstance(checkpoint, dict)
+            or not (checkpoint.get("files") or {}).get("model.safetensors")
+            or alignment is not None
+        ):
+            raise LagunaSpeculativeError("LAGUNA_RELEASED_DSPARK_RUNTIME_INVALID")
+    bound = dict(result)
+    bound["runtime_evidence"] = {
+        "runtime_sha256": runtime["sha256"],
+        "runtime_file_sha256": runtime_file_sha256,
+        "draft_source": source,
+        "draft_checkpoint": checkpoint,
+        "runtime_alignment": alignment,
+        "resolved_arguments": runtime.get("resolved_arguments"),
+        "execution_sources": runtime.get("execution_sources"),
+        "image": runtime.get("image"),
+        "vllm_observed_build": runtime.get("vllm_observed_build"),
+    }
+    bound["result_sha256"] = canonical_sha256(
+        {key: value for key, value in bound.items() if key != "result_sha256"}
+    )
+    return bound
+
+
 def _request(
     *,
     base_url: str,
