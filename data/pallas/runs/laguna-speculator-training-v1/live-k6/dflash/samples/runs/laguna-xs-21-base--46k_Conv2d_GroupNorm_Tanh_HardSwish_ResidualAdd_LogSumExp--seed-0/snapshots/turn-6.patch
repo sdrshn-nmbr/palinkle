@@ -1,0 +1,107 @@
+diff --git a/__pycache__/kernel.cpython-312.pyc b/__pycache__/kernel.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..f0da87a04f3bb2094f1e68f641bf1f4dc1e16ab3
+GIT binary patch
+literal 2235
+zcmah}O=ufe5PqwbRzIs<SwFVZ#33~_B%;J=+B%pz4ONw@&JS+gq_Ha!)Q#RoT6wkF
+z?8>oXR#b%^?2~N>Sb;))DhduXJrq(XG|)?+7YhYyUK(0RFTSNXhtgB$tt5NX81j(j
+z&CHvbZ|2Rs{Z$YG2v+r%FAB%J2tA=fcey&u*2loCAdE1hqI7#_imo)vw0U>YllF9Y
+zuISCW7*zD7{T)pp&D);AVjwMm&h-^ai#M1!yGg^3XFVMhy7}PG!hh>?pn%9!J=j&{
+z$_zcEtI*A<E!xyVm|g4WtKOH`GT6Os>nm?#7dS`24r_TWANF7ld++$xI+j(x<#!;^
+zeE+vB7xs4%=HRUAwBIdzKMr*5Y4n2KkLQD4azmUzm9GY?!b{NoR>1ODyyck#EGuXU
+zS3TR&k;6CmJOY*A9(f$RBdpO5z^aN4d$Fx^(iiMQ7P7=S$lu}D<Me3rR><P$&8&60
+zI>!T+(`UC^MNk)S*R#_<$k>6jn-_~ki^n1suWozIK__40<=({$@~!qb{35&5)zhu0
+z8n(g?+t`b?j?=yuPpvQx(Hp`&-QMAFm!tXPuzhC{%Wp;O8H<)*=|(B+?Q%Q26@@!+
+zb~a|k&ZBr_e3P~(_jmru{15;9bu#WY=zwn8gbu+b?GR|`@Ei1n81RWewo%;G=Ba{s
+zE+)>MJ{4z)dwgs%N!(+Tr#~|MZ~`iER?%>2He;3z1<NM!>Jr9^mLp-T6lKj+N?Jyn
+zDPEBc6Oioq+hp@S8l#<+1D~c7XLqvNgy(@S#9hQKRTPu>re#@&;AT6Towr>Q<>De?
+z3z|;+Wkb?Ty=2OSRiz4vWlP%iOitEhLsBzXQKhnsiPw<Lyrj#-)85=gS<(o5T{4K<
+zyk?Y%yDVvW;w>tgQk*FQ0~t_;Etr6zmU8AyQLgCmUcyueZ)42LN-kd}ep|SrNG9>;
+zv`k0q1=iMaIiobAn}n5taFvXfpUo0(S~fIUr84y<%s63^gc&2uq(KM3puM-POGc6I
+zc6Px^CNCK{W6mmOo_H!5D2niv%yxEWFSxzB+xj<lbhczno4S;hkG8>w^c%!Sm1;@C
+z#xQu&Mw{QlsMOGg5UQm%0-;*+8HdF1;^l?Q^<#ClCA?ls?Px|D!Im)G(flSHYzhZA
+zd?Nkz@89U@-`M-+GoBN<TIy*8iLsm6mFeZ_)p+A_t8cU^j5;G7Up>(h-T*@mMfR)=
+zEDwBnrk1E(n;)E?062eekze4KQuT>duE8`e-sbO4++)@U-f8(pYY8w2h89N_MwSxw
+z(|6qu`Qh5B-vh$pp@l<BgY|d=KMcH8OG4xTKYw9i&&~5IQ_EBJ>}v9s(&|0j^c}WC
+zbTATi1`3r{!%J4n_gXChZer+WbY<W2zWQg4a3j&Uc6SiU4i7hl;h)%_`5*cFA3l)Q
+zCq7xf@ag*G)PqZ{k#ti?cZ-`^m|D8p6877r#rA%k{O0Vfvv=6<c&H(DZ{qti_nFq=
+z_wOfK1F2>-^&s4go~fM!P$9Z>sTmxseE`)(`&N!DA6fM@68GE>Bk$JE{>k^PyZg4F
+zT__%c5rwh$0~vzn2Tk?Zn-PUm;-zYM76zRR5~h-wRrDJ}rY>g{Nrm@7MdIzq#sO-_
+z>5{6#JiBz22=Ls?C2gpq^5|+=pRvc~HZqQbwedD}@tr7^@Qf;-G?F0F&y7h#J!Kh&
+fd4vLwQU7Dq`v*F(jt)FR(Z^{27B|B5+X4OqEF<_f
+
+literal 0
+HcmV?d00001
+
+diff --git a/kernel.py b/kernel.py
+index a877f2f..acf1fa2 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,65 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.lax as lax
++import jax.scipy.special as jsp
++import pallas as pl
++import triton.pallas as pltpu
++
++
++def workload(x, conv_weight, conv_bias, gn_weight, gn_bias):
++    groups = 16
++    eps = 1e-05
++    
++    # Transpose x from NCHW to NHWC
++    x_nhwc = jnp.transpose(x, (0, 2, 3, 1))
++    
++    # Transpose kernel from OIHW to HWIO
++    kernel = jnp.transpose(conv_weight, (2, 3, 1, 0))
++    
++    # Conv2d with VALID padding
++    x_conv = lax.conv_general_dilated(
++        x_nhwc,
++        kernel,
++        window_strides=(1, 1),
++        padding="VALID",
++        dimension_numbers=("NHWC", "HWIO", "NHWC")
++    )
++    
++    # Add bias (reshape to broadcast)
++    x_conv = x_conv + jnp.reshape(conv_bias, (1, 1, 1, 64))
++    
++    # Transpose back to NCHW
++    x_conv = jnp.transpose(x_conv, (0, 3, 1, 2))
++    
++    # Get shape
++    N, C, H, W = x_conv.shape
++    
++    # Reshape for group norm: (N, groups, C//groups, H, W)
++    x = jnp.reshape(x_conv, (N, groups, C // groups, H, W))
++    
++    # GroupNorm: compute mean and variance over H, W, and C//groups dimensions
++    mean = jnp.mean(x, axis=(2, 3, 4), keepdims=True)
++    var = jnp.var(x, axis=(2, 3, 4), keepdims=True)
++    
++    # Normalize
++    x = (x - mean) / jnp.sqrt(var + eps)
++    
++    # Reshape back to (N, C, H, W)
++    x = jnp.reshape(x, (N, C, H, W))
++    
++    # Apply gamma and beta (scale and shift)
++    x_norm = x * jnp.reshape(gn_weight, (1, C, 1, 1)) + jnp.reshape(gn_bias, (1, C, 1, 1))
++    
++    # Tanh
++    x_tanh = jnp.tanh(x_norm)
++    
++    # HardSwish: x * clip(x + 3, 0, 6) / 6
++    x_hard_swish = x_tanh * jnp.minimum(jnp.maximum(x_tanh + 3, 0), 6) / 6
++    
++    # Residual add
++    x_res = x_conv + x_hard_swish
++    
++    # LogSumExp over axis 1 (channel dimension)
++    x_logsumexp = jsp.logsumexp(x_res, axis=1, keepdims=True)
++    
++    return x_logsumexp

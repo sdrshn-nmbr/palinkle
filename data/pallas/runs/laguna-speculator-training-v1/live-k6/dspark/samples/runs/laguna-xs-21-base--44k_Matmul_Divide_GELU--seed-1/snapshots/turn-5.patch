@@ -1,0 +1,57 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..eb7eca5 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,50 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as plp
++import jaxlib.xla_extension as pltpu
++
++
++def matmul_divide_gelu_kernel(x_ref, weight_ref, bias_ref, out_ref):
++    """Pallas kernel for Matmul + Divide + GELU."""
++    m, k = x_ref.shape
++    k2, n = weight_ref.shape
++    
++    # Accumulate matmul result in float32 for better precision
++    acc = jnp.zeros((m, n), dtype=jnp.float32)
++    
++    # Perform matmul with accumulation
++    for i in range(k):
++        acc = acc + x_ref[:, i] * weight_ref[i, :]
++    
++    # Add bias (broadcast along first dimension)
++    acc = acc + bias_ref[None, :]
++    
++    # Divide by 10.0
++    acc = acc / 10.0
++    
++    # Apply GELU
++    acc = jax.nn.gelu(acc)
++    
++    # Write result back as bfloat16
++    out_ref[...] = acc.astype(jnp.bfloat16)
++
++
++def workload(x, weight, bias):
++    """Compute Matmul + Divide + GELU."""
++    block_size = 128  # Block size for tiling
++    
++    return pl.pallas_call(
++        matmul_divide_gelu_kernel,
++        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
++        grid=(x.shape[0] // block_size, x.shape[1] // block_size),
++        in_specs=(
++            pl.BlockSpec((block_size, block_size), lambda i, j: (i * block_size, j * block_size)),
++            pl.BlockSpec((block_size, block_size), lambda i, j: (i * block_size, j * block_size)),
++            pl.BlockSpec((block_size,), lambda i, j: (j * block_size,)),
++        ),
++        out_specs=pl.BlockSpec((block_size, block_size), lambda i, j: (i * block_size, j * block_size)),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel", "parallel")
++        ),
++    )(x, weight, bias)

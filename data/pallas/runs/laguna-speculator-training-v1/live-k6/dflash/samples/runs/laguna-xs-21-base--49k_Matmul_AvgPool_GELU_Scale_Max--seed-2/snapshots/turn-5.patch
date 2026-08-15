@@ -1,0 +1,60 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..1b97a74 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,53 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as plp
++import jax.interpreters.pallas as pallas
++import jax.random as random
++
++def workload(x, weight, bias):
++    """
++    Implements: Matmul + AvgPool1d + GELU + Scale + Max
++    
++    Args:
++        x: shape (4096, 8192), dtype bfloat16
++        weight: shape (8192, 8192), dtype bfloat16
++        bias: shape (8192,), dtype bfloat16
++    
++    Returns:
++        shape (4096,), dtype bfloat16
++    """
++    pool_kernel_size = 16
++    scale_factor = 2.0
++    
++    # Matmul: (4096, 8192) @ (8192, 8192) -> (4096, 8192)
++    # Add bias: (4096, 8192) + (8192,) -> (4096, 8192)
++    x_matmul = jnp.dot(x, weight) + bias
++    
++    # Expand dims to (4096, 1, 8192) for 1D pooling along last axis
++    x_expanded = jnp.expand_dims(x_matmul, axis=1)
++    
++    # AvgPool1d with kernel size 16, stride 16, VALID padding
++    # reduce_window with sum, then divide by kernel_size
++    pooled = jax.lax.reduce_window(
++        x_expanded,
++        init_value=0.0,
++        computation=jax.lax.add,
++        window_dimensions=(1, 1, pool_kernel_size),
++        window_strides=(1, 1, pool_kernel_size),
++        padding='VALID'
++    ) / pool_kernel_size
++    
++    # Squeeze to (4096, 8192)
++    x_squeezed = jnp.squeeze(pooled, axis=1)
++    
++    # GELU activation
++    x_gelu = jax.nn.gelu(x_squeezed)
++    
++    # Scale by 2.0
++    x_scaled = x_gelu * scale_factor
++    
++    # Max along axis 1 -> (4096,)
++    result = jnp.max(x_scaled, axis=1)
++    
++    return result

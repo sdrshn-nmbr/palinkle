@@ -1,0 +1,81 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as plp
+import jax.interpreters.tpu as pltpu
+
+def workload(x, weight, bias):
+    """Matmul + Dropout (skipped in inference) + Softmax kernel."""
+    batch_size, in_features = x.shape
+    out_features = weight.shape[1]
+    
+    # Block sizes for TPU - multiples of 8 for bf16, 128 for vectorized dims
+    block_m = 128  # tile along batch dimension
+    block_k = 128  # tile along reduction dimension
+    block_n = 128  # tile along output dimension
+    
+    def matmul_softmax_kernel(x_ref, weight_ref, bias_ref, out_ref, 
+                               x_scratch, weight_scratch):
+        """Kernel that performs matmul and softmax."""
+        m = pl.program_id(0)  # batch block index
+        n = pl.program_id(1)  # output block index
+        
+        # Accumulate in float32 for better precision
+        acc = jnp.zeros((block_m, block_n), dtype=jnp.float32)
+        
+        # Matmul: x @ weight.T + bias
+        for k in range(0, in_features, block_k):
+            # Load x block [block_m, block_k]
+            x_block = x_ref[
+                m * block_m:(m + 1) * block_m,
+                k:min(k + block_k, in_features)
+            ]
+            
+            # Load weight block [block_k, block_n] (transposed)
+            weight_block = weight_ref[
+                k:min(k + block_k, in_features),
+                n * block_n:(n + 1) * block_n
+            ]
+            
+            # Compute partial matmul in float32
+            acc = acc + jnp.dot(x_block.astype(jnp.float32), 
+                               weight_block.astype(jnp.float32))
+        
+        # Add bias
+        bias_block = bias_ref[n * block_n:(n + 1) * block_n]
+        acc = acc + bias_block
+        
+        # Softmax along axis 1 (features dimension)
+        # For each row in the output block
+        max_val = jnp.max(acc, axis=1, keepdims=True)
+        shifted = acc - max_val
+        exp_shifted = jnp.exp(shifted)
+        sum_exp = jnp.sum(exp_shifted, axis=1, keepdims=True)
+        softmax_result = exp_shifted / sum_exp
+        
+        # Write output back to bfloat16
+        out_ref[m * block_m:(m + 1) * block_m, 
+                n * block_n:(n + 1) * block_n] = softmax_result.astype(jnp.bfloat16)
+    
+    # Calculate grid dimensions
+    num_m_blocks = (batch_size + block_m - 1) // block_m
+    num_n_blocks = (out_features + block_n - 1) // block_n
+    
+    return pl.pallas_call(
+        matmul_softmax_kernel,
+        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+        grid=(num_m_blocks, num_n_blocks),
+        in_specs=(
+            pl.BlockSpec((block_m, block_k), lambda m, n, k, i: (m * block_m, k * block_k)),
+            pl.BlockSpec((block_k, block_n), lambda m, n, k, i: (k * block_k, n * block_n)),
+            pl.BlockSpec((block_n,), lambda m, n, k, i: (n * block_n,)),
+        ),
+        out_specs=pl.BlockSpec((block_m, block_n), lambda m, n, k, i: (m * block_m, n * block_n)),
+        scratch_shapes=(
+            (block_m, block_k),  # scratch for x
+            (block_k, block_n),  # scratch for weight
+        ),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel")
+        ),
+    )(x, weight, bias)

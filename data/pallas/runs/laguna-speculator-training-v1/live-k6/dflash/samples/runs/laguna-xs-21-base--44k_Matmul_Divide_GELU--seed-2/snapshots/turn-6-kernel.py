@@ -1,0 +1,80 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas.lib as pllib
+import jax.pallas.tpu as pltpu
+
+
+def workload(x, weight, bias):
+    """Matmul + Divide + GELU kernel.
+    
+    Computes: gelu((x @ weight + bias) / 10.0)
+    """
+    batch_size = x.shape[0]
+    input_size = x.shape[1]
+    output_size = weight.shape[1]
+    
+    # Block sizes for TPU - need to be multiples of 8 for bf16
+    # and 128 for vectorized dimensions
+    block_m = 128  # block size for batch dimension
+    block_k = 128  # block size for reduction dimension
+    block_n = 128  # block size for output dimension
+    
+    def kernel(ref_x, ref_weight, ref_bias, ref_out):
+        # Get program IDs
+        m_idx = pl.program_id(0)
+        n_idx = pl.program_id(1)
+        
+        # Compute tile offsets
+        m_start = m_idx * block_m
+        n_start = n_idx * block_n
+        
+        # Initialize accumulator in float32 for better precision
+        acc = jnp.zeros((block_m, block_n), dtype=jnp.float32)
+        
+        # Matmul kernel: accumulate over k dimension
+        for k_idx in range(input_size // block_k):
+            k_start = k_idx * block_k
+            
+            # Load tiles from x and weight
+            x_tile = ref_x[m_start:m_start + block_m, k_start:k_start + block_k]
+            w_tile = ref_weight[k_start:k_start + block_k, n_start:n_start + block_n]
+            
+            # Convert to float32 for accumulation
+            x_f32 = x_tile.astype(jnp.float32)
+            w_f32 = w_tile.astype(jnp.float32)
+            
+            # Accumulate
+            acc = acc + jnp.dot(x_f32, w_f32)
+        
+        # Add bias (broadcast along batch dimension)
+        bias_tile = ref_bias[n_start:n_start + block_n]
+        acc = acc + bias_tile[None, :]  # Broadcast bias
+        
+        # Divide by 10.0
+        acc = acc / 10.0
+        
+        # Apply GELU
+        acc = jax.nn.gelu(acc)
+        
+        # Convert back to bfloat16 and write output
+        ref_out[m_start:m_start + block_m, n_start:n_start + block_n] = acc.astype(jnp.bfloat16)
+    
+    # Grid dimensions
+    grid_m = (batch_size + block_m - 1) // block_m
+    grid_n = (output_size + block_n - 1) // block_n
+    
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((batch_size, output_size), jnp.bfloat16),
+        grid=(grid_m, grid_n),
+        in_specs=(
+            pl.BlockSpec((block_m, block_k), lambda m, n, k: (m * block_m, k * block_k)),
+            pl.BlockSpec((block_k, block_n), lambda m, n, k: (k * block_k, n * block_n)),
+            pl.BlockSpec((block_n,), lambda m, n, k: (n * block_n,)),
+        ),
+        out_specs=pl.BlockSpec((block_m, block_n), lambda m, n, k: (m * block_m, n * block_n)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel")
+        ),
+    )(x, weight, bias)

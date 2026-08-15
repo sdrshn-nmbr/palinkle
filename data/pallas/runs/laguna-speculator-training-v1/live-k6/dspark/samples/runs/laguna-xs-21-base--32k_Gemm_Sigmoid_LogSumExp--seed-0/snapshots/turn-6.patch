@@ -1,0 +1,85 @@
+diff --git a/__pycache__/kernel.cpython-312.pyc b/__pycache__/kernel.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..d89403d6a96db9712359beba5df78745905199e0
+GIT binary patch
+literal 2319
+zcmcIlO>7%Q6rNps*K5b?G;Y&4p`;E!B`zUVLy!=ZNClc!rHYyc5;YRBHr}=C?XGt<
+zyH<X*5f%a|mMYoh68F?rJ&-7sXisq9$c>ZbL#iQ2Nc2*PLqu}o#GCzz11jl>k$2vk
+z_h#RFJ8!<vKZ{}v!Fce~7wR8jgnp-sV6eWjdk&N}BqN#8(5xpJot+Iao*ve@S^j_?
+z0iFE{%?fe|=I9cW2|uHuCUU$VkqXF$Lh$V785-S&*&Aw*H!y&dnN8on!aK;}Wmaat
+zX7g+>_*Nn|7i?7zX7G(p#9>q+*wL1oejbNi2IGogyC*^YYP`KG(A3UAYfDGiuS$49
+z4T2Low1%)-L-armN7{J;O-%+`TdLh{J<y!!eqAvq=5P*AJGjJVLd&C9B~6p8^i2hq
+z6fK=MaQdR6>*+VsQ^kUA6lKtS!xf`2Rn{*on!}i$)I_F(u%<?0CN>IK(z8XGgw&Er
+zLb72K=2KWmi-aweNW}6&5zfjL%_UfyO0FnrB&rz&tE?-FCdA?vvslR!e&MVq=Y6>_
+z;;%g!G0L`UV2bW5#scAQ6lGZ{kr=p4>ZLZUSY^$&I-t^Yd;E3m%z}Y$TBej!&UoKE
+z3>ER7ieG}=5qPXyFjde~AyyNsVqIzpsml2s9*N2Nz&Dfi*Q%dXF6{9r(N&wN&eT6^
+zjNiR<=Tb|2eVuQL!<F%E@knjDI$fKq&Naqc;;WT$*qrQM>$%<2IDYT=x2gN7R@dqE
+z>1Nm4mCIh7>(%R9Vt-TY-x3F#;^2B;OB}6?|JK!0xwv}%%geh^56bOdYgo_^bK$b>
+z!i9YSU~CF6ci8j;-SNB&=pc3f+6Vh6+$gZ}40xXdg?->0`tAWhC)$w%O=kZivkU1w
+zOQ|EsV+SuG^*NyU|Gatb1>X>sxdT-m4a!uH1zKCm{KH59%7?<HPg6i;jKex1C%ozR
+zdJ1Kt%WurUoz)CUcJVp-PL?7v>jO0VFI+yO#F*P>Pgqd2(qeXLXV;Je?aZ?fn4NHe
+zyn!|tOj*OCFQsuG%tSb+N&37jjV<?4z|iEw=QJZHY1SAhp6?a<5@pf~dNlb1^LQMe
+zfJKJE{UH8P0*&mJKzGv;@(dKfOyD%E@c>K*l4Bb8u)KqGKRq(Y%WT+wRw9@Z1~yZ)
+z3`35}MO`UbMWd9p6kRIW#hjJlNR+aNbwe^05-wn1ETIS+fQ~HR<*J=ILpO_>g0nQD
+zZe=<!g%9a4U9!x=DQGTN;3zd8nW6zdwwFw0%EslK4MgXr;ACne(GTI^ZcagHB9@Ho
+zJYBg-31@1+SS0b0pYN)djw1{(=fYXS&cm}X0&>Kn7s4enzd=D;@Vnrk#AW>mQw8mW
+zJLCMVk=j^wY+FcdC%d<jr<%!A>&$nNjR+i9?B2>F>HEUtLMu7;B+*$bR10;fs;++i
+zG@htksa|OeG$!xP+?lyId1tn9vU&QwR{Z_#cw#Glq8UGNh_chcCu4gFbhLYI==M;<
+zzCYJWj&7%3-bxKMQ$tVEZ|#NH-q>C*RJYTQBEo8N^;$hyzqWg_Gv2#{I=No2k1_91
+zqww!BTq^6p&YUYSZ8(Whv)2Z~d(!O<J_}y2C-gkLdqr<!aGiBSE^Epd{s3(BHd^$^
+cc0vrp{DNY?q8|6x_b1=Qq;?0p7_XSW0W<~UjsO4v
+
+literal 0
+HcmV?d00001
+
+diff --git a/kernel.py b/kernel.py
+index a877f2f..30c4d1d 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,44 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as pltpu
++
++
++def kernel(x_ref, w1_ref, b1_ref, w2_ref, b2_ref, out_ref):
++    """Pallas kernel for Gemm + Sigmoid + Gemm + LogSumExp."""
++    i = pl.program_id(0)
++    
++    # Load the entire row of x
++    x_row = x_ref[i, :]
++    
++    # First matmul: x @ w1.T + b1
++    hidden = jnp.dot(x_row, w1_ref.T) + b1_ref
++    hidden = jax.nn.sigmoid(hidden)
++    
++    # Second matmul: hidden @ w2.T + b2
++    output_row = jnp.dot(hidden, w2_ref.T) + b2_ref
++    
++    # LogSumExp
++    result = jax.scipy.special.logsumexp(output_row)
++    
++    out_ref[i] = result
++
++
++def workload(x, w1, b1, w2, b2):
++    """Workload for 45_Gemm_Sigmoid_LogSumExp."""
++    return pl.pallas_call(
++        kernel,
++        out_shape=jax.ShapeDtypeStruct((x.shape[0],), x.dtype),
++        grid=(x.shape[0],),
++        in_specs=(
++            pl.BlockSpec((1, x.shape[1]), lambda i: (i, 0)),  # x
++            pl.no_block_spec,  # w1
++            pl.no_block_spec,  # b1
++            pl.no_block_spec,  # w2
++            pl.no_block_spec,  # b2
++        ),
++        out_specs=pl.BlockSpec((1,), lambda i: (i,)),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel",)
++        ),
++    )(x, w1, b1, w2, b2)

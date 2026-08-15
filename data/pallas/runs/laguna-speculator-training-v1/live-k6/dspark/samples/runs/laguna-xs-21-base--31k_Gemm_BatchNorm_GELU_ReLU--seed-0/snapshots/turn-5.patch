@@ -1,0 +1,105 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..2ffb5b1 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,98 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as plp
++import jax.interpreters.pallas as pj
++import jax.numpy as jnp
++
++def workload(x, gemm_weight, gemm_bias, bn_weight, bn_bias):
++    """GEMM + BatchNorm + GELU + ReLU kernel."""
++    
++    # Constants
++    eps = 1e-5
++    
++    # Block size for tiling
++    BLOCK_M = 128
++    BLOCK_K = 128
++    BLOCK_N = 128
++    
++    M, K = x.shape
++    _, N = gemm_weight.shape
++    
++    def kernel(ref_x, ref_gemm_weight, ref_gemm_bias, ref_bn_weight, ref_bn_bias, out_ref):
++        # Get program IDs
++        m_block = pl.program_id(0)
++        n_block = pl.program_id(1)
++        
++        # Compute tile offsets
++        m_start = m_block * BLOCK_M
++        n_start = n_block * BLOCK_N
++        
++        # Initialize accumulator for GEMM result in float32
++        acc = pj.zeros((BLOCK_M, BLOCK_N), dtype=jnp.float32)
++        
++        # GEMM: x @ gemm_weight
++        for k_block in range(K // BLOCK_K):
++            k_start = k_block * BLOCK_K
++            
++            # Load x tile [BLOCK_M, BLOCK_K]
++            x_tile = ref_x[m_start:m_start + BLOCK_M, k_start:k_start + BLOCK_K]
++            # Load weight tile [BLOCK_K, BLOCK_N]
++            w_tile = ref_gemm_weight[k_start:k_start + BLOCK_K, n_start:n_start + BLOCK_N]
++            
++            # Convert to float32 for accumulation
++            x_f32 = x_tile.astype(jnp.float32)
++            w_f32 = w_tile.astype(jnp.float32)
++            
++            # Accumulate
++            acc = acc + jnp.dot(x_f32, w_f32)
++        
++        # Add bias
++        bias_tile = ref_gemm_bias[n_start:n_start + BLOCK_N]
++        acc = acc + bias_tile.astype(jnp.float32)
++        
++        # Convert back to bfloat16 for BatchNorm
++        acc_bf16 = acc.astype(jnp.bfloat16)
++        
++        # BatchNorm: (x - mean) / sqrt(var + eps) * bn_weight + bn_bias
++        # Compute mean and variance along axis 0 (batch dimension)
++        mean = jnp.mean(acc_bf16, axis=0, keepdims=True)
++        var = jnp.mean((acc_bf16 - mean) ** 2, axis=0, keepdims=True)
++        
++        # Normalize
++        normalized = (acc_bf16 - mean) / jnp.sqrt(var + eps)
++        
++        # Scale and shift
++        bn_w = ref_bn_weight[n_start:n_start + BLOCK_N]
++        bn_b = ref_bn_bias[n_start:n_start + BLOCK_N]
++        bn_out = normalized * bn_w + bn_b
++        
++        # GELU
++        gelu_out = jax.nn.gelu(bn_out)
++        
++        # ReLU
++        relu_out = jax.nn.relu(gelu_out)
++        
++        # Write output
++        out_ref[m_start:m_start + BLOCK_M, n_start:n_start + BLOCK_N] = relu_out.astype(jnp.bfloat16)
++    
++    # Grid dimensions
++    num_m_blocks = (M + BLOCK_M - 1) // BLOCK_M
++    num_n_blocks = (N + BLOCK_N - 1) // BLOCK_N
++    
++    return pl.pallas_call(
++        kernel,
++        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
++        grid=(num_m_blocks, num_n_blocks),
++        in_specs=(
++            pl.BlockSpec((BLOCK_M, BLOCK_K), lambda m, n, offs_m, offs_n: (m * BLOCK_M, offs_m)),
++            pl.BlockSpec((BLOCK_K, BLOCK_N), lambda m, n, offs_m, offs_n: (offs_m, n * BLOCK_N)),
++            pl.BlockSpec((BLOCK_N,), lambda m, n, offs_m, offs_n: (n * BLOCK_N,)),
++            pl.BlockSpec((BLOCK_N,), lambda m, n, offs_m, offs_n: (n * BLOCK_N,)),
++            pl.BlockSpec((BLOCK_N,), lambda m, n, offs_m, offs_n: (n * BLOCK_N,)),
++        ),
++        out_specs=pl.BlockSpec((BLOCK_M, BLOCK_N), lambda m, n, offs_m, offs_n: (m * BLOCK_M, n * BLOCK_N)),
++        compiler_params=jax.pallas.tpu.CompilerParams(
++            dimension_semantics=("parallel", "parallel")
++        ),
++    )(x, gemm_weight, gemm_bias, bn_weight, bn_bias)

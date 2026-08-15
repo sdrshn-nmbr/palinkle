@@ -1,0 +1,56 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..13d9f15 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,49 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas.tpu as pltpu
++from jax import lax
++
++def workload(x, conv_weight, conv_bias, bn_weight, bn_bias):
++    """Conv2d + Mish activation + BatchNorm kernel."""
++
++    # Transpose x from NHWC to NCHW: [64, 64, 128, 128] -> [64, 128, 128, 128]
++    x = jnp.transpose(x, (0, 2, 3, 1))
++
++    # Transpose conv_weight from HWIO to OIHW: [128, 64, 3, 3] -> [3, 3, 64, 128]
++    weight = jnp.transpose(conv_weight, (2, 3, 1, 0))
++
++    # Conv2d with VALID padding
++    x = lax.conv_general_dilated(
++        x, weight,
++        window_strides=(1, 1),
++        padding='VALID',
++        dimension_numbers=('NCHW', 'OIHW', 'NCHW')
++    )
++
++    # Add bias: reshape to [1, 128, 1, 1]
++    x = x + jnp.reshape(conv_bias, (1, 128, 1, 1))
++
++    # Transpose to NHWC: [64, 128, 126, 126] -> [64, 126, 126, 128]
++    x = jnp.transpose(x, (0, 2, 3, 1))
++
++    # Mish activation: tanh(softplus(x)) * x
++    softplus_x = jax.nn.softplus(x)
++    x = jnp.tanh(softplus_x) * x
++
++    # BatchNorm: compute mean and variance over axes [0, 2, 3]
++    eps = 1e-5
++    mean = jnp.mean(x, axis=(0, 2, 3), keepdims=True)
++    var = jnp.mean((x - mean) ** 2, axis=(0, 2, 3), keepdims=True)
++
++    # Reshape bn_weight and bn_bias to [1, 1, 1, 128]
++    w = jnp.reshape(bn_weight, (1, 1, 1, 128))
++    b = jnp.reshape(bn_bias, (1, 1, 1, 128))
++
++    # Apply batch normalization
++    x = (x - mean) / jnp.sqrt(var + eps) * w + b
++
++    # Transpose back to NCHW: [64, 126, 126, 128] -> [64, 128, 126, 126]
++    x = jnp.transpose(x, (0, 3, 1, 2))
++
++    return x

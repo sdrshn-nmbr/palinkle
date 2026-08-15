@@ -1,0 +1,170 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as plp
+import jax.random as jrandom
+
+def workload(hidden, weight, labels):
+    """Fused Linear + Cross-Entropy Loss kernel for Llama 3.1 8B."""
+    
+    batch_size = hidden.shape[0]  # 8192
+    hidden_dim = hidden.shape[1]  # 4096
+    vocab_size = weight.shape[1]  # 128256
+    
+    # Block size for TPU optimization
+    block_m = 128  # batch block
+    block_k = 128  # hidden_dim block (for matmul)
+    block_n = 128  # vocab block
+    
+    def cross_entropy_kernel(
+        hidden_ref,
+        weight_ref,
+        labels_ref,
+        loss_ref,
+    ):
+        # Get program IDs for parallel processing
+        m_idx = pl.program_id(0)  # batch block index
+        n_idx = pl.program_id(1)  # vocab block index
+        
+        # Compute the range of elements this program instance handles
+        m_start = m_idx * block_m
+        m_end = min(m_start + block_m, batch_size)
+        n_start = n_idx * block_n
+        n_end = min(n_start + block_n, vocab_size)
+        
+        # Accumulator for loss values (float32 for numerical stability)
+        local_loss = 0.0
+        
+        # Process each batch element in this block
+        for m in range(m_start, m_end):
+            # Compute logits for this batch element: logits = hidden[m] @ weight
+            # We need to compute the full row of logits for softmax
+            # For efficiency, we'll compute the full logits row and then softmax
+            
+            # Accumulate logits for the full vocab dimension
+            # We'll compute log_softmax in a numerically stable way
+            max_logit = -jnp.inf
+            sum_exp = 0.0
+            
+            # First pass: compute max logit for numerical stability
+            for k in range(0, hidden_dim, block_k):
+                k_end = min(k + block_k, hidden_dim)
+                h_block = hidden_ref[m, k:k_end]
+                
+                for n in range(n_start, n_end, block_n):
+                    n_end_block = min(n + block_n, vocab_size)
+                    w_block = weight_ref[k:k_end, n:n_end_block]
+                    logits_block = jnp.dot(h_block, w_block)
+                    max_logit = jnp.maximum(max_logit, jnp.max(logits_block))
+            
+            # Reset and compute sum of exponentials
+            sum_exp = 0.0
+            for k in range(0, hidden_dim, block_k):
+                k_end = min(k + block_k, hidden_dim)
+                h_block = hidden_ref[m, k:k_end]
+                
+                for n in range(n_start, n_end, block_n):
+                    n_end_block = min(n + block_n, vocab_size)
+                    w_block = weight_ref[k:k_end, n:n_end_block]
+                    logits_block = jnp.dot(h_block, w_block)
+                    # Subtract max for numerical stability
+                    exp_block = jnp.exp(logits_block - max_logit)
+                    sum_exp = sum_exp + jnp.sum(exp_block)
+            
+            # Get the label for this batch element
+            label = labels_ref[m]
+            
+            # Compute -log(prob[label]) = max_logit + log(sum_exp) - logit[label]
+            # We need to find the logit for the label
+            label_logit = 0.0
+            for k in range(0, hidden_dim, block_k):
+                k_end = min(k + block_k, hidden_dim)
+                h_block = hidden_ref[m, k:k_end]
+                
+                # Find which block the label is in
+                label_block_start = (label // block_n) * block_n
+                label_block_end = min(label_block_start + block_n, vocab_size)
+                
+                if label >= label_block_start and label < label_block_end:
+                    w_block = weight_ref[k:k_end, label_block_start:label_block_end]
+                    logits_block = jnp.dot(h_block, w_block)
+                    label_local_idx = label - label_block_start
+                    label_logit = label_logit + logits_block[label_local_idx]
+            
+            # Compute loss for this batch element
+            # loss[m] = -log(exp(logit[label] - max_logit) / sum_exp)
+            #         = max_logit + log(sum_exp) - logit[label]
+            element_loss = max_logit + jnp.log(sum_exp) - label_logit
+            local_loss = local_loss + element_loss
+        
+        # Write the accumulated loss for this block
+        loss_ref[m_idx, n_idx] = local_loss
+    
+    # Grid dimensions
+    num_batch_blocks = (batch_size + block_m - 1) // block_m
+    num_vocab_blocks = (vocab_size + block_n - 1) // block_n
+    
+    # For the final reduction, we need a single output
+    # We'll use a simpler approach: compute loss per batch element and reduce
+    
+    def simple_kernel(
+        hidden_ref,
+        weight_ref,
+        labels_ref,
+        loss_ref,
+    ):
+        # Each program instance handles one batch element
+        m_idx = pl.program_id(0)
+        
+        if m_idx >= batch_size:
+            return
+        
+        # Compute logits for this batch element
+        # logits = hidden[m] @ weight
+        logits = jnp.zeros(vocab_size, dtype=jnp.float32)
+        
+        for k in range(0, hidden_dim, block_k):
+            k_end = min(k + block_k, hidden_dim)
+            h_block = hidden_ref[m_idx, k:k_end]
+            
+            for n in range(0, vocab_size, block_n):
+                n_end = min(n + block_n, vocab_size)
+                w_block = weight_ref[k:k_end, n:n_end]
+                logits_block = jnp.dot(h_block, w_block).astype(jnp.float32)
+                logits = logits.at[n:n_end].set(logits_block)
+        
+        # Compute log_softmax
+        max_logit = jnp.max(logits)
+        log_sum_exp = jnp.log(jnp.sum(jnp.exp(logits - max_logit))) + max_logit
+        log_probs = logits - log_sum_exp
+        
+        # Get the label
+        label = labels_ref[m_idx]
+        
+        # Compute loss: -log_prob[label]
+        loss = -log_probs[label]
+        
+        # Write loss
+        loss_ref[m_idx] = loss
+    
+    # Output shape: one loss value per batch element
+    loss_shape = jax.ShapeDtypeStruct((batch_size,), jnp.float32)
+    
+    # Call the kernel
+    loss_per_example = pl.pallas_call(
+        simple_kernel,
+        out_shape=loss_shape,
+        grid=(num_batch_blocks,),
+        in_specs=(
+            pl.BlockSpec((block_m, hidden_dim), lambda m_idx: (m_idx * block_m, 0)),
+            pl.BlockSpec((hidden_dim, vocab_size), lambda _: (0, 0)),
+            pl.BlockSpec((1,), lambda m_idx: (m_idx,)),
+        ),
+        out_specs=pl.BlockSpec((block_m,), lambda m_idx: (m_idx * block_m,)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",)
+        ),
+    )(hidden, weight, labels)
+    
+    # Return mean loss
+    return jnp.mean(loss_per_example)

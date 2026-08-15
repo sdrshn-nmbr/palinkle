@@ -1,0 +1,104 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as plp
+import jax.interpreters.pallas as pallas
+from jax.interpreters import pallas as pl
+from jax.pallas.lib import SlabAllocator
+import jax.numpy as jnp
+from functools import partial
+
+# Constants from the semantic contract
+BATCH = 4
+NUM_HEADS = 16
+SEQ_LEN = 4096
+HEAD_DIM = 256
+
+
+def workload(query, key, value):
+    """Multi-scale retention kernel for RetNet.
+    
+    Retention(X) = (Q K^T ⊙ D) V
+    where D[i,j] = γ^(i-j) if i >= j, else 0
+    
+    Each head has a different decay rate γ_h.
+    """
+    # Compute gammas: exp2(1.0 - 5.0 / H) for each head
+    gammas = jnp.exp2(1.0 - 5.0 / jnp.arange(NUM_HEADS, dtype=jnp.float32))
+    
+    # Compute positions
+    positions = jnp.arange(SEQ_LEN, dtype=jnp.float32)
+    
+    # Compute distance matrix: distance[i, j] = positions[i] - positions[j]
+    distance = positions[:, None] - positions[None, :]
+    
+    # Causal mask: 1 if distance >= 0, else 0
+    causal_mask = (distance >= 0).astype(jnp.float32)
+    
+    # Log gamma for each head
+    log_gamma = jnp.log(gammas)
+    
+    # Compute decay: exp(log_gamma * max(distance, 0)) * causal_mask
+    # decay has shape [NUM_HEADS, SEQ_LEN, SEQ_LEN]
+    decay = jnp.exp(log_gamma[:, None, :] * jnp.maximum(distance[None, :, :], 0.0)) * causal_mask[None, :, :]
+    
+    def retention_kernel(ref_q, ref_k, ref_v, ref_out, gammas_ref, decay_ref):
+        """Pallas kernel for multi-scale retention."""
+        # Get program IDs
+        b = pl.program_id(0)
+        h = pl.program_id(1)
+        
+        # Load gammas for this head
+        gamma = gammas_ref[h]
+        
+        # Load query, key, value for this batch and head
+        # Shape: [SEQ_LEN, HEAD_DIM]
+        q = ref_q[...]
+        k = ref_k[...]
+        v = ref_v[...]
+        
+        # Compute QK: einsum("bhsd,bhtd->bhst", query, key)
+        # Result shape: [SEQ_LEN, SEQ_LEN]
+        qk = jnp.einsum('sd,td->st', q, k)
+        
+        # Get decay for this head
+        decay_h = decay_ref[h]
+        
+        # Apply decay
+        qk_decayed = qk * decay_h
+        
+        # Compute retention sum: sum over axis 1 (key positions)
+        retention_sum = jnp.maximum(jnp.abs(qk_decayed).sum(axis=1, keepdims=True), 1.0)
+        
+        # Normalize
+        qk_normalized = qk_decayed / retention_sum
+        
+        # Compute output: einsum("bhst,bhtd->bhsd", qk_normalized, value)
+        output = jnp.einsum('st,td->sd', qk_normalized, v)
+        
+        # Write output
+        ref_out[...] = output.astype(ref_out.dtype)
+    
+    # Block size for sequence dimension
+    block_s = 128
+    
+    # Grid: (BATCH, NUM_HEADS)
+    grid = (BATCH, NUM_HEADS)
+    
+    # Call the Pallas kernel
+    return pl.pallas_call(
+        retention_kernel,
+        out_shape=jax.ShapeDtypeStruct((SEQ_LEN, HEAD_DIM), query.dtype),
+        grid=grid,
+        in_specs=(
+            pl.BlockSpec((SEQ_LEN, HEAD_DIM), lambda b, h: (b, h, 0, 0)),
+            pl.BlockSpec((SEQ_LEN, HEAD_DIM), lambda b, h: (b, h, 0, 0)),
+            pl.BlockSpec((SEQ_LEN, HEAD_DIM), lambda b, h: (b, h, 0, 0)),
+            pl.BlockSpec((NUM_HEADS,), lambda b, h: (h,)),
+            pl.BlockSpec((NUM_HEADS, SEQ_LEN, SEQ_LEN), lambda b, h: (h, 0, 0)),
+        ),
+        out_specs=pl.BlockSpec((SEQ_LEN, HEAD_DIM), lambda b, h: (b, h, 0, 0)),
+        compiler_params=plp.CompilerParams(
+            dimension_semantics=("parallel", "parallel")
+        ),
+    )(query, key, value, gammas, decay)

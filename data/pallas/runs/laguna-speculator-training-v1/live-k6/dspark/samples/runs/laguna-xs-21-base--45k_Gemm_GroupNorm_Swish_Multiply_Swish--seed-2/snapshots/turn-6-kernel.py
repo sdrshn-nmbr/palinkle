@@ -1,0 +1,136 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as plp
+import jax.interpreters.pallas as pl
+import jaxlib.xla_extension as jax_xla
+from jax import lax
+from jax.sharding import Shard
+import functools
+
+# TPU-specific imports
+try:
+    import jax.pallas as pl
+    from jax import xla
+    from jax.interpreters import pallas
+    from jax.interpreters.pallas import TPUCompilerParams
+    pltpu = pl
+except ImportError:
+    pltpu = pl
+
+def workload(x, gemm_weight, gemm_bias, gn_weight, gn_bias, multiply_weight):
+    """
+    GEMM + GroupNorm + Swish + Multiply + Swish
+    
+    Args:
+        x: [batch_size, in_features] = [4096, 8192]
+        gemm_weight: [in_features, out_features] = [8192, 8192]
+        gemm_bias: [out_features] = [8192]
+        gn_weight: [out_features] = [8192]
+        gn_bias: [out_features] = [8192]
+        multiply_weight: [out_features] = [8192]
+    
+    Returns:
+        [batch_size, out_features] = [4096, 8192]
+    """
+    batch_size = x.shape[0]
+    out_features = 8192
+    num_groups = 256
+    group_size = out_features // num_groups  # 32
+    
+    # Block size for TPU - need multiples of 8 for bf16
+    block_m = 128  # batch dimension block
+    block_n = 128  # output feature dimension block
+    block_k = 128  # reduction dimension block
+    
+    def kernel_ref(
+        x_ref, gemm_weight_ref, gemm_bias_ref,
+        gn_weight_ref, gn_bias_ref, multiply_weight_ref,
+        out_ref
+    ):
+        # Get program IDs
+        m_block = pl.program_id(0)
+        n_block = pl.program_id(1)
+        
+        # GEMM: x @ gemm_weight + gemm_bias
+        # Accumulate in float32 for better precision
+        acc = jnp.zeros((block_m, block_n), dtype=jnp.float32)
+        
+        # Tile along K dimension
+        for k_block in range(x.shape[1] // block_k):
+            x_block = x_ref[
+                m_block * block_m:(m_block + 1) * block_m,
+                k_block * block_k:(k_block + 1) * block_k
+            ].astype(jnp.float32)
+            
+            w_block = gemm_weight_ref[
+                k_block * block_k:(k_block + 1) * block_k,
+                n_block * block_n:(n_block + 1) * block_n
+            ].astype(jnp.float32)
+            
+            acc = acc + jnp.dot(x_block, w_block)
+        
+        # Add bias
+        bias_block = gemm_bias_ref[n_block * block_n:(n_block + 1) * block_n]
+        acc = acc + bias_block
+        
+        # Convert to bf16 for group norm
+        x_out = acc.astype(jnp.bfloat16)
+        
+        # GroupNorm
+        # Reshape to (batch_size, num_groups, group_size)
+        x_grouped = x_out.reshape(batch_size, num_groups, group_size)
+        
+        # Compute mean and variance along group dimension (axis=-1)
+        mean = jnp.mean(x_grouped, axis=-1, keepdims=True)
+        var = jnp.var(x_grouped, axis=-1, keepdims=True)
+        
+        # Normalize
+        eps = 1e-5
+        x_normalized = (x_grouped - mean) / jnp.sqrt(var + eps)
+        
+        # Reshape back
+        x_out = x_normalized.reshape(batch_size, out_features)
+        
+        # Apply GN weight and bias
+        gn_w = gn_weight_ref[n_block * block_n:(n_block + 1) * block_n]
+        gn_b = gn_bias_ref[n_block * block_n:(n_block + 1) * block_n]
+        x_out = x_out * gn_w + gn_b
+        
+        # Swish: x * sigmoid(x)
+        x_out = x_out * jax.nn.sigmoid(x_out)
+        
+        # Multiply by multiply_weight
+        mult_w = multiply_weight_ref[n_block * block_n:(n_block + 1) * block_n]
+        x_out = x_out * mult_w
+        
+        # Swish again
+        x_out = x_out * jax.nn.sigmoid(x_out)
+        
+        # Write output
+        out_ref[
+            m_block * block_m:(m_block + 1) * block_m,
+            n_block * block_n:(n_block + 1) * block_n
+        ] = x_out
+    
+    # Grid dimensions
+    grid_m = batch_size // block_m
+    grid_n = out_features // block_n
+    
+    return pl.pallas_call(
+        kernel_ref,
+        out_shape=jax.ShapeDtypeStruct((batch_size, out_features), jnp.bfloat16),
+        grid=(grid_m, grid_n),
+        in_specs=(
+            pl.BlockSpec((block_m, block_k), lambda m, n, k=0: (m * block_m, k * block_k)),
+            pl.BlockSpec((block_k, block_n), lambda m=0, n, k=0: (k * block_k, n * block_n)),
+            pl.BlockSpec((block_n,), lambda m=0, n, k=0: (n * block_n,)),
+            pl.BlockSpec((block_n,), lambda m=0, n, k=0: (n * block_n,)),
+            pl.BlockSpec((block_n,), lambda m=0, n, k=0: (n * block_n,)),
+            pl.BlockSpec((block_n,), lambda m=0, n, k=0: (n * block_n,)),
+        ),
+        out_specs=pl.BlockSpec((block_m, block_n), lambda m, n: (m * block_m, n * block_n)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel")
+        ),
+    )(x, gemm_weight, gemm_bias, gn_weight, gn_bias, multiply_weight)

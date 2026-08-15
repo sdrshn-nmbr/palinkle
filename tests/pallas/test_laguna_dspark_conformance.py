@@ -13,10 +13,12 @@ from opjax.pallas.laguna_dspark_conformance import (
     DFLASH_BOUNDARIES,
     build_dflash_conformance_report,
     build_conformance_report,
+    build_target_feature_conformance_report,
     canonical_sha256,
     finalize_conformance,
     validate_conformance_report,
     validate_dflash_conformance_report,
+    validate_target_feature_conformance_report,
 )
 from opjax.remote.laguna_dspark_capture import (
     capture_is_configured,
@@ -35,6 +37,14 @@ EVIDENCE_ROOT = (
     / "pallas"
     / "runs"
     / "laguna-dspark-conformance-v1"
+)
+TRAINED_EVIDENCE_ROOT = (
+    Path(__file__).parents[2]
+    / "data"
+    / "pallas"
+    / "runs"
+    / "laguna-speculator-training-v1"
+    / "conformance"
 )
 
 
@@ -314,6 +324,50 @@ def test_frozen_hardware_conformance_evidence_is_bound() -> None:
     assert remote["modal_runs"] == index["modal_runs"]
 
 
+def test_trained_conformance_package_has_immutable_remote_locator() -> None:
+    remote = json.loads(
+        (TRAINED_EVIDENCE_ROOT / "remote-evidence.json").read_text(encoding="utf-8")
+    )
+    expected = canonical_sha256(
+        {key: value for key, value in remote.items() if key != "sha256"}
+    )
+    assert remote["sha256"] == expected
+    assert len(remote["hub"]["revision"]) == 40
+    assert remote["hub"]["files"] == 504
+    assert remote["clean_download_validation"] == {
+        "conditional_adapter_report_valid": True,
+        "content_tree_match": True,
+        "live_target_feature_reports_valid": True,
+    }
+    conditional = json.loads(
+        (TRAINED_EVIDENCE_ROOT / "dspark-step120-v1" / "report.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    first_live = json.loads(
+        (
+            TRAINED_EVIDENCE_ROOT
+            / "dspark-step120-v1"
+            / "target-feature-report.json"
+        ).read_text(encoding="utf-8")
+    )
+    second_live = json.loads(
+        (
+            TRAINED_EVIDENCE_ROOT
+            / "dspark-step120-live-validation-v1"
+            / "target-feature-report.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert remote["reports"] == {
+        "conditional_adapter_conformance": conditional["report_sha256"],
+        "live_target_features_prompt_1": first_live["report_sha256"],
+        "live_target_features_prompt_2": second_live["report_sha256"],
+    }
+    assert conditional["passed"] is True
+    assert first_live["passed"] is False
+    assert second_live["passed"] is False
+
+
 def test_runtime_capture_is_explicit_and_hash_bound(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -363,6 +417,7 @@ def test_vllm_capture_reconstructs_the_exact_markov_chain(tmp_path: Path) -> Non
         )
 
     record("combined_target_feature", 0, np.zeros((3, 4), dtype=np.float32))
+    record("raw_target_features", 0, np.zeros((3, 20), dtype=np.float32))
     record("draft_backbone_hidden_state", 0, np.zeros((15, 4), dtype=np.float32))
     record("draft_input_ids", 0, np.arange(15, dtype=np.int64))
     record("draft_positions", 0, np.arange(15, dtype=np.int64))
@@ -424,6 +479,7 @@ def test_vllm_capture_reconstructs_the_exact_markov_chain(tmp_path: Path) -> Non
         encoding="utf-8",
     )
     result = _canonicalize_capture(raw, static, output)
+    assert np.load(output / result["raw_target_features"]["path"]).shape == (3, 20)
     tokens = np.load(output / result["proposal_token_ids"]["path"])
     assert tokens.tolist() == list(range(15))
 
@@ -458,3 +514,86 @@ def test_target_feature_override_normalizes_the_source_batch_axis(
     value = load_target_feature_override()
     assert value is not None
     assert tuple(value.shape) == (52, 10240)
+
+
+def test_target_feature_conformance_accepts_numeric_drift_and_preserves_order(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    adapter_root = tmp_path / "adapter-live"
+    source_root.mkdir()
+    adapter_root.mkdir()
+    rng = np.random.default_rng(0)
+    source_value = rng.normal(size=(1, 7, 20)).astype(np.float32)
+    adapter_value = source_value.reshape(7, 20) * np.float32(1.001)
+    source = {
+        "manifest_sha256": "a" * 64,
+        "prompt_token_ids": [1, 2],
+        "boundaries": {
+            "raw_target_features": _write_array(
+                source_root, "raw_target_features", source_value
+            )
+        },
+    }
+    adapter = {
+        "manifest_sha256": "b" * 64,
+        "prompt_token_ids": [1, 2],
+        "boundaries": {
+            "raw_target_features": _write_array(
+                adapter_root, "raw_target_features", adapter_value
+            )
+        },
+    }
+
+    report = build_target_feature_conformance_report(
+        source_root=source_root,
+        source_capture=source,
+        adapter_root=adapter_root,
+        adapter_capture=adapter,
+    )
+
+    assert report["passed"] is True
+    assert [layer["best_adapter_layer"] for layer in report["layers"]] == list(
+        range(5)
+    )
+    validate_target_feature_conformance_report(report, root=tmp_path)
+
+
+def test_target_feature_conformance_rejects_reordered_layers(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    adapter_root = tmp_path / "adapter-live"
+    source_root.mkdir()
+    adapter_root.mkdir()
+    rng = np.random.default_rng(1)
+    source_value = rng.normal(size=(6, 20)).astype(np.float32)
+    adapter_value = source_value.reshape(6, 5, 4)[:, [1, 0, 2, 3, 4], :].reshape(6, 20)
+    source = {
+        "manifest_sha256": "a" * 64,
+        "prompt_token_ids": [1, 2],
+        "boundaries": {
+            "raw_target_features": _write_array(
+                source_root, "raw_target_features", source_value
+            )
+        },
+    }
+    adapter = {
+        "manifest_sha256": "b" * 64,
+        "prompt_token_ids": [1, 2],
+        "boundaries": {
+            "raw_target_features": _write_array(
+                adapter_root, "raw_target_features", adapter_value
+            )
+        },
+    }
+
+    report = build_target_feature_conformance_report(
+        source_root=source_root,
+        source_capture=source,
+        adapter_root=adapter_root,
+        adapter_capture=adapter,
+    )
+
+    assert report["passed"] is False
+    validate_target_feature_conformance_report(
+        report, root=tmp_path, require_pass=False
+    )

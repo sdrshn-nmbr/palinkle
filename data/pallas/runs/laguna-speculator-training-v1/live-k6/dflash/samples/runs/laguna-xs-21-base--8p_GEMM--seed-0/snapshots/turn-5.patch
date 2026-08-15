@@ -1,0 +1,81 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..47e7615 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,74 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as plp
++import jax.interpreters.tpu as pltpu
++
++
++def gemm_kernel(
++    A_ref,
++    B_ref,
++    C_ref,
++    *,
++    M: int,
++    N: int,
++    K: int,
++):
++    """Pallas kernel for GEMM: C = A @ B"""
++    # Get the program indices
++    m = pl.program_id(0)
++    n = pl.program_id(1)
++    
++    # Block size for K dimension (reduction dimension)
++    block_k = 128
++    
++    # Initialize accumulator in float32
++    acc = pl.zeros((M, N), dtype=jnp.float32)
++    
++    # Loop over K dimension in blocks
++    for k_start in range(0, K, block_k):
++        k_end = min(k_start + block_k, K)
++        
++        # Load A block: shape (M, block_k)
++        A_block = A_ref[m * M : (m + 1) * M, k_start:k_end].astype(jnp.float32)
++        
++        # Load B block: shape (block_k, N)
++        B_block = B_ref[k_start:k_end, n * N : (n + 1) * N].astype(jnp.float32)
++        
++        # Compute partial dot product and accumulate
++        acc = acc + jnp.dot(A_block, B_block)
++    
++    # Write result back as bf16
++    C_ref[m * M : (m + 1) * M, n * N : (n + 1) * N] = acc.astype(jnp.bfloat16)
++
++
++def workload(A, B):
++    """GEMM workload: C = A @ B for Llama-70B FFN dimensions."""
++    M, K = A.shape  # (8192, 8192)
++    K, N = B.shape  # (8192, 28672)
++    
++    # Block sizes - must be multiples of 8 for bf16 on TPU
++    block_m = 128
++    block_n = 128
++    
++    # Grid dimensions
++    grid_m = (M + block_m - 1) // block_m
++    grid_n = (N + block_n - 1) // block_n
++    
++    return pl.pallas_call(
++        gemm_kernel,
++        out_shape=jax.ShapeDtypeStruct((M, N), jnp.bfloat16),
++        grid=(grid_m, grid_n),
++        in_specs=(
++            pl.BlockSpec((block_m, K), lambda m, n: (m * block_m, 0)),
++            pl.BlockSpec((K, block_n), lambda m, n: (0, n * block_n)),
++        ),
++        out_specs=pl.BlockSpec((block_m, block_n), lambda m, n: (m * block_m, n * block_n)),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel", "parallel")
++        ),
++        interpret=False,
++        M=block_m,
++        N=block_n,
++        K=K,
++    )(A, B)

@@ -1,0 +1,102 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..eb7a2a5 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,95 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as plp
++from jax import lax
++from jax.pallas.lib import SlabAllocator
++import functools
++
++def matmul_avg_pool_gelu_scale_max_kernel(
++    x_ref,
++    weight_ref,
++    bias_ref,
++    out_ref,
++):
++    """Pallas kernel for Matmul + AvgPool + GELU + Scale + Max"""
++    batch_size = 4096
++    in_features = 8192
++    out_features = 8192
++    pool_kernel_size = 16
++    scale_factor = 2.0
++    
++    # Get the program ID (batch index)
++    batch_idx = pl.program_id(0)
++    
++    # Perform matmul for this batch element
++    # x_ref[batch_idx, :] is [8192]
++    # weight_ref[:, :] is [8192, 8192]
++    # result is [8192]
++    
++    # Compute matmul: x @ weight + bias
++    x_row = x_ref[batch_idx, :]  # [8192]
++    weight_mat = weight_ref[:, :]  # [8192, 8192]
++    bias_vec = bias_ref[:]  # [8192]
++    
++    # Matmul result
++    matmul_result = jnp.dot(x_row, weight_mat) + bias_vec  # [8192]
++    
++    # Expand dims: [8192] -> [1, 8192]
++    expanded = jnp.expand_dims(matmul_result, axis=0)  # [1, 8192]
++    
++    # Avg pool with kernel size 16
++    # Window dimensions: [1, 16], strides: [1, 16]
++    # Result: [1, 512]
++    pooled = lax.reduce_window(
++        expanded,
++        init_value=0.0,
++        computation=lax.add,
++        window_dimensions=(1, pool_kernel_size),
++        window_strides=(1, pool_kernel_size),
++        padding="VALID"
++    ) / pool_kernel_size
++    
++    # Squeeze: [1, 512] -> [512]
++    squeezed = jnp.squeeze(pooled, axis=0)  # [512]
++    
++    # GELU activation
++    gelu_result = jax.nn.gelu(squeezed)  # [512]
++    
++    # Scale by 2.0
++    scaled = gelu_result * scale_factor  # [512]
++    
++    # Max along axis 0: [512] -> scalar
++    result = jnp.max(scaled, axis=0)
++    
++    # Write output
++    out_ref[batch_idx] = result
++
++
++def workload(x, weight, bias):
++    """
++    Matmul + AvgPool1d + GELU + Scale + Max
++    
++    Input shapes:
++    - x: [4096, 8192]
++    - weight: [8192, 8192]
++    - bias: [8192]
++    
++    Output shape: [4096]
++    """
++    batch_size = 4096
++    
++    return pl.pallas_call(
++        matmul_avg_pool_gelu_scale_max_kernel,
++        out_shape=jax.ShapeDtypeStruct((batch_size,), x.dtype),
++        grid=(batch_size,),
++        in_specs=(
++            pl.BlockSpec((batch_size, 8192), lambda batch_idx: (slice(None), slice(None))),
++            pl.BlockSpec((8192, 8192), lambda batch_idx: (slice(None), slice(None))),
++            pl.BlockSpec((8192,), lambda batch_idx: (slice(None),)),
++        ),
++        out_specs=pl.BlockSpec((batch_size,), lambda batch_idx: (batch_idx,)),
++        compiler_params=jax.pallas.pltpu.CompilerParams(
++            dimension_semantics=("parallel",)
++        ),
++    )(x, weight, bias)

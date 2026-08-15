@@ -1,0 +1,66 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.interpreters.tpu as pltpu
+
+
+def workload(x, weight, bias):
+    """
+    Implements: Matmul + Sum + Max + AvgPool + LogSumExp + LogSumExp
+    
+    Input shapes:
+    - x: [4096, 8192] bfloat16
+    - weight: [8192, 8192] bfloat16
+    - bias: [8192] bfloat16
+    
+    Output shape: [4096, 1] bfloat16
+    """
+    block_size = 128
+    
+    def kernel(matmul_ref, bias_ref, out_ref):
+        # matmul_ref: [M, K] block of x @ weight
+        # bias_ref: [K] block of bias
+        # out_ref: [M, 1] output block
+        
+        # Perform matmul in float32 for accumulation
+        m = matmul_ref.shape[0]
+        k = matmul_ref.shape[1]
+        
+        # Compute x @ weight + bias
+        # matmul_ref is already x @ weight, we need to add bias
+        result = matmul_ref.astype(jnp.float32) + bias_ref.astype(jnp.float32)
+        
+        # Sum along axis 1 (the K dimension)
+        result = jnp.sum(result, axis=1, keepdims=True)
+        
+        # Max along axis 1
+        result = jnp.max(result, axis=1, keepdims=True)
+        
+        # Mean along axis 1
+        result = jnp.mean(result, axis=1, keepdims=True)
+        
+        # LogSumExp along axis 1 (first)
+        result = jax.scipy.special.logsumexp(result, axis=1, keepdims=True)
+        
+        # LogSumExp along axis 1 (second)
+        result = jax.scipy.special.logsumexp(result, axis=1, keepdims=True)
+        
+        out_ref[...] = result.astype(matmul_ref.dtype)
+    
+    # Grid: process each row of the output
+    # Output shape is [4096, 1], so we need 4096 blocks along M
+    grid = (x.shape[0],)
+    
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((x.shape[0], 1), x.dtype),
+        grid=grid,
+        in_specs=(
+            pl.BlockSpec((block_size, weight.shape[1]), lambda i: (i, 0)),
+            pl.BlockSpec((weight.shape[1],), lambda i: (0,)),
+        ),
+        out_specs=pl.BlockSpec((block_size, 1), lambda i: (i, 0)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",)
+        ),
+    )(x, weight, bias)

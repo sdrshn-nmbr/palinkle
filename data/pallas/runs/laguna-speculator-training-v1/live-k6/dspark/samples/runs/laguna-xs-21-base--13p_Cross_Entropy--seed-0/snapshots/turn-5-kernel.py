@@ -1,0 +1,125 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as plp
+import jax.interpreters.pallas as pj
+import jax.numpy as jnp
+
+def workload(hidden, weight, labels):
+    """Fused Linear + Cross-Entropy Loss kernel for Llama 3.1 8B."""
+    
+    batch_tokens = hidden.shape[0]  # 8192
+    hidden_dim = hidden.shape[1]    # 4096
+    vocab_size = weight.shape[1]    # 128256
+    
+    # Block sizes for TPU optimization
+    # For bf16, use multiples of 8
+    # For the matmul, tile along vocab dimension
+    block_m = 128  # batch block
+    block_k = 64   # hidden_dim block
+    block_n = 128  # vocab block (multiple of 8 for bf16)
+    
+    def cross_entropy_kernel(
+        hidden_ref,
+        weight_ref,
+        labels_ref,
+        loss_ref,
+        *,
+        batch_tokens=batch_tokens,
+        hidden_dim=hidden_dim,
+        vocab_size=vocab_size,
+    ):
+        # Grid: one block per batch element
+        m = pl.program_id(0)
+        
+        # Compute logits for this batch element: logits[m] = hidden[m] @ weight
+        # hidden[m] has shape [hidden_dim], weight has shape [hidden_dim, vocab_size]
+        # Result: logits[m] has shape [vocab_size]
+        
+        # We'll compute the full logits and then log_softmax
+        # For efficiency, we can fuse the operations
+        
+        # Initialize accumulator for logits in float32
+        logits_acc = jnp.zeros((vocab_size,), dtype=jnp.float32)
+        
+        # Compute matmul: hidden[m] @ weight
+        # Tile along hidden_dim
+        for k in range(0, hidden_dim, block_k):
+            k_end = min(k + block_k, hidden_dim)
+            # Load block of hidden: [block_k]
+            hidden_block = hidden_ref[m, k:k_end]
+            # Load block of weight: [block_k, vocab_size]
+            weight_block = weight_ref[k:k_end, :]
+            # Accumulate: [vocab_size]
+            logits_acc = logits_acc + jnp.dot(hidden_block.astype(jnp.float32), weight_block.astype(jnp.float32))
+        
+        # Compute log_softmax
+        # log_softmax(x) = x - log(sum(exp(x)))
+        max_logits = jnp.max(logits_acc)
+        shifted = logits_acc - max_logits
+        log_sum_exp = jnp.log(jnp.sum(jnp.exp(shifted)))
+        log_probs = shifted - log_sum_exp
+        
+        # Get label for this batch element
+        label = labels_ref[m]
+        
+        # Compute loss: -log_prob[label]
+        loss_val = -log_probs[label]
+        
+        # Write loss
+        loss_ref[()] = loss_val
+    
+    # Grid: one program per batch element
+    grid = (batch_tokens,)
+    
+    # Output shape: scalar (mean of losses)
+    # We'll compute per-element losses and then mean them
+    # Actually, let's compute all losses and then mean in a separate kernel or use reduction
+    
+    # Let's use a simpler approach: compute all losses and reduce
+    def cross_entropy_kernel_v2(
+        hidden_ref,
+        weight_ref,
+        labels_ref,
+        loss_ref,
+    ):
+        m = pl.program_id(0)
+        
+        # Compute logits for this batch element
+        logits = jnp.dot(
+            hidden_ref[m, :].astype(jnp.float32),
+            weight_ref[:, :].astype(jnp.float32)
+        )
+        
+        # Compute log_softmax
+        log_probs = jax.nn.log_softmax(logits, axis=-1)
+        
+        # Get label
+        label = labels_ref[m]
+        
+        # Compute loss
+        loss_val = -log_probs[label]
+        
+        loss_ref[m] = loss_val
+    
+    # Allocate output for per-element losses
+    loss_shape = jax.ShapeDtypeStruct((batch_tokens,), jnp.float32)
+    
+    # Call the kernel
+    per_element_losses = pl.pallas_call(
+        cross_entropy_kernel_v2,
+        out_shape=loss_shape,
+        grid=grid,
+        in_specs=(
+            pl.BlockSpec((batch_tokens, hidden_dim), lambda _: (0, 0)),  # hidden
+            pl.BlockSpec((hidden_dim, vocab_size), lambda _: (0, 0)),    # weight
+            pl.BlockSpec((batch_tokens,), lambda _: (0,)),                # labels
+        ),
+        out_specs=pl.BlockSpec((batch_tokens,), lambda i: (i,)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",)
+        ),
+    )(hidden, weight, labels)
+    
+    # Compute mean of losses
+    return jnp.mean(per_element_losses)

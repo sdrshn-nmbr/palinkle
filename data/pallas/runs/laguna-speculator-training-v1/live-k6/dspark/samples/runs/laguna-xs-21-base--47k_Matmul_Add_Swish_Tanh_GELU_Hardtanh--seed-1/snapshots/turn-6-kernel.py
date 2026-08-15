@@ -1,0 +1,77 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as plp
+import jax.random as jrandom
+
+def workload(x, weight, bias, add_value):
+    """TPU Pallas kernel for Matmul + Add + Swish + Tanh + GELU + Hardtanh."""
+    
+    # Block size for tiling - use multiples of 8 for bf16
+    BLOCK_M = 128
+    BLOCK_N = 128
+    BLOCK_K = 128
+    
+    M, K = x.shape
+    _, N = weight.shape
+    
+    def kernel(ref_x, ref_weight, ref_bias, ref_add_value, ref_out):
+        # Initialize accumulator in float32 for better precision
+        acc = jnp.zeros((BLOCK_M, BLOCK_N), dtype=jnp.float32)
+        
+        # Tile over K dimension
+        for k_start in range(0, K, BLOCK_K):
+            k_end = min(k_start + BLOCK_K, K)
+            actual_k = k_end - k_start
+            
+            # Load x block [BLOCK_M, actual_k]
+            x_block = ref_x[k_start:k_end, :].astype(jnp.float32)
+            
+            # Load weight block [actual_k, BLOCK_N]
+            w_block = ref_weight[:actual_k, :].astype(jnp.float32)
+            
+            # Matmul and accumulate
+            acc = acc + jnp.dot(x_block, w_block)
+        
+        # Add bias [BLOCK_N] -> broadcast to [BLOCK_M, BLOCK_N]
+        acc = acc + ref_bias[:].astype(jnp.float32)
+        
+        # Add add_value [BLOCK_N] -> broadcast to [BLOCK_M, BLOCK_N]
+        acc = acc + ref_add_value[:].astype(jnp.float32)
+        
+        # Convert back to bf16 for activations
+        x_val = acc.astype(jnp.bfloat16)
+        
+        # Swish: x * sigmoid(x)
+        x_val = x_val * jax.nn.sigmoid(x_val)
+        
+        # Tanh
+        x_val = jnp.tanh(x_val)
+        
+        # GELU: x * sigmoid(1.702 * x) (approximate)
+        x_val = x_val * jax.nn.sigmoid(1.702 * x_val)
+        
+        # Hardtanh: clip to [-1, 1]
+        x_val = jnp.clip(x_val, -1.0, 1.0)
+        
+        ref_out[...] = x_val
+    
+    # Grid dimensions
+    grid_m = (M + BLOCK_M - 1) // BLOCK_M
+    grid_n = (N + BLOCK_N - 1) // BLOCK_N
+    
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((M, N), jnp.bfloat16),
+        grid=(grid_m, grid_n),
+        in_specs=(
+            pl.BlockSpec((K, BLOCK_N), lambda mi, ni: (0, ni * BLOCK_N)),
+            pl.BlockSpec((K, BLOCK_M), lambda mi, ni: (0, mi * BLOCK_M)),
+            pl.BlockSpec((BLOCK_N,), lambda mi, ni: (0,)),
+            pl.BlockSpec((BLOCK_N,), lambda mi, ni: (0,)),
+        ),
+        out_specs=pl.BlockSpec((BLOCK_M, BLOCK_N), lambda mi, ni: (mi * BLOCK_M, ni * BLOCK_N)),
+        compiler_params=plp.CompilerParams(
+            dimension_semantics=("parallel", "parallel")
+        ),
+    )(x, weight, bias, add_value)

@@ -1,0 +1,70 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as plp
+import jax.interpreters.tpu as pltpu
+
+
+def workload(x, weights):
+    """Grouped matmul (ragged dot) for MoE - Mixtral 8x7B.
+    
+    Computes: out[g, m, n] = sum_k x[g, m, k] * weights[g, k, n]
+    for each group g in [0, num_groups).
+    """
+    num_groups = x.shape[0]
+    M = x.shape[1]
+    K = x.shape[2]
+    N = weights.shape[2]
+    
+    # Block sizes - multiples of 8 for bf16, 128 for vectorized dimensions
+    block_m = 128
+    block_n = 128
+    block_k = 8
+    
+    def matmul_kernel(x_ref, w_ref, out_ref, g_idx, m_idx, n_idx):
+        """Kernel for a single group's matmul block."""
+        # Compute the tile indices
+        m_start = m_idx * block_m
+        n_start = n_idx * block_n
+        
+        # Accumulate in float32 for better precision
+        acc = 0.0
+        
+        # Loop over K dimension
+        for k_tile in range(K // block_k):
+            k_start = k_tile * block_k
+            
+            # Load blocks
+            x_block = x_ref[
+                g_idx,
+                plp.arange(block_m),
+                plp.arange(block_k) + k_start
+            ]
+            w_block = w_ref[
+                g_idx,
+                plp.arange(block_k) + k_start,
+                plp.arange(block_n) + n_start
+            ]
+            
+            # Compute dot product and accumulate
+            acc += jnp.sum(x_block * w_block, axis=(1, 2))
+        
+        # Store result
+        out_ref[g_idx, m_start, n_start] = acc
+    
+    # Grid dimensions: (num_groups, M // block_m, N // block_n)
+    grid = (num_groups, M // block_m, N // block_n)
+    
+    return pl.pallas_call(
+        matmul_kernel,
+        out_shape=jax.ShapeDtypeStruct((num_groups, M, N), jnp.bfloat16),
+        grid=grid,
+        in_specs=(
+            pl.BlockSpec((num_groups, M, K), lambda g, m, n: (g, m, n)),
+            pl.BlockSpec((num_groups, K, N), lambda g, m, n: (g, m, n)),
+        ),
+        out_specs=pl.BlockSpec((num_groups, M, N), lambda g, m, n: (g, m, n)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel", "parallel")
+        ),
+    )(x, weights)

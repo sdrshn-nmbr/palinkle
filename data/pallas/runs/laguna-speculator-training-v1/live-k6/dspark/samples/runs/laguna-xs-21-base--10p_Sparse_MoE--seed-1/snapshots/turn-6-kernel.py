@@ -1,0 +1,72 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas.tpu as pltpu
+
+def workload(x, router_weights, expert_gate_kernels, expert_up_kernels, expert_down_kernels):
+    """Sparse MoE kernel for Mixtral-8x7B."""
+    B, S, E = x.shape
+    N = router_weights.shape[0]  # 4096
+    K = 2  # num_experts_per_tok
+    
+    def kernel(x_ref, router_weights_ref, expert_gate_kernels_ref, 
+               expert_up_kernels_ref, expert_down_kernels_ref, out_ref):
+        # Read inputs
+        x_val = x_ref[...]
+        router_weights_val = router_weights_ref[...]
+        expert_gate_kernels_val = expert_gate_kernels_ref[...]
+        expert_up_kernels_val = expert_up_kernels_ref[...]
+        expert_down_kernels_val = expert_down_kernels_ref[...]
+        
+        # Compute logits = x @ router_weights
+        logits = jnp.dot(x_val, router_weights_val)
+        
+        # Get top-k indices and values
+        top_k_logits, top_k_indices = jax.lax.top_k(logits, K)
+        
+        # Compute router probabilities via softmax
+        router_probs = jax.nn.softmax(top_k_logits, axis=-1)
+        
+        # Compute gate_out = silu(einsum("bse,nem->bsnm", x, expert_gate_kernels))
+        gate_out = jax.nn.silu(jnp.einsum("bse,nem->bsnm", x_val, expert_gate_kernels_val))
+        
+        # Compute up_out = einsum("bse,nem->bsnm", x, expert_up_kernels)
+        up_out = jnp.einsum("bse,nem->bsnm", x_val, expert_up_kernels_val)
+        
+        # Compute hidden = gate_out * up_out
+        hidden = gate_out * up_out
+        
+        # Compute expert_outputs = einsum("bsnm,nme->bsne", hidden, expert_down_kernels)
+        expert_outputs = jnp.einsum("bsnm,nme->bsne", hidden, expert_down_kernels_val)
+        
+        # Compute one_hot from top_k_indices
+        one_hot = jax.nn.one_hot(top_k_indices, N)
+        
+        # Compute weighted = one_hot * router_probs[..., None]
+        weighted = one_hot * router_probs[..., None]
+        
+        # Compute expert_weights = sum(weighted, axis=2)
+        expert_weights = jnp.sum(weighted, axis=2)
+        
+        # Compute output = einsum("bsne,bsn->bse", expert_outputs, expert_weights)
+        output = jnp.einsum("bsne,bsn->bse", expert_outputs, expert_weights)
+        
+        # Write output (cast to float32)
+        out_ref[...] = output.astype(jnp.float32)
+    
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((B, S, E), jnp.float32),
+        grid=(1,),
+        in_specs=(
+            pl.no_block_spec,
+            pl.no_block_spec,
+            pl.no_block_spec,
+            pl.no_block_spec,
+            pl.no_block_spec,
+        ),
+        out_specs=pl.no_block_spec,
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",)
+        ),
+    )(x, router_weights, expert_gate_kernels, expert_up_kernels, expert_down_kernels)

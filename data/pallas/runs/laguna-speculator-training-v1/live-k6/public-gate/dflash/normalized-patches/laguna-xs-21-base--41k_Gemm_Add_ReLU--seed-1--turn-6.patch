@@ -1,0 +1,86 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..188acae 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,79 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as plp
++import jax.interpreters.pallas as pl
++import jax.pallas.lib as pllib
++
++def workload(x, weight, bias):
++    """GEMM + Add(bias) + ReLU kernel."""
++    # Block size for TPU - need multiples of 8 for bf16 and 128 for vectorized dimensions
++    block_m = 128  # tile along M dimension
++    block_n = 128  # tile along N dimension
++    block_k = 128  # tile along K dimension
++
++    # Grid dimensions
++    grid_m = x.shape[0] // block_m
++    grid_n = x.shape[1] // block_n
++
++    def gemm_add_relu_kernel(ref_x, ref_weight, ref_bias, ref_out):
++        # Get program IDs
++        m_block = pl.program_id(0)
++        n_block = pl.program_id(1)
++
++        # Initialize accumulator in float32 for better precision
++        acc = pl.zeros((block_m, block_n), dtype=jnp.float32)
++
++        # K dimension tiling
++        k_tiles = weight.shape[0] // block_k
++
++        for k_block in pl.range(k_tiles):
++            # Load blocks from x and weight
++            x_block = ref_x[
++                m_block * block_m:(m_block + 1) * block_m,
++                k_block * block_k:(k_block + 1) * block_k
++            ]
++            weight_block = ref_weight[
++                k_block * block_k:(k_block + 1) * block_k,
++                n_block * block_n:(n_block + 1) * block_n
++            ]
++
++            # Convert to float32 for accumulation
++            x_block_f32 = x_block.astype(jnp.float32)
++            weight_block_f32 = weight_block.astype(jnp.float32)
++
++            # GEMM operation
++            acc = acc + jnp.dot(x_block_f32, weight_block_f32)
++
++        # Add bias (broadcast along M dimension)
++        bias_block = ref_bias[n_block * block_n:(n_block + 1) * block_n]
++        acc = acc + bias_block[None, :]  # Broadcast bias
++
++        # Apply ReLU
++        acc = jnp.maximum(acc, 0.0)
++
++        # Convert back to bfloat16 and write output
++        ref_out[
++            m_block * block_m:(m_block + 1) * block_m,
++            n_block * block_n:(n_block + 1) * block_n
++        ] = acc.astype(x.dtype)
++
++    # Define grid
++    grid = (grid_m, grid_n)
++
++    # Define block specs
++    x_spec = pl.BlockSpec((block_m, block_k), lambda m, n, k: (m * block_m, k * block_k))
++    weight_spec = pl.BlockSpec((block_k, block_n), lambda m, n, k: (k * block_k, n * block_n))
++    bias_spec = pl.BlockSpec((block_n,), lambda m, n, k: (n * block_n,))
++    out_spec = pl.BlockSpec((block_m, block_n), lambda m, n, k: (m * block_m, n * block_n))
++
++    return pl.pallas_call(
++        gemm_add_relu_kernel,
++        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
++        grid=grid,
++        in_specs=(x_spec, weight_spec, bias_spec),
++        out_specs=out_spec,
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel", "parallel", "parallel")
++        ),
++    )(x, weight, bias)

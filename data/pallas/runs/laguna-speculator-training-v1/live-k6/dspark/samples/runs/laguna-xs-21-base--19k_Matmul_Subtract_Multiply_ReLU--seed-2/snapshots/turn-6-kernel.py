@@ -1,0 +1,73 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as plp
+import jax.interpreters.tpu as pltpu
+
+
+def matmul_subtract_multiply_relu_kernel(
+    x_ref,
+    weight_ref,
+    bias_ref,
+    out_ref,
+):
+    """Pallas kernel for matmul + subtract + multiply + relu."""
+    # Get program IDs for grid layout
+    m = pl.program_id(0)
+    n = pl.program_id(1)
+    
+    # Block size for matmul
+    block_size = 128
+    
+    # Accumulate in float32 for better precision
+    acc = jnp.zeros((block_size, block_size), dtype=jnp.float32)
+    
+    # Matmul with accumulation
+    for k in range(x_ref.shape[1] // block_size):
+        x_block = x_ref[m * block_size : (m + 1) * block_size, k * block_size : (k + 1) * block_size]
+        weight_block = weight_ref[k * block_size : (k + 1) * block_size, n * block_size : (n + 1) * block_size]
+        acc = acc + jnp.dot(x_block.astype(jnp.float32), weight_block.astype(jnp.float32))
+    
+    # Add bias (broadcast along last dimension)
+    bias_block = bias_ref[n * block_size : (n + 1) * block_size]
+    acc = acc + bias_block[None, :]
+    
+    # Subtract 2.0
+    acc = acc - 2.0
+    
+    # Multiply by 1.5
+    acc = acc * 1.5
+    
+    # ReLU
+    acc = jnp.maximum(acc, 0.0)
+    
+    # Convert back to bfloat16 and write output
+    out_ref[m * block_size : (m + 1) * block_size, n * block_size : (n + 1) * block_size] = acc.astype(jnp.bfloat16)
+
+
+def workload(x, weight, bias):
+    """Workload: matmul + add bias + subtract 2.0 + multiply 1.5 + relu."""
+    batch_size = x.shape[0]
+    in_features = x.shape[1]
+    out_features = weight.shape[1]
+    
+    block_size = 128
+    
+    # Grid dimensions
+    grid_m = batch_size // block_size
+    grid_n = out_features // block_size
+    
+    return pl.pallas_call(
+        matmul_subtract_multiply_relu_kernel,
+        out_shape=jax.ShapeDtypeStruct((batch_size, out_features), jnp.bfloat16),
+        grid=(grid_m, grid_n),
+        in_specs=(
+            pl.BlockSpec((batch_size, in_features), lambda: (0, 0)),
+            pl.BlockSpec((in_features, out_features), lambda: (0, 0)),
+            pl.BlockSpec((out_features,), lambda: 0),
+        ),
+        out_specs=pl.BlockSpec((batch_size, out_features), lambda: (0, 0)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel")
+        ),
+    )(x, weight, bias)

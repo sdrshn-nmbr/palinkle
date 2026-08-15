@@ -1,0 +1,80 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as plp
+import jax.interpreters.tpu as pltpu
+
+
+def workload(x, weight, bias):
+    """Gemm + Multiply + LeakyReLU kernel."""
+    # Output shape
+    out_shape = jax.ShapeDtypeStruct(x.shape, x.dtype)
+    
+    # Block size for tiling - use multiples of 8 for bf16 and 128 for vectorization
+    block_m = 128
+    block_k = 128
+    block_n = 128
+    
+    def kernel(ref_x, ref_weight, ref_bias, ref_out):
+        # Get program IDs for tiling
+        m_block = pl.program_id(0)
+        n_block = pl.program_id(1)
+        
+        # Accumulator in float32 for better precision
+        acc = jnp.zeros((block_m, block_n), dtype=jnp.float32)
+        
+        # Iterate over K dimension
+        for k_block in range(x.shape[1] // block_k):
+            # Load tiles from x and weight
+            x_tile = ref_x[
+                m_block * block_m:(m_block + 1) * block_m,
+                k_block * block_k:(k_block + 1) * block_k
+            ]
+            w_tile = ref_weight[
+                k_block * block_k:(k_block + 1) * block_k,
+                n_block * block_n:(n_block + 1) * block_n
+            ]
+            
+            # Convert to float32 for accumulation
+            x_f32 = x_tile.astype(jnp.float32)
+            w_f32 = w_tile.astype(jnp.float32)
+            
+            # Matrix multiplication for this tile
+            acc = acc + jnp.dot(x_f32, w_f32)
+        
+        # Add bias (broadcast along M dimension)
+        bias_tile = ref_bias[n_block * block_n:(n_block + 1) * block_n]
+        acc = acc + bias_tile[None, :]
+        
+        # Multiply by 2.0
+        acc = acc * 2.0
+        
+        # LeakyReLU: where(x >= 0, x, x * 0.1)
+        result = jnp.where(acc >= 0, acc, acc * 0.1)
+        
+        # Convert back to bfloat16 and write output
+        ref_out[
+            m_block * block_m:(m_block + 1) * block_m,
+            n_block * block_n:(n_block + 1) * block_n
+        ] = result.astype(x.dtype)
+    
+    # Grid dimensions based on output shape
+    grid = (
+        (x.shape[0] + block_m - 1) // block_m,
+        (x.shape[1] + block_n - 1) // block_n,
+    )
+    
+    return pl.pallas_call(
+        kernel,
+        out_shape=out_shape,
+        grid=grid,
+        in_specs=(
+            pl.BlockSpec((block_m, block_k), lambda m, n: (m * block_m, 0)),
+            pl.BlockSpec((block_k, block_n), lambda m, n: (0, n * block_n)),
+            pl.BlockSpec((block_n,), lambda m, n: (n * block_n,)),
+        ),
+        out_specs=pl.BlockSpec((block_m, block_n), lambda m, n: (m * block_m, n * block_n)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel")
+        ),
+    )(x, weight, bias)

@@ -1,0 +1,403 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..7299879 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,396 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.random as jrandom
++import math
++import pallas as pl
++import triton.pallas as pltpu
++
++# Configuration constants
++CONFIG = {
++    "head_dim": 128,
++    "max_num_batched_tokens": 4096,
++    "max_num_seqs": 64,
++    "model": "Llama-3.1-70B",
++    "num_kv_heads": 8,
++    "num_q_heads": 64,
++    "page_size": 16,
++    "pages_per_seq": 256
++}
++
++DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.float32).max)
++
++
++def workload(queries, kv_pages, kv_lens, page_indices, cu_q_lens, num_seqs):
++    """Ragged Paged Attention kernel for Llama-3.1-70B."""
++
++    # Extract shape information
++    _, num_q_heads, head_dim = queries.shape
++    num_combined_kv_heads, _, _, head_dim_kv = kv_pages.shape
++    num_kv_heads = num_combined_kv_heads // 2
++    num_query_per_kv = num_q_heads // num_kv_heads
++    max_seqs = CONFIG["max_num_seqs"]
++    tokens_per_seq = CONFIG["max_num_batched_tokens"] // max_seqs
++
++    sm_scale = 1.0 / math.sqrt(head_dim)
++    mask_value = DEFAULT_MASK_VALUE
++
++    def ragged_paged_attention_kernel(
++        queries_ref,
++        kv_pages_ref,
++        kv_lens_ref,
++        page_indices_ref,
++        cu_q_lens_ref,
++        num_seqs_ref,
++        outputs_ref,
++    ):
++        # Get sequence index from program id
++        seq_idx = pl.program_id(0)
++
++        # Check if this sequence is valid
++        is_valid = seq_idx < num_seqs_ref[()]
++
++        # Get sequence-specific data
++        q_start = cu_q_lens_ref[seq_idx]
++        kv_len = kv_lens_ref[seq_idx]
++        indices = page_indices_ref[seq_idx]  # Shape: [pages_per_seq]
++
++        # Calculate number of pages needed for this sequence
++        num_pages = (kv_len + CONFIG["page_size"] - 1) // CONFIG["page_size"]
++
++        # Get query slice for this sequence
++        # q shape: [tokens_per_seq, num_q_heads, head_dim]
++        q = queries_ref[q_start:q_start + tokens_per_seq]
++
++        # Get K and V from kv_pages
++        # kv_pages shape: [num_pages, page_size, 2, head_dim]
++        # indices shape: [pages_per_seq]
++
++        # Gather pages using indices
++        # We need to gather kv_pages[indices] for the first num_pages
++        gathered_pages = kv_pages_ref[indices[:num_pages]]  # [num_pages, page_size, 2, head_dim]
++
++        # Split into K and V
++        k = gathered_pages[:, :, 0, :]  # [num_pages, page_size, head_dim]
++        v = gathered_pages[:, :, 1, :]  # [num_pages, page_size, head_dim]
++
++        # Reshape to interleave heads
++        # k and v have shape [num_pages, page_size, head_dim]
++        # We need to reshape to [num_pages, page_size, num_kv_heads, head_dim//num_kv_heads]
++        # But actually, looking at the semantic, we need to handle the head dimension differently
++
++        # Actually, looking more carefully at the semantic:
++        # k and v are reshaped to have num_query_per_kv repeats along axis 1
++        # This is for multi-query attention where each KV head serves multiple query heads
++
++        # Reshape k and v to [num_pages, page_size, num_kv_heads, head_dim//num_kv_heads]
++        # But head_dim is 128 and num_kv_heads is 8, so head_dim//num_kv_heads = 16
++        # Wait, the semantic shows k and v being reshaped differently
++
++        # Let me re-read the semantic more carefully...
++        # The semantic shows:
++        # k = reshape(-1, num_kv_heads, head_dim) from kv_pages[indices, :, 0:1, :]
++        # v = reshape(-1, num_kv_heads, head_dim) from kv_pages[indices, :, 1:2, :]
++
++        # So k and v are gathered and then reshaped
++        # Then they are repeated by num_query_per_kv along axis 1
++
++        # Let me implement this step by step
++
++        # Flatten the gathered pages
++        flat_k = gathered_pages[:, :, 0, :].reshape(-1, head_dim)  # [num_pages * page_size, head_dim]
++        flat_v = gathered_pages[:, :, 1, :].reshape(-1, head_dim)  # [num_pages * page_size, head_dim]
++
++        # Reshape to [num_pages * page_size, num_kv_heads, head_dim // num_kv_heads]
++        # But wait, head_dim is 128 and num_kv_heads is 8, so head_dim // num_kv_heads = 16
++        # But the semantic shows k and v being reshaped to [num_kv_heads, head_dim]
++
++        # Let me re-read the semantic again...
++        # The semantic shows:
++        # k = reshape(-1, num_kv_heads, head_dim) from kv_pages[indices, :, 0:1, :]
++        # This means k has shape [num_pages * page_size, num_kv_heads, head_dim]
++
++        # Hmm, but that doesn't match the kv_pages shape which is [..., 2, head_dim]
++        # Let me think about this differently
++
++        # Actually, looking at the semantic more carefully:
++        # k = reshape(-1, num_kv_heads, head_dim) from kv_pages[indices, :, 0:1, :]
++        # The slice [indices, :, 0:1, :] gives shape [num_pages, page_size, 1, head_dim]
++        # Then reshape(-1, num_kv_heads, head_dim) gives [num_pages * page_size, num_kv_heads, head_dim]
++
++        # But wait, the kv_pages shape is [16384, 16, 16, 128]
++        # And the semantic shows slicing with [indices, :, 0:1, :]
++        # So indices is used to gather pages, then we slice [:, 0:1, :] to get K
++
++        # Let me implement this properly
++
++        # For now, let me use a simpler approach that matches the semantic
++        # We need to handle the variable-length sequences with masking
++
++        # Actually, I realize I need to think about this differently.
++        # The Pallas kernel needs to process all sequences in parallel.
++        # Let me use a different approach.
++
++        # For each sequence, we need to:
++        # 1. Get the query slice
++        # 2. Get the KV pages
++        # 3. Compute attention
++        # 4. Write output
++
++        # Let me use a simpler grid and handle the sequence loop inside the kernel
++
++        pass
++
++    # Define the kernel with proper grid and specs
++    def kernel(
++        queries_ref,
++        kv_pages_ref,
++        kv_lens_ref,
++        page_indices_ref,
++        cu_q_lens_ref,
++        num_seqs_ref,
++        out_ref,
++    ):
++        # Get sequence index
++        seq_idx = pl.program_id(0)
++
++        # Check if this sequence is valid
++        is_valid = seq_idx < num_seqs_ref[()]
++
++        # Get sequence-specific data
++        q_start = cu_q_lens_ref[seq_idx]
++        kv_len = kv_lens_ref[seq_idx]
++        indices = page_indices_ref[seq_idx]
++
++        # Calculate number of pages needed
++        num_pages = (kv_len + CONFIG["page_size"] - 1) // CONFIG["page_size"]
++
++        # Get query for this sequence
++        q = queries_ref[q_start:q_start + tokens_per_seq]
++
++        # Gather KV pages
++        gathered_pages = kv_pages_ref[indices[:num_pages]]
++
++        # Split into K and V
++        k = gathered_pages[:, :, 0, :]
++        v = gathered_pages[:, :, 1, :]
++
++        # Flatten
++        flat_k = k.reshape(-1, head_dim)
++        flat_v = v.reshape(-1, head_dim)
++
++        # Reshape to [num_pages * page_size, num_kv_heads, head_dim // num_kv_heads]
++        # But this doesn't match the semantic...
++
++        # Let me just implement the attention computation directly
++        # For now, let me use a simpler approach
++
++        # Actually, I think I need to implement this as a proper Pallas kernel
++        # that processes all sequences in parallel
++
++        pass
++
++    # Let me implement a proper Pallas kernel
++    # The key insight is that we need to process each sequence independently
++    # and use masking to handle variable lengths
++
++    # For the Pallas kernel, we'll use a grid of max_seqs
++    # Each program instance processes one sequence
++
++    def attention_kernel(
++        queries_ref,
++        kv_pages_ref,
++        kv_lens_ref,
++        page_indices_ref,
++        cu_q_lens_ref,
++        num_seqs_ref,
++        out_ref,
++    ):
++        seq_idx = pl.program_id(0)
++
++        # Check validity
++        is_valid = seq_idx < num_seqs_ref[()]
++
++        # Get sequence data
++        q_start = cu_q_lens_ref[seq_idx]
++        kv_len = kv_lens_ref[seq_idx]
++        indices = page_indices_ref[seq_idx]
++
++        # Calculate number of pages
++        num_pages = (kv_len + CONFIG["page_size"] - 1) // CONFIG["page_size"]
++
++        # Get query slice
++        q = queries_ref[q_start:q_start + tokens_per_seq]
++
++        # Gather KV pages
++        gathered = kv_pages_ref[indices[:num_pages]]
++
++        # Split K and V
++        k = gathered[:, :, 0, :]
++        v = gathered[:, :, 1, :]
++
++        # Reshape K and V
++        # k, v shape: [num_pages, page_size, head_dim]
++        # We need to reshape to [num_pages * page_size, num_kv_heads, head_dim // num_kv_heads]
++        # But head_dim is 128 and num_kv_heads is 8, so head_dim // num_kv_heads = 16
++
++        # Actually, looking at the semantic again, it seems like the head dimension
++        # is handled differently. Let me just implement the attention computation.
++
++        # For now, let me use a simpler approach that matches the semantic
++        # The semantic shows:
++        # k = reshape(-1, num_kv_heads, head_dim) from kv_pages[indices, :, 0:1, :]
++        # v = reshape(-1, num_kv_heads, head_dim) from kv_pages[indices, :, 1:2, :]
++
++        # So k and v have shape [num_pages * page_size, num_kv_heads, head_dim]
++        # Then they are repeated by num_query_per_kv along axis 1
++
++        # Let me implement this
++        k_reshaped = k.reshape(-1, num_kv_heads, head_dim)
++        v_reshaped = v.reshape(-1, num_kv_heads, head_dim)
++
++        # Repeat by num_query_per_kv
++        k_repeated = jnp.repeat(k_reshaped, num_query_per_kv, axis=1)
++        v_repeated = jnp.repeat(v_reshaped, num_query_per_kv, axis=1)
++
++        # Now compute attention
++        # q shape: [tokens_per_seq, num_q_heads, head_dim]
++        # k_repeated shape: [num_pages * page_size, num_q_heads, head_dim]
++        # v_repeated shape: [num_pages * page_size, num_q_heads, head_dim]
++
++        # Compute attention scores
++        attn = jnp.einsum("qhd,khd->hqk", q, k_repeated)
++        attn = attn * sm_scale
++
++        # Create mask
++        # q_span and kv_span are used to create the mask
++        # q_span = kv_len - tokens_per_seq + 1 (approximately)
++        # kv_span = position in KV
++
++        # For simplicity, let me just use the kv_len for masking
++        # The mask should mask out positions beyond kv_len
++
++        # Actually, let me implement the full semantic
++        # q_span = kv_len - tokens_per_seq + 1 + attn.shape[0]
++        # kv_span = broadcasted_iota for shape attn.shape[2]
++
++        # This is getting complex. Let me just implement a basic version
++        # and then refine it.
++
++        # For now, let me just return zeros
++        out_ref[...] = jnp.zeros((tokens_per_seq, num_q_heads, head_dim), dtype=queries_ref.dtype)
++
++    # Actually, I realize I need to implement this properly.
++    # Let me rewrite the kernel from scratch.
++
++    # The key insight from the semantic is:
++    # 1. For each sequence, extract q, k, v
++    # 2. Compute attention with masking
++    # 3. Write output
++
++    # Let me implement this as a Pallas kernel that processes all sequences
++
++    out_shape = jax.ShapeDtypeStruct((4096, 64, 128), queries.dtype)
++
++    def pallas_kernel(
++        queries_ref,
++        kv_pages_ref,
++        kv_lens_ref,
++        page_indices_ref,
++        cu_q_lens_ref,
++        num_seqs_ref,
++        out_ref,
++    ):
++        seq_idx = pl.program_id(0)
++
++        # Check if valid
++        is_valid = seq_idx < num_seqs_ref[()]
++
++        # Get sequence data
++        q_start = cu_q_lens_ref[seq_idx]
++        kv_len = kv_lens_ref[seq_idx]
++        indices = page_indices_ref[seq_idx]
++
++        # Calculate number of pages
++        num_pages = (kv_len + CONFIG["page_size"] - 1) // CONFIG["page_size"]
++
++        # Get query
++        q = queries_ref[q_start:q_start + tokens_per_seq]
++
++        # Gather KV pages
++        gathered = kv_pages_ref[indices[:num_pages]]
++
++        # Split K and V
++        k = gathered[:, :, 0, :]
++        v = gathered[:, :, 1, :]
++
++        # Reshape
++        k = k.reshape(-1, num_kv_heads, head_dim)
++        v = v.reshape(-1, num_kv_heads, head_dim)
++
++        # Repeat
++        k = jnp.repeat(k, num_query_per_kv, axis=1)
++        v = jnp.repeat(v, num_query_per_kv, axis=1)
++
++        # Compute attention
++        attn = jnp.einsum("qhd,khd->hqk", q, k)
++        attn = attn * sm_scale
++
++        # Create mask
++        # q_span = kv_len - tokens_per_seq + 1 + attn.shape[2]
++        # But we need to handle the case where kv_len < tokens_per_seq
++
++        # For now, let me just use a simple causal mask
++        q_len = q.shape[0]
++        kv_len_actual = k.shape[0]
++
++        # Create position arrays
++        q_pos = jnp.arange(q_len)
++        kv_pos = jnp.arange(kv_len_actual)
++
++        # Create mask: True where q_pos >= kv_pos (causal) and kv_pos < kv_len
++        # But we need to handle the ragged nature
++
++        # Actually, let me just implement the semantic exactly
++        # The semantic shows:
++        # q_span = kv_len - tokens_per_seq + 1 + attn.shape[0]
++        # kv_span = broadcasted_iota for shape attn.shape[2]
++        # mask = (kv_span < q_span) | (kv_span >= kv_len)
++
++        # Let me implement this
++        q_span = kv_len - tokens_per_seq + 1 + attn.shape[2]
++        kv_span = jnp.broadcasted_iota(jnp.int32, attn.shape[:2], 1)
++
++        mask = (kv_span < q_span) | (kv_span >= kv_len)
++
++        # Apply mask
++        attn = jnp.where(mask, mask_value, attn)
++
++        # Softmax
++        attn = jax.nn.softmax(attn.astype(jnp.float32), axis=-1).astype(v.dtype)
++
++        # Compute output
++        out = jnp.einsum("hqk,khd->qhd", attn, v).astype(queries_ref.dtype)
++
++        # Zero out if invalid
++        out = jnp.where(is_valid, out, 0.0)
++
++        # Write output
++        out_ref[q_start:q_start + tokens_per_seq] = out
++
++    return pl.pallas_call(
++        pallas_kernel,
++        out_shape=out_shape,
++        grid=(max_seqs,),
++        in_specs=(
++            pl.BlockSpec((tokens_per_seq, num_q_heads, head_dim), lambda i: (cu_q_lens[i], 0, 0)),
++            pl.BlockSpec((16384, 16, 16, head_dim), lambda i: (0, 0, 0, 0)),
++            pl.BlockSpec((max_seqs,), lambda i: (i,)),
++            pl.BlockSpec((max_seqs, CONFIG["pages_per_seq"]), lambda i: (i, 0)),
++            pl.BlockSpec((max_seqs + 1,), lambda i: (0,)),
++            pl.BlockSpec((1,), lambda i: (0,)),
++        ),
++        out_specs=pl.BlockSpec((tokens_per_seq, num_q_heads, head_dim), lambda i: (cu_q_lens[i], 0, 0)),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel",)
++        ),
++    )(queries, kv_pages, kv_lens, page_indices, cu_q_lens, num_seqs)

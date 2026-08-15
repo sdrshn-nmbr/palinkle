@@ -1,0 +1,134 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as plp
+import jax.interpreters.pallas as pallas
+from jax.interpreters import pallas as pl
+from jax.pallas import lib as pllib
+import jax.numpy as jnp
+
+# TPU-specific imports
+try:
+    from jax.pallas import TPUCompilerParams
+    from jax.pallas import TPUBlockSpec
+    HAS_TPU = True
+except ImportError:
+    HAS_TPU = False
+
+# Configuration
+CONFIG = {
+    "batch": 4,
+    "head_dim": 128,
+    "model": "Llama-3.1-70B",
+    "name": "llama3_70b_flex_attention",
+    "num_heads": 64,
+    "operator": "flex_attention",
+    "seq_len": 4096
+}
+
+def workload(q, k, v, rel_pos_bias):
+    """Flex attention workload for TPU Pallas kernel.
+    
+    Computes: softmax((q @ k^T * sm_scale + rel_pos_bias) * causal_mask) @ v
+    where causal_mask is lower triangular.
+    """
+    D = CONFIG["head_dim"]  # 128
+    S = CONFIG["seq_len"]   # 4096
+    sm_scale = D ** -0.5
+    
+    # Block sizes for tiling
+    BLOCK_Q = 128  # Query sequence block
+    BLOCK_K = 128  # Key sequence block
+    BLOCK_D = 128  # Head dimension block
+    
+    # Grid dimensions: (batch, heads, num_q_blocks)
+    num_q_blocks = (S + BLOCK_Q - 1) // BLOCK_Q
+    grid = (CONFIG["batch"], CONFIG["num_heads"], num_q_blocks)
+    
+    def attention_kernel(
+        q_ref, k_ref, v_ref, rel_pos_bias_ref, out_ref,
+        batch_ref, head_ref, q_block_ref
+    ):
+        """Pallas kernel for attention computation."""
+        b = batch_ref[()]
+        h = head_ref[()]
+        q_start = q_block_ref[()] * BLOCK_Q
+        
+        # Get shapes
+        seq_len = S
+        head_dim = D
+        
+        # Initialize output accumulator in float32 for numerical stability
+        # Output shape: [seq_len, head_dim]
+        # We compute one query block at a time
+        
+        # For each query position in the block
+        for q_local in range(BLOCK_Q):
+            q_idx = q_start + q_local
+            if q_idx >= seq_len:
+                break
+            
+            # Initialize attention scores accumulator
+            # We need to accumulate over all key positions
+            attn_scores = jnp.zeros(seq_len, dtype=jnp.float32)
+            
+            # Compute attention scores with all key positions
+            # Q[b, h, q_idx, :] @ K[b, h, :, :].T
+            q_vec = q_ref[b, h, q_idx, :].astype(jnp.float32)  # [head_dim]
+            
+            # Tile over key dimension
+            for k_block in range(0, seq_len, BLOCK_K):
+                k_end = min(k_block + BLOCK_K, seq_len)
+                
+                # Get key block
+                k_block_data = k_ref[b, h, k_block:k_end, :]  # [BLOCK_K, head_dim]
+                
+                # Compute dot products: q @ k^T for this block
+                # Result shape: [BLOCK_K]
+                scores_block = jnp.dot(q_vec, k_block_data.T) * sm_scale  # [BLOCK_K]
+                
+                # Add relative position bias
+                # rel_pos_bias has shape [num_heads, seq_len, seq_len]
+                bias_block = rel_pos_bias_ref[h, q_idx, k_block:k_end].astype(jnp.float32)
+                scores_block = scores_block + bias_block
+                
+                # Apply causal mask: only keep scores where k_idx <= q_idx
+                for i in range(k_end - k_block):
+                    k_idx = k_block + i
+                    if k_idx > q_idx:
+                        scores_block = scores_block.at[i].set(-1e30)
+                
+                # Accumulate scores
+                attn_scores = attn_scores.at[k_block:k_end].set(scores_block)
+            
+            # Apply softmax
+            attn_probs = jax.nn.softmax(attn_scores)
+            
+            # Compute output: sum over values weighted by attention
+            # Tile over head dimension
+            out_vec = jnp.zeros(head_dim, dtype=jnp.float32)
+            for v_block in range(0, seq_len, BLOCK_K):
+                v_end = min(v_block + BLOCK_K, seq_len)
+                v_block_data = v_ref[b, h, v_block:v_end, :]  # [BLOCK_K, head_dim]
+                weights = attn_probs[v_block:v_end]  # [BLOCK_K]
+                out_vec = out_vec + jnp.outer(weights, v_block_data.astype(jnp.float32))
+            
+            # Write output
+            out_ref[b, h, q_idx, :] = out_vec.astype(q_ref.dtype)
+    
+    # Use pallas_call with proper specs
+    return pl.pallas_call(
+        attention_kernel,
+        out_shape=jax.ShapeDtypeStruct(q.shape, q.dtype),
+        grid=grid,
+        in_specs=(
+            pl.BlockSpec((1, 1, S, D), lambda b, h, q_block, _: (b, h, 0, 0)),
+            pl.BlockSpec((1, 1, S, D), lambda b, h, q_block, _: (b, h, 0, 0)),
+            pl.BlockSpec((1, 1, S, D), lambda b, h, q_block, _: (b, h, 0, 0)),
+            pl.BlockSpec((1, S, S), lambda b, h, q_block, _: (h, 0, 0)),
+        ),
+        out_specs=pl.BlockSpec((1, 1, S, D), lambda b, h, q_block, _: (b, h, 0, 0)),
+        compiler_params=jax.pallas TPUCompilerParams(
+            dimension_semantics=("parallel", "parallel", "parallel", "parallel")
+        ) if HAS_TPU else None,
+    )(q, k, v, rel_pos_bias)

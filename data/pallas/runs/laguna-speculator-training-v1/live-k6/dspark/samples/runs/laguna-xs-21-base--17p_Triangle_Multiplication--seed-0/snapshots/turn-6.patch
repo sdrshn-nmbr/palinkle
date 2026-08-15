@@ -1,0 +1,110 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..0da1405 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,103 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.nn as nn
++import pallas as pl
++import torch_pallas as pltpu
++
++def workload(pair_act, mask, left_proj_w, right_proj_w, left_gate_w, right_gate_w, center_scale, out_proj_w, out_gate_w):
++    """Triangle Multiplicative Update (Outgoing) kernel for AlphaFold2."""
++    
++    # Define block size for tiling
++    BLOCK_I = 128
++    BLOCK_J = 128
++    BLOCK_K = 128
++    BLOCK_C = 128
++    
++    def kernel(ref_pair_act, ref_mask, ref_left_proj_w, ref_right_proj_w, 
++               ref_left_gate_w, ref_right_gate_w, ref_center_scale, 
++               ref_out_proj_w, ref_out_gate_w, ref_out):
++        # Get program IDs for grid traversal
++        i = pl.program_id(0)
++        j = pl.program_id(1)
++        c = pl.program_id(2)
++        
++        # Initialize accumulators
++        left_proj_acc = jnp.zeros((BLOCK_K, BLOCK_C), dtype=jnp.float32)
++        right_proj_acc = jnp.zeros((BLOCK_K, BLOCK_C), dtype=jnp.float32)
++        result_acc = jnp.zeros((BLOCK_I, BLOCK_J, BLOCK_C), dtype=jnp.float32)
++        
++        # Tile over the contracted dimension k
++        for k in range(pair_act.shape[1] // BLOCK_K):
++            # Load act = pair_act * mask for this tile
++            act_i = ref_pair_act[i * BLOCK_I:(i + 1) * BLOCK_I, k * BLOCK_K:(k + 1) * BLOCK_K, :]
++            mask_tile = ref_mask[i * BLOCK_I:(i + 1) * BLOCK_I, k * BLOCK_K:(k + 1) * BLOCK_K, :]
++            act = act_i * mask_tile
++            
++            # Compute left_proj = act @ left_proj_w
++            left_proj_tile = jnp.dot(act, ref_left_proj_w)
++            
++            # Compute right_proj = act @ right_proj_w
++            right_proj_tile = jnp.dot(act, ref_right_proj_w)
++            
++            # Compute gates
++            left_gate = nn.sigmoid(jnp.dot(act, ref_left_gate_w))
++            right_gate = nn.sigmoid(jnp.dot(act, ref_right_gate_w))
++            
++            # Apply gates
++            left_proj_tile = left_proj_tile * left_gate
++            right_proj_tile = right_proj_tile * right_gate
++            
++            # Accumulate for einsum
++            # We need to compute einsum("ikc,jkc->ijc", left_proj, right_proj)
++            # This means for each (i, j, c), sum over k: left_proj[i,k,c] * right_proj[j,k,c]
++            # We'll accumulate this in result_acc
++            
++            # Load right_proj for all j positions
++            for j_tile in range(pair_act.shape[0] // BLOCK_J):
++                right_proj_j = ref_right_proj[j_tile * BLOCK_J:(j_tile + 1) * BLOCK_J, k * BLOCK_K:(k + 1) * BLOCK_K, :]
++                right_gate_j = nn.sigmoid(jnp.dot(ref_pair_act[j_tile * BLOCK_J:(j_tile + 1) * BLOCK_J, k * BLOCK_K:(k + 1) * BLOCK_K, :], ref_right_gate_w))
++                right_proj_j = right_proj_j * right_gate_j
++                
++                # Compute partial einsum contribution
++                partial = jnp.einsum("ikc,jkc->ijc", left_proj_tile, right_proj_j)
++                result_acc = result_acc + partial
++        
++        # Compute RMS
++        eps = 1e-6
++        rms = jnp.sqrt(jnp.mean(result_acc * result_acc, axis=-1, keepdims=True) + eps)
++        
++        # Normalize and scale
++        result = (result_acc / rms) * ref_center_scale[c:c+BLOCK_C]
++        
++        # Compute output = result @ out_proj_w
++        output = jnp.dot(result, ref_out_proj_w)
++        
++        # Compute final gate
++        gate = nn.sigmoid(jnp.dot(ref_pair_act[i * BLOCK_I:(i + 1) * BLOCK_I, j * BLOCK_J:(j + 1) * BLOCK_J, :], ref_out_gate_w))
++        
++        # Write output
++        ref_out[i * BLOCK_I:(i + 1) * BLOCK_I, j * BLOCK_J:(j + 1) * BLOCK_J, c * BLOCK_C:(c + 1) * BLOCK_C] = output * gate
++    
++    # Grid dimensions
++    grid = (pair_act.shape[0] // BLOCK_I, pair_act.shape[0] // BLOCK_J, pair_act.shape[2] // BLOCK_C)
++    
++    return pl.pallas_call(
++        kernel,
++        out_shape=jax.ShapeDtypeStruct(pair_act.shape, pair_act.dtype),
++        grid=grid,
++        in_specs=(
++            pl.BlockSpec((BLOCK_I, BLOCK_K, BLOCK_C), lambda i, k, c: (i * BLOCK_I, k * BLOCK_K, c * BLOCK_C)),
++            pl.BlockSpec((BLOCK_I, BLOCK_K, 1), lambda i, k, c: (i * BLOCK_I, k * BLOCK_K, 0)),
++            pl.BlockSpec((BLOCK_C, BLOCK_C), lambda i, k, c: (0, 0)),
++            pl.BlockSpec((BLOCK_C, BLOCK_C), lambda i, k, c: (0, 0)),
++            pl.BlockSpec((BLOCK_C, BLOCK_C), lambda i, k, c: (0, 0)),
++            pl.BlockSpec((BLOCK_C, BLOCK_C), lambda i, k, c: (0, 0)),
++            pl.BlockSpec((BLOCK_C,), lambda i, k, c: (c * BLOCK_C,)),
++            pl.BlockSpec((BLOCK_C, BLOCK_C), lambda i, k, c: (0, 0)),
++            pl.BlockSpec((BLOCK_C, BLOCK_C), lambda i, k, c: (0, 0)),
++        ),
++        out_specs=pl.BlockSpec((BLOCK_I, BLOCK_J, BLOCK_C), lambda i, j, c: (i * BLOCK_I, j * BLOCK_J, c * BLOCK_C)),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel", "parallel", "parallel")
++        ),
++    )(pair_act, mask, left_proj_w, right_proj_w, left_gate_w, right_gate_w, center_scale, out_proj_w, out_gate_w)

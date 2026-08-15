@@ -1,0 +1,77 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..6af9a58 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,70 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as plp
++import jax.lax as lax
++
++def kernel(x_ref, weight_ref, bias_ref, out_ref):
++    # Get the batch index
++    batch_idx = pl.program_id(0)
++    
++    # Read the input row for this batch
++    x_row = x_ref[batch_idx, :]  # [8192]
++    
++    # Read weight and bias
++    weight = weight_ref[:]  # [8192, 8192]
++    bias = bias_ref[:]  # [8192]
++    
++    # Matmul: x @ weight + bias
++    # Result shape: [8192]
++    result = jnp.dot(x_row, weight) + bias
++    
++    # Expand dims on axis 1 -> [8192, 1]
++    result = jnp.expand_dims(result, axis=1)
++    
++    # Reduce window (avg pool with kernel size 16)
++    # Window dimensions: [1, 1, 16], strides: [1, 1, 16]
++    # Result shape: [8192 // 16, 1] = [512, 1]
++    pool_kernel_size = 16
++    pooled = lax.reduce_window(
++        result,
++        init_value=0.0,
++        computation=lax.add,
++        window_dimensions=(1, 1, pool_kernel_size),
++        window_strides=(1, 1, pool_kernel_size),
++        padding="VALID"
++    ) / pool_kernel_size
++    
++    # Squeeze on axis 1 -> [512]
++    pooled = jnp.squeeze(pooled, axis=1)
++    
++    # GELU activation
++    pooled = jax.nn.gelu(pooled)
++    
++    # Scale by 2.0
++    pooled = pooled * 2.0
++    
++    # Max along axis 0 -> scalar
++    final_result = jnp.max(pooled)
++    
++    # Write output
++    out_ref[batch_idx] = final_result
++
++
++def workload(x, weight, bias):
++    batch_size = x.shape[0]
++    
++    return pl.pallas_call(
++        kernel,
++        out_shape=jax.ShapeDtypeStruct((batch_size,), x.dtype),
++        grid=(batch_size,),
++        in_specs=(
++            pl.BlockSpec((1, 8192), lambda batch_idx: (batch_idx, 0)),
++            pl.BlockSpec((8192, 8192), lambda: (0, 0)),
++            pl.BlockSpec((8192,), lambda: 0),
++        ),
++        out_specs=pl.BlockSpec((1,), lambda batch_idx: (batch_idx,)),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel",)
++        ),
++    )(x, weight, bias)

@@ -1,0 +1,72 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..acf1fa2 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,65 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.lax as lax
++import jax.scipy.special as jsp
++import pallas as pl
++import triton.pallas as pltpu
++
++
++def workload(x, conv_weight, conv_bias, gn_weight, gn_bias):
++    groups = 16
++    eps = 1e-05
++    
++    # Transpose x from NCHW to NHWC
++    x_nhwc = jnp.transpose(x, (0, 2, 3, 1))
++    
++    # Transpose kernel from OIHW to HWIO
++    kernel = jnp.transpose(conv_weight, (2, 3, 1, 0))
++    
++    # Conv2d with VALID padding
++    x_conv = lax.conv_general_dilated(
++        x_nhwc,
++        kernel,
++        window_strides=(1, 1),
++        padding="VALID",
++        dimension_numbers=("NHWC", "HWIO", "NHWC")
++    )
++    
++    # Add bias (reshape to broadcast)
++    x_conv = x_conv + jnp.reshape(conv_bias, (1, 1, 1, 64))
++    
++    # Transpose back to NCHW
++    x_conv = jnp.transpose(x_conv, (0, 3, 1, 2))
++    
++    # Get shape
++    N, C, H, W = x_conv.shape
++    
++    # Reshape for group norm: (N, groups, C//groups, H, W)
++    x = jnp.reshape(x_conv, (N, groups, C // groups, H, W))
++    
++    # GroupNorm: compute mean and variance over H, W, and C//groups dimensions
++    mean = jnp.mean(x, axis=(2, 3, 4), keepdims=True)
++    var = jnp.var(x, axis=(2, 3, 4), keepdims=True)
++    
++    # Normalize
++    x = (x - mean) / jnp.sqrt(var + eps)
++    
++    # Reshape back to (N, C, H, W)
++    x = jnp.reshape(x, (N, C, H, W))
++    
++    # Apply gamma and beta (scale and shift)
++    x_norm = x * jnp.reshape(gn_weight, (1, C, 1, 1)) + jnp.reshape(gn_bias, (1, C, 1, 1))
++    
++    # Tanh
++    x_tanh = jnp.tanh(x_norm)
++    
++    # HardSwish: x * clip(x + 3, 0, 6) / 6
++    x_hard_swish = x_tanh * jnp.minimum(jnp.maximum(x_tanh + 3, 0), 6) / 6
++    
++    # Residual add
++    x_res = x_conv + x_hard_swish
++    
++    # LogSumExp over axis 1 (channel dimension)
++    x_logsumexp = jsp.logsumexp(x_res, axis=1, keepdims=True)
++    
++    return x_logsumexp

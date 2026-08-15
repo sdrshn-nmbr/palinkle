@@ -1,0 +1,70 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas.tpu as pltpu
+
+def workload(x, weight, linear_bias, gn_weight, gn_bias, bias):
+    """Gemm + GroupNorm + Min + BiasAdd kernel."""
+    
+    # Constants
+    num_groups = 512
+    eps = 1e-5
+    
+    # Output shape
+    out_shape = jax.ShapeDtypeStruct((1, 8192, 4096, 1), x.dtype)
+    
+    # Block sizes for TPU (multiples of 8 for bf16, 128 for vectorization)
+    block_m = 128  # batch dimension block
+    block_n = 128  # output feature block
+    block_k = 128  # reduction dimension block
+    
+    def kernel(x_ref, weight_ref, linear_bias_ref, gn_weight_ref, gn_bias_ref, bias_ref, out_ref):
+        # Get program IDs
+        m = pl.program_id(0)  # batch block index
+        n = pl.program_id(1)  # output feature block index
+        
+        # Compute local indices
+        m_start = m * block_m
+        n_start = n * block_n
+        
+        # Matmul: x @ weight + linear_bias
+        # Accumulate in float32 for better precision
+        acc = jnp.zeros((block_m, block_n), dtype=jnp.float32)
+        
+        # Tiled matmul along K dimension
+        for k in range(0, 8192, block_k):
+            k_end = min(k + block_k, 8192)
+            x_block = x_ref[m_start:m_start + block_m, k:k_end].astype(jnp.float32)
+            w_block = weight_ref[k:k_end, n_start:n_start + block_n].astype(jnp.float32)
+            acc = acc + jnp.dot(x_block, w_block)
+        
+        # Add bias
+        acc = acc + linear_bias_ref[n_start:n_start + block_n].astype(jnp.float32)
+        
+        # Convert back to bfloat16
+        result = acc.astype(x.dtype)
+        
+        # Write output
+        out_ref[m_start:m_start + block_m, n_start:n_start + block_n] = result
+    
+    # Grid dimensions
+    grid_m = (4096 + block_m - 1) // block_m
+    grid_n = (8192 + block_n - 1) // block_n
+    
+    return pl.pallas_call(
+        kernel,
+        out_shape=out_shape,
+        grid=(grid_m, grid_n),
+        in_specs=(
+            pl.BlockSpec((block_m, 8192), lambda m, n: (m * block_m, 0)),
+            pl.BlockSpec((8192, block_n), lambda m, n: (0, n * block_n)),
+            pl.BlockSpec((block_n,), lambda m, n: (n * block_n,)),
+            pl.BlockSpec((8192,), lambda m, n: (0,)),
+            pl.BlockSpec((8192,), lambda m, n: (0,)),
+            pl.BlockSpec((1, 8192, 1, 1), lambda m, n: (0, 0, 0, 0)),
+        ),
+        out_specs=pl.BlockSpec((block_m, block_n), lambda m, n: (m * block_m, n * block_n)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel")
+        ),
+    )(x, weight, linear_bias, gn_weight, gn_bias, bias)

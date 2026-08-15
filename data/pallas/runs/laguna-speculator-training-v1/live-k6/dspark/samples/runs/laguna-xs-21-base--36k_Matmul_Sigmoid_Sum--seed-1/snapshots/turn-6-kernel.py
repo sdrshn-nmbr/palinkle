@@ -1,0 +1,42 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas.tpu as pltpu
+
+
+def matmul_sigmoid_sum_kernel(x_ref, weight_ref, bias_ref, out_ref):
+    """Pallas kernel for matmul + sigmoid + sum."""
+    # Compute matmul: x_ref @ weight_ref -> result
+    result = jnp.dot(x_ref[:], weight_ref[:])
+    
+    # Add bias (broadcasts along first dimension)
+    result = result + bias_ref[:]
+    
+    # Apply sigmoid
+    result = jax.nn.sigmoid(result)
+    
+    # Sum along axis 1 with keepdims
+    result = jnp.sum(result, axis=1, keepdims=True)
+    
+    out_ref[:] = result
+
+
+def workload(x, weight, bias):
+    """Workload for 56_Matmul_Sigmoid_Sum."""
+    block_size = 128
+    grid = (x.shape[0] // block_size, 1)
+    
+    return pl.pallas_call(
+        matmul_sigmoid_sum_kernel,
+        out_shape=jax.ShapeDtypeStruct((x.shape[0], 1), x.dtype),
+        grid=grid,
+        in_specs=(
+            pl.BlockSpec((block_size, x.shape[1]), lambda m, n: (m * block_size, 0)),
+            pl.BlockSpec((weight.shape[0], weight.shape[1]), lambda m, n: (0, 0)),
+            pl.BlockSpec((bias.shape[0],), lambda m, n: (0,)),
+        ),
+        out_specs=pl.BlockSpec((block_size, 1), lambda m, n: (m * block_size, 0)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",)
+        ),
+    )(x, weight, bias)

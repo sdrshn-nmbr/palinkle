@@ -1,0 +1,65 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as pltpu
+
+
+def workload(A, B):
+    """TPU Pallas kernel for dense matrix multiplication (GEMM).
+    
+    Computes C = A @ B where:
+    - A: (8192, 8192) bf16
+    - B: (8192, 28672) bf16
+    - C: (8192, 28672) bf16
+    """
+    M, K = A.shape
+    K, N = B.shape
+    
+    # Block sizes: multiples of 8 for bf16, 128 for vectorized dimensions
+    block_m = 128
+    block_k = 128
+    block_n = 128
+    
+    def gemm_kernel(ref_A, ref_B, ref_C):
+        # Get program IDs
+        m_block = pl.program_id(0)
+        n_block = pl.program_id(1)
+        
+        # Initialize accumulator in float32
+        acc = jnp.zeros((block_m, block_n), dtype=jnp.float32)
+        
+        # Loop over K dimension
+        for k_block in range(K // block_k):
+            # Load blocks from A and B
+            a_block = ref_A[
+                m_block * block_m:(m_block + 1) * block_m,
+                k_block * block_k:(k_block + 1) * block_k
+            ]
+            b_block = ref_B[
+                k_block * block_k:(k_block + 1) * block_k,
+                n_block * block_n:(n_block + 1) * block_n
+            ]
+            
+            # Compute dot product and accumulate in float32
+            acc = acc + jnp.dot(a_block, b_block).astype(jnp.float32)
+        
+        # Write result back in bf16
+        ref_C[...] = acc.astype(jnp.bfloat16)
+    
+    # Grid dimensions
+    grid_m = M // block_m
+    grid_n = N // block_n
+    
+    return pl.pallas_call(
+        gemm_kernel,
+        out_shape=jax.ShapeDtypeStruct((M, N), jnp.bfloat16),
+        grid=(grid_m, grid_n),
+        in_specs=(
+            pl.BlockSpec((block_m, block_k), lambda m, n, k=0: (m * block_m, k * block_k)),
+            pl.BlockSpec((block_k, block_n), lambda m, n, k=0: (k * block_k, n * block_n)),
+        ),
+        out_specs=pl.BlockSpec((block_m, block_n), lambda m, n: (m * block_m, n * block_n)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel")
+        ),
+    )(A, B)

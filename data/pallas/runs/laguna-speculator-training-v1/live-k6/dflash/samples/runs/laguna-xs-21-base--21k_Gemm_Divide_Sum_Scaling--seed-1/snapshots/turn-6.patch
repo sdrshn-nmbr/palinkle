@@ -1,0 +1,52 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..fd0e1f8 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,45 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as plp
++import jax.interpreters.tpu as pltpu
++
++
++def workload(x, weight):
++    """GEMM + Divide + Sum + Scaling kernel."""
++    block_size = 128  # Block size for tiling
++    
++    def kernel(x_ref, weight_ref, out_ref):
++        # Get program IDs for grid traversal
++        m = pl.program_id(0)  # batch dimension
++        k = pl.program_id(1)  # reduction dimension (sum axis)
++        
++        # Initialize accumulator in float32 for precision
++        acc = jnp.zeros((), dtype=jnp.float32)
++        
++        # Perform the matmul along the reduction dimension
++        # x[m, :] @ weight[:, k] -> accumulate for each k
++        for n in range(x_ref.shape[1] // block_size):
++            x_block = x_ref[m, n * block_size:(n + 1) * block_size]
++            w_block = weight_ref[n * block_size:(n + 1) * block_size, k]
++            acc = acc + jnp.dot(x_block, w_block)
++        
++        # Store result
++        out_ref[m, k] = acc
++    
++    # Grid: (batch_size, 1) since output is [4096, 1]
++    grid = (x.shape[0], 1)
++    
++    return pl.pallas_call(
++        kernel,
++        out_shape=jax.ShapeDtypeStruct((x.shape[0], 1), x.dtype),
++        grid=grid,
++        in_specs=(
++            pl.BlockSpec((x.shape[0], x.shape[1]), lambda m, k: (m, 0)),
++            pl.BlockSpec((weight.shape[0], weight.shape[1]), lambda m, k: (0, k)),
++        ),
++        out_specs=pl.BlockSpec((x.shape[0], 1), lambda m, k: (m, k)),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel", "parallel")
++        ),
++    )(x, weight)

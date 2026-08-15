@@ -1,0 +1,57 @@
+diff --git a/__pycache__/kernel.cpython-312.pyc b/__pycache__/kernel.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..284b60bcb6432d0584ce61b5cbafd130250ab556
+GIT binary patch
+literal 223
+zcmX@j%ge<81aFlpvgCpEV-N=h7@>^MASKfoQW#noq8KU}HJOrODqu7_knx!Xtg4bh
+zlhJP_khsN`nO9I+Qd|r&M&Xx;etCXTc5y*sa;koIYEfQlj$T3KEe?=iPJUua5gSky
+zNM$iAkZ54I!NUF-$YAi(WCTkUF#|b8AbW~H3T|=O<mRW8=A_ycaR9ksjUZQkU}j`w
+M{LIA2$N^Rh06d;4E&u=k
+
+literal 0
+HcmV?d00001
+
+diff --git a/kernel.py b/kernel.py
+index a877f2f..2a46e7a 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,37 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as pltpu
++
++def workload(x, weight, conv_bias, bias):
++    """Conv2D + ReLU + BiasAdd kernel."""
++    
++    # Transpose x from NCHW to NHWC: [128, 64, 128, 128] -> [128, 128, 128, 64]
++    x_nhwc = jnp.transpose(x, (0, 2, 3, 1))
++    
++    # Transpose weight from HWIO to HWIO format: [128, 64, 3, 3] -> [3, 3, 64, 128]
++    kernel = jnp.transpose(weight, (2, 3, 1, 0))
++    
++    # Conv2D: NHWC input, HWIO kernel, NHWC output
++    # Output shape: [128, 126, 126, 128]
++    conv_out = jax.lax.conv_general_dilated(
++        x_nhwc,
++        kernel,
++        window_strides=(1, 1),
++        padding="VALID",
++        dimension_numbers=("NHWC", "HWIO", "NHWC")
++    )
++    
++    # Add conv_bias: reshape to [1, 1, 1, 128] and broadcast
++    conv_out = conv_out + jnp.reshape(conv_bias, (1, 1, 1, -1))
++    
++    # ReLU activation
++    relu_out = jax.nn.relu(conv_out)
++    
++    # Transpose from NHWC to NCHW: [128, 126, 126, 128] -> [128, 128, 126, 126]
++    output = jnp.transpose(relu_out, (0, 3, 1, 2))
++    
++    # Add bias: [128, 128, 126, 126] + [128, 1, 1] -> broadcast
++    output = output + bias
++    
++    return output

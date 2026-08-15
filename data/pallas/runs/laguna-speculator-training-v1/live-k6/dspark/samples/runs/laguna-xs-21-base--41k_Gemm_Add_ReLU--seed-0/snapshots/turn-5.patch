@@ -1,0 +1,71 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..e0a6104 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,64 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as plp
++import jax.interpreters.tpu as pltpu
++
++
++def gemm_add_relu_kernel(x_ref, weight_ref, bias_ref, out_ref):
++    """Pallas kernel for Gemm + Add + ReLU."""
++    m = x_ref.shape[0]
++    k = x_ref.shape[1]
++    n = weight_ref.shape[1]
++    
++    # Accumulate in float32 for better precision
++    acc = jnp.zeros((m, n), dtype=jnp.float32)
++    
++    # Matrix multiplication
++    for i in range(k):
++        acc = acc + x_ref[:, i] * weight_ref[i, :]
++    
++    # Add bias and apply ReLU
++    result = acc + bias_ref[jnp.newaxis, :]
++    result = jnp.maximum(result, 0.0)
++    
++    out_ref[...] = result.astype(x_ref.dtype)
++
++
++def workload(x, weight, bias):
++    """Gemm + Add + ReLU workload."""
++    block_m = 128
++    block_n = 128
++    block_k = 8
++    
++    m, k = x.shape
++    _, n = weight.shape
++    
++    grid = (m // block_m, n // block_n)
++    
++    def index_map(m_idx, n_idx):
++        return (m_idx * block_m, n_idx * block_n)
++    
++    def x_index_map(m_idx, n_idx):
++        return (m_idx * block_m, slice(None))
++    
++    def weight_index_map(m_idx, n_idx):
++        return (slice(None), n_idx * block_n)
++    
++    def bias_index_map(m_idx, n_idx):
++        return (slice(None), n_idx * block_n)
++    
++    return pl.pallas_call(
++        gemm_add_relu_kernel,
++        out_shape=jax.ShapeDtypeStruct((m, n), x.dtype),
++        grid=grid,
++        in_specs=(
++            pl.BlockSpec((block_m, k), x_index_map),
++            pl.BlockSpec((k, block_n), weight_index_map),
++            pl.BlockSpec((block_n,), bias_index_map),
++        ),
++        out_specs=pl.BlockSpec((block_m, block_n), index_map),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel", "parallel")
++        ),
++    )(x, weight, bias)

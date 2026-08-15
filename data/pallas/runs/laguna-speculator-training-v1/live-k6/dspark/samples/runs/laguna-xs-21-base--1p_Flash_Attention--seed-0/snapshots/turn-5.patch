@@ -1,0 +1,93 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..a31b103 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,86 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as plp
++import jax.interpreters.tpu as pltpu
++
++def workload(query, key, value):
++    B, H, S, D = query.shape
++    
++    # Block size for tiling - use multiples of 8 for bf16
++    block_q = 64  # query block size
++    block_k = 64  # key block size
++    
++    # Grid: iterate over batch, heads, and query blocks
++    grid = (B, H, (S + block_q - 1) // block_q)
++    
++    def flash_attention_kernel(
++        query_ref,
++        key_ref,
++        value_ref,
++        out_ref,
++        *,
++        batch=pl.program_id(0),
++        head=pl.program_id(1),
++        q_block=pl.program_id(2),
++    ):
++        # Get the query position range for this block
++        q_start = q_block * block_q
++        q_end = min(q_start + block_q, S)
++        
++        # Scale factor: 1/sqrt(D)
++        scale = 1.0 / jnp.sqrt(D)
++        
++        # For each query position in the block
++        for q_idx in pl.range(q_end - q_start):
++            q_pos = q_start + q_idx
++            
++            # Initialize running sum and max for numerically stable softmax
++            running_sum = 0.0
++            running_max = -jnp.inf
++            
++            # Accumulator for output
++            acc = jnp.zeros(D, dtype=jnp.float32)
++            
++            # Iterate over all key positions (causal: k < q)
++            for k_pos in pl.range(q_pos + 1):
++                # Load query and key vectors
++                q_vec = query_ref[batch, head, q_pos, :].astype(jnp.float32)
++                k_vec = key_ref[batch, head, k_pos, :].astype(jnp.float32)
++                v_vec = value_ref[batch, head, k_pos, :].astype(jnp.float32)
++                
++                # Compute attention score
++                score = jnp.dot(q_vec, k_vec) * scale
++                
++                # Update max for numerical stability
++                new_max = jnp.maximum(running_max, score)
++                
++                # Update running sum with scaling
++                if running_max > -jnp.inf:
++                    running_sum = running_sum * jnp.exp(running_max - new_max)
++                running_sum = running_sum + jnp.exp(score - new_max)
++                running_max = new_max
++                
++                # Accumulate value
++                acc = acc + jnp.exp(score - running_max) * v_vec
++            
++            # Normalize and write output
++            if running_sum > 0:
++                acc = acc / running_sum
++            
++            out_ref[batch, head, q_pos, :] = acc.astype(query.dtype)
++    
++    return pl.pallas_call(
++        flash_attention_kernel,
++        out_shape=jax.ShapeDtypeStruct(query.shape, query.dtype),
++        grid=grid,
++        in_specs=(
++            pl.BlockSpec((S, D), lambda b, h, _: (b, h, 0, 0)),
++            pl.BlockSpec((S, D), lambda b, h, _: (b, h, 0, 0)),
++            pl.BlockSpec((S, D), lambda b, h, _: (b, h, 0, 0)),
++        ),
++        out_specs=pl.BlockSpec((block_q, D), lambda b, h, q: (b, h, q * block_q, 0)),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel", "parallel", "parallel")
++        ),
++    )(query, key, value)

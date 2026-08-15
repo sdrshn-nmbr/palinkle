@@ -1,0 +1,91 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as plp
+import jax.interpreters.tpu as pltpu
+
+def workload(x, gemm_weight, gemm_bias, gn_weight, gn_bias, multiply_weight):
+    """
+    GEMM + GroupNorm + Swish + Multiply + Swish
+    """
+    batch_size = x.shape[0]
+    out_features = 8192
+    num_groups = 256
+    group_size = out_features // num_groups  # 32
+    
+    block_size = 128  # Block size for parallel dimension
+    
+    def kernel(ref_out, x_ref, gemm_weight_ref, gemm_bias_ref, 
+               gn_weight_ref, gn_bias_ref, multiply_weight_ref):
+        # Get program ID for batch dimension
+        batch_idx = pl.program_id(0)
+        
+        # GEMM: x @ gemm_weight + gemm_bias
+        # We'll compute this row by row for each batch element
+        # Each block computes one row of the output
+        
+        # Read the input row and compute GEMM
+        x_row = x_ref[batch_idx, :]  # [out_features]
+        
+        # Compute GEMM: x_row @ gemm_weight + gemm_bias
+        # Accumulate in float32 for better precision
+        gemm_result = jnp.zeros((out_features,), dtype=jnp.float32)
+        
+        # Tile the matmul for better performance
+        tile_size = 128
+        for i in range(0, out_features, tile_size):
+            x_tile = x_row[i:i+tile_size].astype(jnp.float32)
+            w_tile = gemm_weight_ref[i:i+tile_size, :].astype(jnp.float32)
+            gemm_result = gemm_result + jnp.dot(x_tile, w_tile)
+        
+        gemm_result = gemm_result.astype(jnp.bfloat16) + gemm_bias_ref
+        
+        # GroupNorm
+        # Reshape to [num_groups, group_size]
+        x_grouped = gemm_result.reshape(num_groups, group_size)
+        
+        # Compute mean and variance along group_size dimension
+        mean = jnp.mean(x_grouped, axis=1, keepdims=True)
+        var = jnp.var(x_grouped, axis=1, keepdims=True)
+        
+        # Normalize
+        x_normalized = (x_grouped - mean) / jnp.sqrt(var + 1e-5)
+        
+        # Apply gamma and beta
+        x_normalized = x_normalized * gn_weight_ref.reshape(num_groups, 1) + gn_bias_ref.reshape(num_groups, 1)
+        
+        # Flatten back
+        x = x_normalized.reshape(out_features)
+        
+        # Swish: x * sigmoid(x)
+        x = x * jax.nn.sigmoid(x)
+        
+        # Multiply by multiply_weight
+        x = x * multiply_weight_ref
+        
+        # Swish again
+        x = x * jax.nn.sigmoid(x)
+        
+        ref_out[batch_idx, :] = x
+    
+    # Grid: one block per batch element
+    grid = (batch_size,)
+    
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((batch_size, out_features), jnp.bfloat16),
+        grid=grid,
+        in_specs=(
+            pl.no_block_spec,  # ref_out is output
+            pl.BlockSpec((batch_size, out_features), lambda batch_idx: (batch_idx, slice(None))),  # x
+            pl.BlockSpec((out_features, out_features), lambda batch_idx: (slice(None), slice(None))),  # gemm_weight
+            pl.BlockSpec((out_features,), lambda batch_idx: slice(None)),  # gemm_bias
+            pl.BlockSpec((out_features,), lambda batch_idx: slice(None)),  # gn_weight
+            pl.BlockSpec((out_features,), lambda batch_idx: slice(None)),  # gn_bias
+            pl.BlockSpec((out_features,), lambda batch_idx: slice(None)),  # multiply_weight
+        ),
+        out_specs=pl.BlockSpec((batch_size, out_features), lambda batch_idx: (batch_idx, slice(None))),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",)
+        ),
+    )(x, gemm_weight, gemm_bias, gn_weight, gn_bias, multiply_weight)

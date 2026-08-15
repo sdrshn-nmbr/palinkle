@@ -1,0 +1,75 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as plp
+import jax.interpreters.tpu as pltpu
+
+def workload(hidden, weight, labels):
+    """Fused Linear + Cross-Entropy Loss kernel for TPU."""
+    batch_tokens = hidden.shape[0]
+    hidden_dim = hidden.shape[1]
+    vocab_size = weight.shape[1]
+    
+    # Block size for batch dimension (multiple of 8 for bf16)
+    block_size = 128
+    num_blocks = (batch_tokens + block_size - 1) // block_size
+    
+    def cross_entropy_kernel(
+        hidden_ref,
+        weight_ref,
+        labels_ref,
+        loss_ref,
+        *,
+        block_idx=pl.program_id(0),
+    ):
+        # Get the batch slice for this block
+        start = block_idx * block_size
+        end = min(start + block_size, batch_tokens)
+        
+        if start >= batch_tokens:
+            # No work to do for this block
+            return
+        
+        # Slice the inputs for this block
+        hidden_block = hidden_ref[start:end, :]
+        weight_block = weight_ref
+        labels_block = labels_ref[start:end]
+        
+        # Compute logits = hidden @ weight
+        # Use float32 accumulation for numerical stability
+        logits = jnp.dot(hidden_block, weight_block, precision=jax.lax.Precision.DEFAULT)
+        logits = logits.astype(jnp.float32)
+        
+        # Compute log_softmax along the vocab dimension (axis=-1)
+        log_probs = jax.nn.log_softmax(logits, axis=-1)
+        
+        # Compute one_hot encoding of labels
+        one_hot = jax.nn.one_hot(labels_block, vocab_size, dtype=jnp.float32)
+        
+        # Compute loss = -sum(one_hot * log_probs, axis=-1)
+        loss_values = -jnp.sum(one_hot * log_probs, axis=-1)
+        
+        # Store the loss values for this block
+        loss_ref[block_idx] = jnp.sum(loss_values)
+    
+    # Output shape: scalar (mean loss)
+    out_shape = jax.ShapeDtypeStruct((), jnp.float32)
+    
+    # Scratch shape for intermediate loss values per block
+    scratch_shape = (num_blocks,)
+    
+    return pl.pallas_call(
+        cross_entropy_kernel,
+        out_shape=out_shape,
+        grid=(num_blocks,),
+        in_specs=(
+            pl.BlockSpec((block_size, hidden_dim), lambda i: (i * block_size, 0)),
+            pl.BlockSpec((hidden_dim, vocab_size), lambda i: (0, 0)),
+            pl.BlockSpec((block_size,), lambda i: (i * block_size,)),
+        ),
+        out_specs=pl.BlockSpec((1,), lambda i: (0,)),
+        scratch_shapes=(scratch_shape,),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",)
+        ),
+    )(hidden, weight, labels)

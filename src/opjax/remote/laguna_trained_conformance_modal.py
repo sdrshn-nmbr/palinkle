@@ -10,7 +10,9 @@ import modal
 from opjax.pallas.laguna_dspark_conformance import (
     build_conformance_report,
     build_dflash_conformance_report,
+    build_target_feature_conformance_report,
     validate_dflash_conformance_report,
+    validate_target_feature_conformance_report,
 )
 from opjax.pallas.laguna_speculative import TARGET_ID, TARGET_REVISION
 from opjax.remote.config import (
@@ -113,7 +115,9 @@ def _target_path() -> Path:
 
 
 @app.function(image=deepspec_image, gpu="H200", **OPTIONS)
-def capture_source(run_id: str, arm: str) -> dict[str, object]:
+def capture_source(
+    run_id: str, arm: str, prompt: str = PROMPT
+) -> dict[str, object]:
     if arm not in {"dflash", "dspark"}:
         raise ValueError(f"LAGUNA_CONFORMANCE_ARM_INVALID:{arm}")
     output = ARTIFACT_ROOT / run_id / "source"
@@ -135,7 +139,7 @@ def capture_source(run_id: str, arm: str) -> dict[str, object]:
         "--output-root",
         str(output),
         "--prompt",
-        PROMPT,
+        prompt,
         "--target-path",
         str(_target_path()),
         "--draft-path",
@@ -172,6 +176,24 @@ def capture_adapter(run_id: str, arm: str) -> dict[str, object]:
     return result
 
 
+@app.function(image=vllm_image, gpu="H200", **OPTIONS)
+def capture_adapter_live(
+    run_id: str, prompt: str = PROMPT, target_features_only: bool = False
+) -> dict[str, object]:
+    output = ARTIFACT_ROOT / run_id / (
+        "adapter-live-target-only" if target_features_only else "adapter-live"
+    )
+    result = run_capture(
+        output_root=output,
+        prompt=prompt,
+        target_feature_override=None,
+        draft_model=str(ROOT / "selected" / "dspark"),
+        target_features_only=target_features_only,
+    )
+    artifacts.commit()
+    return result
+
+
 @app.function(image=deepspec_image, **OPTIONS)
 def compare(run_id: str, arm: str) -> dict[str, object]:
     root = ARTIFACT_ROOT / run_id
@@ -196,6 +218,63 @@ def compare(run_id: str, arm: str) -> dict[str, object]:
             mutation_controls=source["mutation_controls"],
         )
     (root / "report.json").write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n"
+    )
+    artifacts.commit()
+    return report
+
+
+@app.function(image=deepspec_image, **OPTIONS)
+def compare_live(run_id: str) -> dict[str, object]:
+    root = ARTIFACT_ROOT / run_id
+    source_root = root / "source"
+    adapter_root = root / "adapter-live"
+    source = json.loads((source_root / "manifest.json").read_text())
+    adapter = json.loads((adapter_root / "manifest.json").read_text())
+    report = build_conformance_report(
+        source_root=source_root,
+        source_capture=source,
+        adapter_root=adapter_root,
+        adapter_capture=adapter,
+        mutation_controls=source["mutation_controls"],
+    )
+    (root / "report-live.json").write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n"
+    )
+    target_feature_report = build_target_feature_conformance_report(
+        source_root=source_root,
+        source_capture=source,
+        adapter_root=adapter_root,
+        adapter_capture=adapter,
+    )
+    validate_target_feature_conformance_report(
+        target_feature_report, root=root, require_pass=False
+    )
+    (root / "target-feature-report.json").write_text(
+        json.dumps(target_feature_report, indent=2, sort_keys=True) + "\n"
+    )
+    artifacts.commit()
+    return {
+        "downstream_without_override": report,
+        "target_features": target_feature_report,
+    }
+
+
+@app.function(image=deepspec_image, **OPTIONS)
+def compare_target_features(run_id: str) -> dict[str, object]:
+    root = ARTIFACT_ROOT / run_id
+    source_root = root / "source"
+    adapter_root = root / "adapter-live-target-only"
+    source = json.loads((source_root / "manifest.json").read_text())
+    adapter = json.loads((adapter_root / "manifest.json").read_text())
+    report = build_target_feature_conformance_report(
+        source_root=source_root,
+        source_capture=source,
+        adapter_root=adapter_root,
+        adapter_capture=adapter,
+    )
+    validate_target_feature_conformance_report(report, root=root, require_pass=False)
+    (root / "target-feature-report.json").write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n"
     )
     artifacts.commit()

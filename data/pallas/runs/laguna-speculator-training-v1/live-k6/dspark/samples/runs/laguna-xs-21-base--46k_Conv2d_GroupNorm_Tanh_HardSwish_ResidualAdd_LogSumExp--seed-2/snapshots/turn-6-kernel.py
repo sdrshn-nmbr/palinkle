@@ -1,0 +1,73 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as plu
+import jax.pallas.tpu as pltpu
+
+def workload(x, conv_weight, conv_bias, gn_weight, gn_bias):
+    """
+    Conv2d + GroupNorm + Tanh + HardSwish + ResidualAdd + LogSumExp
+    """
+    groups = 16
+    eps = 1e-5
+    
+    # Transpose x from NCHW to NHWC
+    x_nhwc = jnp.transpose(x, (0, 2, 3, 1))
+    
+    # Transpose kernel from HWIO to HWIO (already in correct format for conv_general_dilated)
+    kernel = jnp.transpose(conv_weight, (2, 3, 1, 0))
+    
+    # Conv2d with VALID padding
+    x_conv = jax.lax.conv_general_dilated(
+        x_nhwc,
+        kernel,
+        window_strides=(1, 1),
+        padding='VALID',
+        dimension_numbers=('NHWC', 'HWIO', 'NHWC')
+    )
+    
+    # Add bias (reshaped to broadcast)
+    x_conv = x_conv + jnp.reshape(conv_bias, (1, 1, 1, -1))
+    
+    # Transpose to NCHW for GroupNorm
+    x_conv = jnp.transpose(x_conv, (0, 3, 1, 2))
+    
+    # Get shape
+    N, C, H, W = x_conv.shape
+    
+    # Reshape for GroupNorm: [N, groups, C/groups, H, W]
+    x = jnp.reshape(x_conv, (N, groups, C // groups, H, W))
+    
+    # GroupNorm: compute mean and variance over spatial dimensions
+    mean = jnp.mean(x, axis=(2, 3, 4), keepdims=True)
+    var = jnp.var(x, axis=(2, 3, 4), keepdims=True)
+    
+    # Normalize
+    x = (x - mean) / jnp.sqrt(var + eps)
+    
+    # Reshape back to NCHW
+    x = jnp.reshape(x, (N, C, H, W))
+    
+    # Apply gamma and beta (reshaped for broadcasting)
+    x_norm = x * jnp.reshape(gn_weight, (1, -1, 1, 1)) + jnp.reshape(gn_bias, (1, -1, 1, 1))
+    
+    # Tanh
+    x_tanh = jnp.tanh(x_norm)
+    
+    # HardSwish: x * minimum(maximum(x + 3, 0), 6) / 6
+    x_hard_swish = x_tanh * jnp.minimum(jnp.maximum(x_tanh + 3, 0), 6) / 6
+    
+    # Residual add (add the conv output before transpose back)
+    # Need to get x_conv back in the right shape
+    x_conv_nchw = jnp.transpose(x_conv, (0, 3, 1, 2))  # This is wrong, let me fix
+    
+    # Actually, we need to add the conv output (before transpose) to x_hard_swish
+    # x_conv after bias add is in NHWC, need to transpose to NCHW
+    x_conv_for_res = jnp.transpose(x_conv, (0, 3, 1, 2))
+    
+    x_res = x_conv_for_res + x_hard_swish
+    
+    # LogSumExp over axis 1 (channel dimension) with keepdims
+    x_logsumexp = jax.scipy.special.logsumexp(x_res, axis=1, keepdims=True)
+    
+    return x_logsumexp

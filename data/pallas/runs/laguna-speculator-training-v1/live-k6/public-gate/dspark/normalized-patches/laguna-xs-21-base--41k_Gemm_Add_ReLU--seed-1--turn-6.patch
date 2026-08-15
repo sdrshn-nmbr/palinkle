@@ -1,0 +1,74 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..a7779e8 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,67 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as plp
++import jax.interpreters.tpu as pltpu
++
++def workload(x, weight, bias):
++    """TPU Pallas kernel for Gemm + Add + ReLU."""
++
++    # Block size for output tiles - must be multiple of 8 for bf16
++    BLOCK_M = 128
++    BLOCK_N = 128
++    BLOCK_K = 128
++
++    # Grid dimensions
++    grid_m = x.shape[0] // BLOCK_M
++    grid_n = x.shape[1] // BLOCK_N
++
++    def gemm_add_relu_kernel(
++        x_ref,
++        weight_ref,
++        bias_ref,
++        out_ref,
++    ):
++        # Get program IDs for tiling
++        m_idx = pl.program_id(0)
++        n_idx = pl.program_id(1)
++
++        # Initialize accumulator in float32 for better precision
++        acc = jnp.zeros((BLOCK_M, BLOCK_N), dtype=jnp.float32)
++
++        # Tiled matmul along K dimension
++        for k_idx in range(x.shape[1] // BLOCK_K):
++            # Load blocks from x and weight
++            x_block = x_ref[
++                m_idx * BLOCK_M:(m_idx + 1) * BLOCK_M,
++                k_idx * BLOCK_K:(k_idx + 1) * BLOCK_K,
++            ]
++            weight_block = weight_ref[
++                k_idx * BLOCK_K:(k_idx + 1) * BLOCK_K,
++                n_idx * BLOCK_N:(n_idx + 1) * BLOCK_N,
++            ]
++
++            # Matmul and accumulate in float32
++            acc = acc + jnp.dot(x_block.astype(jnp.float32), weight_block.astype(jnp.float32))
++
++        # Add bias (broadcast along M dimension)
++        bias_block = bias_ref[n_idx * BLOCK_N:(n_idx + 1) * BLOCK_N]
++        acc = acc + bias_block
++
++        # Apply ReLU and convert back to bf16
++        out_ref[...] = jnp.maximum(acc, 0).astype(x.dtype)
++
++    return pl.pallas_call(
++        gemm_add_relu_kernel,
++        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
++        grid=(grid_m, grid_n),
++        in_specs=(
++            pl.BlockSpec((BLOCK_M, BLOCK_K), lambda m_idx, n_idx: (m_idx * BLOCK_M, 0)),
++            pl.BlockSpec((BLOCK_K, BLOCK_N), lambda m_idx, n_idx: (0, n_idx * BLOCK_N)),
++            pl.BlockSpec((BLOCK_N,), lambda m_idx, n_idx: (n_idx * BLOCK_N,)),
++        ),
++        out_specs=pl.BlockSpec((BLOCK_M, BLOCK_N), lambda m_idx, n_idx: (m_idx * BLOCK_M, n_idx * BLOCK_N)),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel", "parallel")
++        ),
++    )(x, weight, bias)

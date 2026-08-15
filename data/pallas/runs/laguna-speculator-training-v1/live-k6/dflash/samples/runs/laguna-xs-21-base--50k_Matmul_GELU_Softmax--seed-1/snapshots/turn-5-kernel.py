@@ -1,0 +1,97 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as plp
+import jax.interpreters.pallas as pallas
+from jax.interpreters import pallas as pl
+import jax.numpy as jnp
+from jax import lax
+import jax
+
+# TPU-specific imports
+try:
+    from jax.interpreters import xla_client as xc
+    TPU_COMPILER_PARAMS = {"xla_gpu_use_multi_threaded_reducer": True}
+except ImportError:
+    TPU_COMPILER_PARAMS = None
+
+def workload(x, weight, bias):
+    """
+    Matmul + GELU + Softmax kernel.
+    
+    Args:
+        x: [batch_size, in_features] bfloat16
+        weight: [in_features, out_features] bfloat16
+        bias: [out_features] bfloat16
+    
+    Returns:
+        [batch_size, out_features] bfloat16
+    """
+    batch_size, in_features = x.shape
+    in_features_w, out_features = weight.shape
+    
+    # Block sizes - use multiples of 8 for bf16 and 128 for vectorization
+    block_m = 128  # tile along batch dimension
+    block_k = 128  # tile along reduction dimension
+    block_n = 128  # tile along output dimension
+    
+    def matmul_gelu_softmax_kernel(
+        x_ref, weight_ref, bias_ref, out_ref,
+        batch_idx, feat_idx
+    ):
+        """Pallas kernel for matmul + GELU + softmax."""
+        # Compute matmul for this tile
+        # x_ref: [block_m, block_k]
+        # weight_ref: [block_k, block_n]
+        # bias_ref: [block_n]
+        
+        # Accumulate in float32 for better precision
+        acc = jnp.zeros((block_m, block_n), dtype=jnp.float32)
+        
+        # Matmul: x @ weight
+        for k in range(block_k):
+            x_tile = x_ref[:, k].astype(jnp.float32)  # [block_m]
+            w_tile = weight_ref[k, :].astype(jnp.float32)  # [block_n]
+            acc = acc + jnp.outer(x_tile, w_tile)
+        
+        # Add bias
+        acc = acc + bias_ref.astype(jnp.float32)
+        
+        # GELU activation: x * sigmoid(1.702 * x)
+        acc = acc * jax.nn.sigmoid(1.702 * acc)
+        
+        # Softmax along axis 1 (feature dimension)
+        # Subtract max for numerical stability
+        max_val = jnp.max(acc, axis=1, keepdims=True)
+        acc = acc - max_val
+        exp_acc = jnp.exp(acc)
+        sum_exp = jnp.sum(exp_acc, axis=1, keepdims=True)
+        acc = exp_acc / sum_exp
+        
+        # Store result
+        out_ref[...] = acc.astype(x_ref.dtype)
+    
+    # Grid dimensions
+    num_batch_blocks = (batch_size + block_m - 1) // block_m
+    num_feat_blocks = (out_features + block_n - 1) // block_n
+    
+    grid = (num_batch_blocks, num_feat_blocks)
+    
+    def index_map(batch_idx, feat_idx):
+        return (
+            batch_idx * block_m,
+            feat_idx * block_n
+        )
+    
+    return pl.pallas_call(
+        matmul_gelu_softmax_kernel,
+        out_shape=jax.ShapeDtypeStruct((batch_size, out_features), x.dtype),
+        grid=grid,
+        in_specs=(
+            pl.BlockSpec((block_m, block_k), lambda batch_idx, feat_idx: (batch_idx * block_m, 0)),
+            pl.BlockSpec((block_k, block_n), lambda batch_idx, feat_idx: (0, feat_idx * block_n)),
+            pl.BlockSpec((block_n,), lambda batch_idx, feat_idx: (feat_idx * block_n,)),
+        ),
+        out_specs=pl.BlockSpec((block_m, block_n), lambda batch_idx, feat_idx: (batch_idx * block_m, feat_idx * block_n)),
+        compiler_params={"xla_gpu_use_multi_threaded_reducer": True} if TPU_COMPILER_PARAMS else None,
+    )(x, weight, bias)

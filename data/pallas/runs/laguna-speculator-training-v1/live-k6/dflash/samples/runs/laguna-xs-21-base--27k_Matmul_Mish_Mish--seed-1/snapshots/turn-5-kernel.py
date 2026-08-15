@@ -1,0 +1,79 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as plp
+import jax.interpreters.tpu as pltpu
+
+
+def matmul_mish_mish_kernel(
+    x_ref,
+    weight_ref,
+    bias_ref,
+    out_ref,
+):
+    """Pallas kernel for Matmul + Mish + Mish."""
+    m = pl.program_id(0)
+    n = pl.program_id(1)
+    k = pl.program_id(2)
+    
+    # Tile sizes
+    block_m = 128
+    block_n = 128
+    block_k = 128
+    
+    # Accumulator in float32
+    acc = 0.0
+    
+    # Matmul: x[m, :] @ weight[:, n] + bias[n]
+    for k_tile in range(x_ref.shape[1] // block_k):
+        x_val = x_ref[m * block_m + k_tile * block_k:(m + 1) * block_m, k_tile * block_k:(k_tile + 1) * block_k]
+        w_val = weight_ref[k_tile * block_k:(k_tile + 1) * block_k, n * block_n:(n + 1) * block_n]
+        acc += jnp.sum(x_val * w_val, axis=1)
+    
+    # Add bias
+    b_val = bias_ref[n * block_n:(n + 1) * block_n]
+    acc = acc + b_val
+    
+    # Convert to bfloat16 for Mish
+    acc_bf16 = acc.astype(jnp.bfloat16)
+    
+    # Mish: x * tanh(softplus(x))
+    def mish(x):
+        return x * jnp.tanh(jnp.nn.softplus(x))
+    
+    # Apply Mish twice
+    result = mish(mish(acc_bf16))
+    
+    out_ref[m * block_m:(m + 1) * block_m, n * block_n:(n + 1) * block_n] = result
+
+
+def workload(x, weight, bias):
+    """Matmul + Mish + Mish workload."""
+    batch_size = x.shape[0]
+    in_features = x.shape[1]
+    out_features = weight.shape[1]
+    
+    block_m = 128
+    block_n = 128
+    block_k = 128
+    
+    grid = (
+        batch_size // block_m,
+        out_features // block_n,
+        in_features // block_k,
+    )
+    
+    return pl.pallas_call(
+        matmul_mish_mish_kernel,
+        out_shape=jax.ShapeDtypeStruct((batch_size, out_features), x.dtype),
+        grid=grid,
+        in_specs=(
+            pl.BlockSpec((block_m, block_k), lambda m, n, k: (m * block_m, k * block_k)),
+            pl.BlockSpec((block_k, block_n), lambda m, n, k: (k * block_k, n * block_n)),
+            pl.BlockSpec((block_n,), lambda m, n, k: (n * block_n,)),
+        ),
+        out_specs=pl.BlockSpec((block_m, block_n), lambda m, n, k: (m * block_m, n * block_n)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel", "parallel")
+        ),
+    )(x, weight, bias)

@@ -1,0 +1,69 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas.lib as pllib
+import jax.pallas.tpu as pltpu
+
+
+def kernel(x_ref, weight_ref, bias_ref, out_ref):
+    """Pallas kernel for Matmul + Subtract + Multiply + ReLU."""
+    # Get program IDs for grid layout
+    m = pl.program_id(0)  # batch dimension
+    n = pl.program_id(1)  # output feature dimension
+    
+    # Block size for tiling
+    block_size = 128
+    
+    # Accumulator in float32 for better precision
+    acc = 0.0
+    
+    # Matmul: accumulate over k dimension
+    for k in range(x_ref.shape[1] // block_size):
+        # Load blocks from x and weight
+        x_block = x_ref[m, k * block_size:(k + 1) * block_size]
+        weight_block = weight_ref[k * block_size:(k + 1) * block_size, n]
+        
+        # Compute dot product and accumulate
+        acc += jnp.sum(x_block * weight_block)
+    
+    # Add bias
+    acc += bias_ref[n]
+    
+    # Subtract 2.0
+    acc -= 2.0
+    
+    # Multiply by 1.5
+    acc *= 1.5
+    
+    # ReLU: max(0, x)
+    acc = jnp.maximum(acc, 0.0)
+    
+    # Store result
+    out_ref[m, n] = acc
+
+
+def workload(x, weight, bias):
+    """Workload: Matmul + Subtract + Multiply + ReLU."""
+    batch_size = x.shape[0]
+    out_features = weight.shape[1]
+    
+    # Block size for tiling
+    block_size = 128
+    
+    # Grid dimensions
+    grid = (batch_size, out_features // block_size)
+    
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((batch_size, out_features), x.dtype),
+        grid=grid,
+        in_specs=(
+            pl.BlockSpec((batch_size, weight.shape[0]), lambda m, n: (m, 0)),
+            pl.BlockSpec((weight.shape[0], block_size), lambda m, n: (0, n * block_size)),
+            pl.BlockSpec((block_size,), lambda m, n: (n * block_size,)),
+        ),
+        out_specs=pl.BlockSpec((batch_size, block_size), lambda m, n: (m, n * block_size)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel")
+        ),
+    )(x, weight, bias)

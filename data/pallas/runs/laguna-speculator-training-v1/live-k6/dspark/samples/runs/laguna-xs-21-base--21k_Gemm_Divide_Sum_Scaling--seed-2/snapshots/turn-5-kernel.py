@@ -1,0 +1,78 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as plp
+import jax.interpreters.pallas as pl_impl
+from jax.interpreters import pallas as pallas_core
+import jax.lax as lax
+
+def workload(x, weight):
+    """TPU Pallas kernel for Gemm + Divide + Sum + Scaling."""
+    
+    # Output shape is [4096, 1]
+    out_shape = jax.ShapeDtypeStruct((x.shape[0], 1), x.dtype)
+    
+    block_size = 128  # Block size for tiling
+    
+    def kernel(ref_x, ref_weight, ref_out):
+        # Perform matmul with highest precision
+        # x @ weight.T with dimension_numbers ((1,), (0,)), meaning:
+        # x has shape [M, K], weight has shape [N, K]
+        # result has shape [M, N]
+        
+        # We need to compute the full matmul result first
+        # Then divide by 2.0, sum along axis 1, and multiply by 1.5
+        
+        # For Pallas, we'll compute the result in the kernel
+        # Use jnp.dot for the matmul operation
+        
+        # Get the shapes
+        m = ref_x.shape[0]
+        k = ref_x.shape[1]
+        n = ref_weight.shape[0]  # weight is [8192, 8192], so n = 8192
+        
+        # Compute matmul result
+        # We need to accumulate in float32 for precision
+        result = jnp.zeros((m, n), dtype=jnp.float32)
+        
+        # Tile the computation
+        for i in range(0, m, block_size):
+            for j in range(0, n, block_size):
+                for kk in range(0, k, block_size):
+                    x_block = ref_x[i:i+block_size, kk:kk+block_size].astype(jnp.float32)
+                    w_block = ref_weight[j:j+block_size, kk:kk+block_size].astype(jnp.float32)
+                    result = result.at[i:i+block_size, j:j+block_size].add(
+                        jnp.dot(x_block, w_block.T)
+                    )
+        
+        # Now apply the remaining operations
+        # Divide by 2.0
+        result = result / 2.0
+        
+        # Sum along axis 1, keeping dimensions
+        result = jnp.sum(result, axis=1, keepdims=True)
+        
+        # Multiply by 1.5
+        result = result * 1.5
+        
+        # Cast back to bfloat16 and store
+        ref_out[...] = result.astype(ref_out.dtype)
+    
+    # For TPU, we need to use proper grid and block specs
+    # The output is [4096, 1], so we process row by row
+    
+    grid = (x.shape[0],)  # One block per row of output
+    
+    return pl.pallas_call(
+        kernel,
+        out_shape=out_shape,
+        grid=grid,
+        in_specs=(
+            pl.BlockSpec((x.shape[0], x.shape[1]), lambda: (0, 0)),
+            pl.BlockSpec((weight.shape[0], weight.shape[1]), lambda: (0, 0)),
+        ),
+        out_specs=pl.BlockSpec((x.shape[0], 1), lambda: (0, 0)),
+        compiler_params=jax.pallas.tpu.CompilerParams(
+            dimension_semantics=("parallel",)
+        ),
+    )(x, weight)

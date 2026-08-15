@@ -1,0 +1,46 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as plp
+import jax.interpreters.pallas as pallas
+from jax.interpreters import pallas as pl
+import jax.numpy as jnp
+
+def workload(x, gemm_weight, gemm_bias, gn_weight, gn_bias, multiply_weight):
+    """
+    GEMM + GroupNorm + Swish + Multiply + Swish
+    """
+    batch_size = x.shape[0]
+    out_features = 8192
+    num_groups = 256
+    group_size = out_features // num_groups  # 32
+    
+    # GEMM: x @ gemm_weight + gemm_bias
+    x = jnp.dot(x, gemm_weight) + gemm_bias
+    
+    # Reshape for group norm: (batch_size, num_groups, group_size)
+    x_grouped = x.reshape(batch_size, num_groups, group_size)
+    
+    # GroupNorm: compute mean and variance along the last axis
+    mean = jnp.mean(x_grouped, axis=-1, keepdims=True)
+    var = jnp.var(x_grouped, axis=-1, keepdims=True)
+    
+    # Normalize
+    x_normalized = (x_grouped - mean) / jnp.sqrt(var + 1e-5)
+    
+    # Reshape back
+    x = x_normalized.reshape(batch_size, out_features)
+    
+    # Scale and shift
+    x = x * gn_weight + gn_bias
+    
+    # Swish: x * sigmoid(x)
+    x = x * jax.nn.sigmoid(x)
+    
+    # Multiply
+    x = x * multiply_weight
+    
+    # Swish again
+    x = x * jax.nn.sigmoid(x)
+    
+    return x

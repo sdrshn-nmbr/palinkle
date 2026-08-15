@@ -1,0 +1,119 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..9814142 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,112 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as plp
++import jax.interpreters.tpu as pltpu
++
++# Configuration
++CONFIG = {
++    "batch": 4,
++    "head_dim": 128,
++    "model": "Llama-3.1-70B",
++    "name": "llama3_70b_flex_attention",
++    "num_heads": 64,
++    "operator": "flex_attention",
++    "seq_len": 4096
++}
++
++def workload(q, k, v, rel_pos_bias):
++    """Flex attention kernel with causal mask and relative position bias."""
++    D = CONFIG["head_dim"]  # 128
++    S = CONFIG["seq_len"]   # 4096
++    sm_scale = D ** -0.5
++    
++    # Tile sizes for TPU
++    TILE_M = 64  # Query tile size
++    TILE_N = 64  # Key tile size
++    TILE_K = 128  # Head dimension (must be multiple of 8 for bf16)
++    
++    def attention_kernel(q_ref, k_ref, v_ref, rel_pos_bias_ref, 
++                         attn_out_ref, out_ref, 
++                         *args, **kwargs):
++        """Pallas kernel for attention computation."""
++        # Get program IDs
++        b = pl.program_id(0)  # batch
++        h = pl.program_id(1)  # head
++        m_start = pl.program_id(2) * TILE_M  # query tile start
++        
++        # Initialize attention output tile
++        attn_out_ref[...] = jnp.zeros((TILE_M, S), dtype=jnp.float32)
++        
++        # Compute attention scores for this query tile
++        # We need to iterate over all key tiles
++        for n_block in range(S // TILE_N):
++            n_start = n_block * TILE_N
++            
++            # Load Q tile [TILE_M, TILE_K]
++            q_tile = q_ref[m_start:m_start + TILE_M, :]
++            
++            # Load K tile [TILE_N, TILE_K]
++            k_tile = k_ref[n_start:n_start + TILE_N, :]
++            
++            # Compute attention scores: Q @ K^T
++            # Shape: [TILE_M, TILE_N]
++            scores = jnp.dot(q_tile, k_tile.T) * sm_scale
++            
++            # Add relative position bias
++            # rel_pos_bias has shape [num_heads, seq_len, seq_len]
++            # We need to index with [h, m_start:m_start+TILE_M, n_start:n_start+TILE_N]
++            rel_bias = rel_pos_bias_ref[
++                m_start:m_start + TILE_M, 
++                n_start:n_start + TILE_N
++            ]
++            scores = scores + rel_bias
++            
++            # Apply causal mask
++            # For causal attention, we can only attend to positions <= current position
++            # Create a mask for this tile
++            m_indices = jnp.arange(TILE_M) + m_start
++            n_indices = jnp.arange(TILE_N) + n_start
++            causal_mask = m_indices[:, None] >= n_indices[None, :]
++            
++            # Apply mask: set masked positions to large negative value
++            scores = jnp.where(causal_mask, scores, -1e30)
++            
++            # Accumulate into attention output
++            attn_out_ref[n_start:n_start + TILE_N] = attn_out_ref[n_start:n_start + TILE_N] + scores
++        
++        # Now compute softmax and apply to V
++        # Softmax along the key dimension (axis=1)
++        attn_probs = jax.nn.softmax(attn_out_ref, axis=1)
++        
++        # Compute output: attn @ V
++        # Load V tile [S, TILE_K]
++        v_all = v_ref[:]
++        
++        # Compute output for this query tile
++        # attn_out_ref: [TILE_M, S], v_all: [S, TILE_K]
++        # Output: [TILE_M, TILE_K]
++        out_tile = jnp.dot(attn_probs, v_all)
++        
++        out_ref[...] = out_tile.astype(jnp.bfloat16)
++    
++    # Grid dimensions
++    grid = (CONFIG["batch"], CONFIG["num_heads"], CONFIG["seq_len"] // TILE_M)
++    
++    # Block specs
++    q_spec = pl.BlockSpec((TILE_M, TILE_K), lambda b, h, m: (b, h, m * TILE_M, 0))
++    k_spec = pl.BlockSpec((TILE_N, TILE_K), lambda b, h, m, n: (b, h, n * TILE_N, 0))
++    v_spec = pl.BlockSpec((S, TILE_K), lambda b, h, m: (b, h, 0, 0))
++    rel_pos_bias_spec = pl.BlockSpec((S, S), lambda b, h, m: (h, 0, 0))
++    attn_out_spec = pl.BlockSpec((TILE_M, S), lambda b, h, m: (b, h, m * TILE_M, 0))
++    out_spec = pl.BlockSpec((TILE_M, TILE_K), lambda b, h, m: (b, h, m * TILE_M, 0))
++    
++    # Call the Pallas kernel
++    return pl.pallas_call(
++        attention_kernel,
++        out_shape=jax.ShapeDtypeStruct((CONFIG["batch"], CONFIG["num_heads"], CONFIG["seq_len"], CONFIG["head_dim"]), jnp.bfloat16),
++        grid=grid,
++        in_specs=(q_spec, k_spec, v_spec, rel_pos_bias_spec),
++        out_specs=(attn_out_spec, out_spec),
++        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel", "parallel")),
++    )(q, k, v, rel_pos_bias)

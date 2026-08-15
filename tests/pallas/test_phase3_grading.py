@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -5,9 +6,41 @@ import pytest
 from opjax.pallas.g42_harness import G42HarnessError
 from opjax.pallas.phase3_grading import (
     EMPTY_PATCH_SHA256,
+    archive_incomplete_unit,
     artifact_failure_record,
+    missing_response_files,
     normalize_submission_patch,
 )
+
+
+def test_incomplete_hardware_unit_is_archived_before_retry(tmp_path: Path) -> None:
+    unit = tmp_path / "results" / "run--turn-6"
+    unit.mkdir(parents=True)
+    marker = unit / "partial.txt"
+    marker.write_text("capacity failure", encoding="utf-8")
+
+    archived = archive_incomplete_unit(
+        unit_root=unit,
+        archive_root=tmp_path / "incomplete-attempts",
+        evidence={"reason": "test", "request_sha256": "a" * 64},
+    )
+
+    assert not unit.exists()
+    assert (archived / "partial.txt").read_text(encoding="utf-8") == "capacity failure"
+    manifest = json.loads(
+        (archived / "archive-manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["reason"] == "test"
+
+
+def test_response_completeness_requires_all_authoritative_files(tmp_path: Path) -> None:
+    response = tmp_path / "artifacts"
+    response.mkdir()
+    (response / "submission.json").write_text("{}", encoding="utf-8")
+    assert missing_response_files(response) == ["result.json", "reward.json"]
+    (response / "result.json").write_text("{}", encoding="utf-8")
+    (response / "reward.json").write_text("{}", encoding="utf-8")
+    assert missing_response_files(response) == []
 
 
 def test_empty_patch_fails_before_tpu_without_execution(tmp_path: Path) -> None:

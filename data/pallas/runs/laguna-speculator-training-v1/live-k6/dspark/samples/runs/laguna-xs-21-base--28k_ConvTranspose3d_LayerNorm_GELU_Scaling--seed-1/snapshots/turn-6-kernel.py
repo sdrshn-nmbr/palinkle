@@ -1,0 +1,93 @@
+import jax
+import jax.numpy as jnp
+import jax.lax as lax
+import jax.nn as nn
+import pallas as pl
+import pytpu as pltpu
+
+def workload(x, conv_weight, conv_bias, ln_weight, ln_bias):
+    """
+    ConvTranspose3d + LayerNorm + GELU + Scaling
+    
+    Input shapes:
+    - x: [32, 32, 16, 32, 32] (batch, d_in, h_in, w_in, channels)
+    - conv_weight: [32, 64, 4, 4, 4]
+    - conv_bias: [64]
+    - ln_weight: [64]
+    - ln_bias: [64]
+    
+    Output shape: [32, 64, 32, 64, 64]
+    """
+    stride = 2
+    padding = 1
+    kernel_size = 4
+    eps = 1e-05
+    scaling_factor = 1.0
+    
+    # Transpose x from [batch, d, h, w, c] to [batch, d, h, w, c] (NDHWC)
+    # The AST shows transpose with perm (0, 2, 3, 4, 1)
+    x = jnp.transpose(x, (0, 2, 3, 4, 1))
+    
+    # Transpose kernel from [in_ch, out_ch, k, k, k] to [in_ch, k, k, k, out_ch]
+    # The AST shows transpose with perm (2, 3, 4, 1, 0)
+    kernel = jnp.transpose(conv_weight, (2, 3, 4, 1, 0))
+    
+    # Flip kernel along first 3 axes (spatial dimensions)
+    kernel = jnp.flip(kernel, axis=(0, 1, 2))
+    
+    # Get input dimensions
+    batch_size, d_in, h_in, w_in, channels = x.shape
+    
+    # Compute dilated dimensions for transposed convolution
+    # d_dilated = d_in + (d_in - 1) * (stride - 1)
+    k = kernel_size
+    d_dilated = d_in + (d_in - 1) * (stride - 1)
+    h_dilated = h_in + (h_in - 1) * (stride - 1)
+    w_dilated = w_in + (w_in - 1) * (stride - 1)
+    
+    # Create dilated input tensor
+    x_dilated = jnp.zeros((batch_size, d_dilated, h_dilated, w_dilated, channels), dtype=x.dtype)
+    
+    # Set values at stride intervals
+    x_dilated = x_dilated.at[:, ::stride, ::stride, ::stride, :].set(x)
+    x = x_dilated
+    
+    # Compute padding for conv_general_dilated
+    # pad = k - 1 - padding
+    pad = k - 1 - padding
+    
+    # Padding tuple for each spatial dimension
+    jax_padding = ((pad, pad), (pad, pad), (pad, pad))
+    
+    # Apply convolution (transposed convolution via dilated convolution)
+    # dimension_numbers: (input, kernel, output) = (NDHWC, DHWIO, NDHWC)
+    x = lax.conv_general_dilated(
+        x, kernel,
+        window_strides=(1, 1, 1),
+        padding=jax_padding,
+        dimension_numbers=('NDHWC', 'DHWIO', 'NDHWC')
+    )
+    
+    # Add bias (reshape to broadcast)
+    x = x + jnp.reshape(conv_bias, (1, 1, 1, 1, -1))
+    
+    # Transpose output from [batch, d_out, h_out, w_out, out_ch] to [batch, out_ch, d_out, h_out, w_out]
+    x = jnp.transpose(x, (0, 4, 1, 2, 3))
+    
+    # LayerNorm: mean and variance along last axis (channels)
+    mean = jnp.mean(x, axis=-1, keepdims=True)
+    var = jnp.mean((x - mean) ** 2, axis=-1, keepdims=True)
+    
+    # Normalize
+    x = (x - mean) / jnp.sqrt(var + eps)
+    
+    # Scale and shift
+    x = x * ln_weight + ln_bias
+    
+    # GELU activation
+    x = nn.gelu(x)
+    
+    # Scaling
+    x = x * scaling_factor
+    
+    return x

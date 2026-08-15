@@ -1,0 +1,121 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as plp
+import jax
+
+def attention_kernel(
+    q_ref,
+    k_ref,
+    v_ref,
+    out_ref,
+    *,
+    num_q_per_kv: int,
+    causal_mask: jax.Array,
+):
+    """Pallas kernel for GQA attention with causal mask."""
+    # Get program IDs
+    h = pl.program_id(0)  # head dimension
+    m = pl.program_id(1)  # sequence dimension (output tile)
+    
+    # Tile sizes
+    block_seq = 128  # sequence tile size
+    block_hd = 128   # head dimension tile size
+    
+    seq_len = q_ref.shape[1]
+    head_dim = q_ref.shape[2]
+    
+    # Compute attention scores for this tile
+    # attn[h, m, :] = q[h, m, :] @ k[h, :, :].T
+    
+    # Initialize attention tile
+    attn_tile = jnp.zeros((block_seq, seq_len), dtype=jnp.float32)
+    
+    # Compute q @ k^T for this head and sequence tile
+    # q_ref[h, m*block_seq:(m+1)*block_seq, :] has shape (block_seq, head_dim)
+    # k_ref[h, :, :] has shape (seq_len, head_dim)
+    
+    # We need to compute: attn[m, :] = q[m, :] @ k.T
+    # This is a matrix-vector product for each position in the tile
+    
+    for s in range(block_seq):
+        if m * block_seq + s >= seq_len:
+            break
+        # Get query vector for this position
+        q_vec = q_ref[h, m * block_seq + s, :]  # (head_dim,)
+        # Compute attention scores with all keys
+        # attn[m, :] = q @ k.T = sum_d q[d] * k[:, d]
+        for t in range(seq_len):
+            k_vec = k_ref[h, t, :]  # (head_dim,)
+            attn_tile = attn_tile.at[s, t].set(
+                jnp.sum(q_vec * k_vec).astype(jnp.float32)
+            )
+    
+    # Apply causal mask
+    for s in range(block_seq):
+        if m * block_seq + s >= seq_len:
+            break
+        for t in range(seq_len):
+            if t > m * block_seq + s:
+                attn_tile = attn_tile.at[s, t].set(-1e30)
+    
+    # Softmax along last axis
+    attn_tile = jax.nn.softmax(attn_tile, axis=-1)
+    
+    # Compute output: out[h, m, :] = attn[m, :] @ v[h, :, :]
+    for s in range(block_seq):
+        if m * block_seq + s >= seq_len:
+            break
+        out_vec = jnp.zeros(head_dim, dtype=jnp.float32)
+        for t in range(seq_len):
+            v_vec = v_ref[h, t, :]  # (head_dim,)
+            out_vec = out_vec + attn_tile[s, t] * v_vec.astype(jnp.float32)
+        out_ref[h, m * block_seq + s, :] = out_vec.astype(q_ref.dtype)
+
+
+def workload(q, k, v):
+    """Sparse attention workload with GQA and causal mask."""
+    # Configuration
+    num_query_heads = 64
+    num_kv_heads = 8
+    seq_len = 4096
+    head_dim = 128
+    
+    # Compute num_q_per_kv
+    num_q_per_kv = num_query_heads // num_kv_heads  # 8
+    
+    # Repeat k and v along axis 0 by num_q_per_kv
+    k_repeat = jnp.repeat(k, num_q_per_kv, axis=0)  # (64, 4096, 128)
+    v_repeat = jnp.repeat(v, num_q_per_kv, axis=0)  # (64, 4096, 128)
+    
+    # Create causal mask
+    causal = jax.lax.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))
+    
+    # Tile sizes
+    block_seq = 128
+    block_hd = 128
+    
+    # Grid dimensions
+    grid = (num_query_heads, seq_len // block_seq)
+    
+    def kernel(q_ref, k_ref, v_ref, out_ref):
+        attention_kernel(
+            q_ref, k_ref, v_ref, out_ref,
+            num_q_per_kv=num_q_per_kv,
+            causal_mask=causal,
+        )
+    
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct(q.shape, q.dtype),
+        grid=grid,
+        in_specs=(
+            pl.BlockSpec((num_query_heads, block_seq, head_dim), lambda h, m: (h, m * block_seq, 0)),
+            pl.BlockSpec((num_query_heads, seq_len, head_dim), lambda h, m: (h, 0, 0)),
+            pl.BlockSpec((num_query_heads, seq_len, head_dim), lambda h, m: (h, 0, 0)),
+        ),
+        out_specs=pl.BlockSpec((num_query_heads, block_seq, head_dim), lambda h, m: (h, m * block_seq, 0)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel")
+        ),
+    )(q, k_repeat, v_repeat)

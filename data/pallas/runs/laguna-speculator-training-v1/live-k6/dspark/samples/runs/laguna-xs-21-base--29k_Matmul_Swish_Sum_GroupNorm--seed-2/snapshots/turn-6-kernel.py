@@ -1,0 +1,72 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas.lib as pllib
+import jax.pallas.tpu as pltpu
+
+def workload(x, weight, bias, gn_weight, gn_bias):
+    """Matmul + Swish + Sum(bias) + GroupNorm kernel."""
+    batch_size = x.shape[0]
+    in_features = x.shape[1]
+    out_features = weight.shape[1]
+    num_groups = 64
+    group_size = out_features // num_groups
+    
+    block_size = 128  # Block size for tiling
+    
+    def kernel(matmul_out_ref, x_ref, bias_ref, gn_weight_ref, gn_bias_ref, out_ref):
+        # Matmul: x @ weight
+        # Accumulate in float32 for better precision
+        acc = jnp.zeros((block_size, block_size), dtype=jnp.float32)
+        
+        for k in range(in_features // block_size):
+            x_block = x_ref[k * block_size:(k + 1) * block_size, :]
+            w_block = matmul_out_ref[:, k * block_size:(k + 1) * block_size]
+            acc = acc + jnp.dot(x_block.astype(jnp.float32), w_block.astype(jnp.float32))
+        
+        # Convert back to bfloat16
+        result = acc.astype(jnp.bfloat16)
+        
+        # Swish: x * sigmoid(x)
+        result = result * jax.nn.sigmoid(result)
+        
+        # Add bias
+        result = result + bias_ref
+        
+        # Reshape for group norm: (batch, num_groups, group_size)
+        result = result.reshape(batch_size, num_groups, group_size)
+        
+        # GroupNorm: compute mean and variance along last axis
+        mean = jnp.mean(result, axis=-1, keepdims=True)
+        var = jnp.var(result, axis=-1, keepdims=True)
+        
+        # Normalize
+        result = (result - mean) / jnp.sqrt(var + 1e-5)
+        
+        # Scale and shift
+        result = result * gn_weight_ref.reshape(1, num_groups, 1) + gn_bias_ref.reshape(1, num_groups, 1)
+        
+        # Reshape back to (batch_size, out_features)
+        result = result.reshape(batch_size, out_features)
+        
+        out_ref[...] = result
+    
+    # Grid dimensions
+    grid = (batch_size // block_size, out_features // block_size)
+    
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((batch_size, out_features), jnp.bfloat16),
+        grid=grid,
+        in_specs=(
+            pl.BlockSpec((batch_size, in_features), lambda: (0, 0)),  # x
+            pl.BlockSpec((in_features, out_features), lambda: (0, 0)),  # weight
+            pl.BlockSpec((out_features,), lambda: (0,)),  # bias
+            pl.BlockSpec((out_features,), lambda: (0,)),  # gn_weight
+            pl.BlockSpec((out_features,), lambda: (0,)),  # gn_bias
+        ),
+        out_specs=pl.BlockSpec((batch_size, out_features), lambda: (0, 0)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel")
+        ),
+    )(x, weight, bias, gn_weight, gn_bias)

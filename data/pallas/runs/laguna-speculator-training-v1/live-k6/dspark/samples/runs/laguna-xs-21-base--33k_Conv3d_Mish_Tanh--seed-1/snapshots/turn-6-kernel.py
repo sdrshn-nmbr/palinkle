@@ -1,0 +1,98 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as plp
+import jax.interpreters.tpu as pltpu
+
+def workload(x, weight, bias):
+    """Conv3d + Mish + Tanh kernel."""
+    # Output shape after conv: [16, 30, 62, 62, 64] (NDHWC)
+    # Final output shape: [16, 64, 30, 62, 62] (NCDHW)
+    out_shape = jax.ShapeDtypeStruct((16, 64, 30, 62, 62), jnp.bfloat16)
+    
+    # Flatten the 5D output for grid computation
+    total_elements = 16 * 64 * 30 * 62 * 62
+    block_size = 128  # TPU prefers multiples of 8 for bf16
+    
+    def conv_mish_tanh_kernel(x_ref, weight_ref, bias_ref, out_ref):
+        # Get the global index
+        i = pl.program_id(0)
+        
+        # Compute 5D indices from flattened index
+        # Output layout: [batch, out_channels, D, H, W]
+        w_idx = (i // (16 * 30 * 62 * 62)) % 64
+        d_idx = (i // (16 * 62 * 62)) % 30
+        h_idx = (i // (16 * 62)) % 62
+        w_idx2 = i % 62
+        b_idx = i // (64 * 30 * 62 * 62)
+        
+        # Actually, let me compute this more carefully
+        # Flattened index i corresponds to [b, oc, d, h, w]
+        stride_w = 1
+        stride_h = 62
+        stride_d = 62 * 62
+        stride_oc = 30 * 62 * 62
+        stride_b = 64 * 30 * 62 * 62
+        
+        w_idx = (i // stride_w) % 62
+        h_idx = (i // stride_h) % 62
+        d_idx = (i // stride_d) % 30
+        oc_idx = (i // stride_oc) % 64
+        b_idx = i // stride_b
+        
+        # Read input patch: x[b, :, d:d+3, h:h+3, w:w+3] -> shape [32, 3, 3, 3]
+        # After transpose, input is [b, d, h, w, 32]
+        x_patch = jnp.zeros((32,), dtype=jnp.bfloat16)
+        for kd in range(3):
+            for kh in range(3):
+                for kw in range(3):
+                    x_patch = x_patch.at[kd * 9 + kh * 3 + kw] = x_ref[b_idx, d_idx + kd, h_idx + kh, w_idx + kw, oc_idx]
+        
+        # Read weight: [3, 3, 3, 32, 64] -> we need weight[:, :, :, :, oc_idx]
+        weight_slice = weight_ref[:, :, :, :, oc_idx]  # shape [3, 3, 3, 32]
+        
+        # Perform convolution via matmul
+        # Reshape x_patch to [1, 32] and weight_slice to [32, 1]
+        # Actually, we need to do a proper conv
+        # x_patch is [32] (flattened 3x3x3x32 -> wait, that's wrong)
+        
+        # Let me reconsider. The input after transpose is [b, d, h, w, 32]
+        # The weight after transpose is [3, 3, 3, 32, 64]
+        # For output [b, oc, d, h, w], we compute:
+        # out[b, oc, d, h, w] = sum_{kd, kh, kw, ic} x[b, d+kd, h+kh, w+kw, ic] * weight[kd, kh, kw, ic, oc]
+        
+        # So for each output element, we sum over 3*3*3*32 = 864 multiplications
+        result = 0.0
+        for kd in range(3):
+            for kh in range(3):
+                for kw in range(3):
+                    for ic in range(32):
+                        result += float(x_ref[b_idx, d_idx + kd, h_idx + kh, w_idx + kw, ic]) * float(weight_ref[kd, kh, kw, ic, oc_idx])
+        
+        # Add bias
+        result += float(bias_ref[oc_idx])
+        
+        # Apply Mish: x * tanh(log(1 + exp(x)))
+        # Then apply tanh
+        mish_result = result * jnp.tanh(jnp.log(1.0 + jnp.exp(result)))
+        final_result = jnp.tanh(mish_result)
+        
+        # Write output
+        out_ref[b_idx, oc_idx, d_idx, h_idx, w_idx] = final_result.astype(jnp.bfloat16)
+    
+    grid = (total_elements,)
+    
+    return pl.pallas_call(
+        conv_mish_tanh_kernel,
+        out_shape=out_shape,
+        grid=grid,
+        in_specs=(
+            pl.BlockSpec((total_elements,) + (32, 64, 64), lambda i: (i // (32 * 64 * 64), i % (32 * 64 * 64))),
+            pl.BlockSpec((3, 3, 3, 32, 64), lambda i: (0, 0, 0, 0, 0)),
+            pl.BlockSpec((64,), lambda i: (0,)),
+        ),
+        out_specs=pl.BlockSpec((total_elements,), lambda i: (i,)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",)
+        ),
+    )(x, weight, bias)

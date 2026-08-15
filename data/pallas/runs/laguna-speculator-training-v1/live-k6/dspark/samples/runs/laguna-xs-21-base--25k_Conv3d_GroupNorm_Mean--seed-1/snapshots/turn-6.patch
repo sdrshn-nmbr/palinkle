@@ -1,0 +1,179 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..0483b7e 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,172 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as plp
++import jax.interpreters.pallas as pallas
++from jax.interpreters import pallas as pl
++import jax.numpy as jnp
++
++def workload(x, weight, conv_bias, gamma, beta):
++    """
++    Conv3d + GroupNorm + Mean workload.
++    
++    Args:
++        x: input tensor [128, 3, 24, 32, 32] in NCDHW format
++        weight: convolution weight [24, 3, 3, 3, 3] in OI DHW format
++        conv_bias: convolution bias [24]
++        gamma: group norm gamma [24]
++        beta: group norm beta [24]
++    
++    Returns:
++        output: [128] tensor after mean reduction
++    """
++    num_groups = 8
++    
++    # Transpose x from NCDHW to NDHWC
++    x = jnp.transpose(x, (0, 2, 3, 4, 1))
++    
++    # Transpose weight from OIDHW to DHWIO
++    kernel = jnp.transpose(weight, (2, 3, 4, 1, 0))
++    
++    # Conv3D operation
++    x = jax.lax.conv_general_dilated(
++        x, kernel,
++        window_strides=(1, 1, 1),
++        padding='VALID',
++        dimension_numbers=('NDHWC', 'DHWIO', 'NDHWC')
++    )
++    
++    # Add bias
++    x = x + jnp.reshape(conv_bias, (1, 1, 1, 1, 24))
++    
++    # Transpose back to NCDHW
++    x = jnp.transpose(x, (0, 4, 1, 2, 3))
++    
++    # Get shape
++    N, C, D, H, W = x.shape
++    G = num_groups
++    
++    # Reshape for group norm: [N, G, C/G, D, H, W]
++    x = jnp.reshape(x, (N, G, C // G, D, H, W))
++    
++    # Compute mean over spatial dimensions and channel groups
++    mean = jnp.mean(x, axis=(2, 3, 4, 5), keepdims=True)
++    
++    # Compute variance
++    var = jnp.var(x, axis=(2, 3, 4, 5), keepdims=True)
++    
++    # Normalize
++    x = (x - mean) / jnp.sqrt(var + 1e-5)
++    
++    # Reshape back to NCDHW
++    x = jnp.reshape(x, (N, C, D, H, W))
++    
++    # Apply gamma and beta (affine transformation)
++    x = x * jnp.reshape(gamma, (1, C, 1, 1, 1)) + jnp.reshape(beta, (1, C, 1, 1, 1))
++    
++    # Final mean over channel and spatial dimensions
++    x = jnp.mean(x, axis=(1, 2, 3, 4))
++    
++    return x
++
++
++def conv3d_gn_mean_kernel(x_ref, weight_ref, conv_bias_ref, gamma_ref, beta_ref, out_ref):
++    """Pallas kernel for Conv3d + GroupNorm + Mean."""
++    # Grid is 1D, one block per batch element
++    batch_idx = pl.program_id(0)
++    
++    # Constants
++    num_groups = 8
++    in_channels = 3
++    out_channels = 24
++    kernel_size = 3
++    
++    # Input shapes
++    # x: [128, 3, 24, 32, 32] -> transposed to [128, 24, 32, 32, 3]
++    # After conv: [128, 24, 22, 30, 30] -> transposed to [128, 24, 22, 30, 30]
++    
++    # For simplicity, we'll use a single block that processes one batch element
++    # The kernel will perform the computation using JAX operations
++    
++    # Read inputs for this batch
++    # x shape: [3, 24, 32, 32] for this batch
++    x_local = x_ref[batch_idx]
++    
++    # weight shape: [24, 3, 3, 3, 3]
++    weight_local = weight_ref[:]
++    
++    # conv_bias shape: [24]
++    conv_bias_local = conv_bias_ref[:]
++    
++    # gamma shape: [24]
++    gamma_local = gamma_ref[:]
++    
++    # beta shape: [24]
++    beta_local = beta_ref[:]
++    
++    # Transpose x from NCDHW to NDHWC for this batch
++    x_local = jnp.transpose(x_local, (1, 2, 3, 0))  # [24, 32, 32, 3]
++    
++    # Transpose weight from OIDHW to DHWIO
++    kernel_local = jnp.transpose(weight_local, (2, 3, 4, 1, 0))  # [3, 3, 3, 3, 24]
++    
++    # Conv3D
++    conv_out = jax.lax.conv_general_dilated(
++        x_local[None], kernel_local[None],  # Add batch dimension
++        window_strides=(1, 1, 1),
++        padding='VALID',
++        dimension_numbers=('NDHWC', 'DHWIO', 'NDHWC')
++    )
++    conv_out = conv_out[0]  # Remove batch dimension: [22, 30, 30, 24]
++    
++    # Add bias
++    conv_out = conv_out + jnp.reshape(conv_bias_local, (1, 1, 1, 24))
++    
++    # Transpose back to NCDHW: [24, 22, 30, 30]
++    conv_out = jnp.transpose(conv_out, (3, 0, 1, 2))
++    
++    # Reshape for group norm: [1, 8, 3, 22, 30, 30]
++    conv_out = jnp.reshape(conv_out, (1, num_groups, out_channels // num_groups, 22, 30, 30))
++    
++    # Compute mean and variance
++    mean = jnp.mean(conv_out, axis=(2, 3, 4, 5), keepdims=True)
++    var = jnp.var(conv_out, axis=(2, 3, 4, 5), keepdims=True)
++    
++    # Normalize
++    gn_out = (conv_out - mean) / jnp.sqrt(var + 1e-5)
++    
++    # Reshape back: [24, 22, 30, 30]
++    gn_out = jnp.reshape(gn_out, (1, out_channels, 22, 30, 30))[0]
++    
++    # Apply gamma and beta
++    gn_out = gn_out * jnp.reshape(gamma_local, (out_channels, 1, 1, 1)) + jnp.reshape(beta_local, (out_channels, 1, 1, 1))
++    
++    # Final mean over channel and spatial dimensions
++    result = jnp.mean(gn_out, axis=(0, 2, 3, 4))
++    
++    # Write output
++    out_ref[batch_idx] = result
++
++
++def workload(x, weight, conv_bias, gamma, beta):
++    """
++    Conv3d + GroupNorm + Mean workload using Pallas kernel.
++    """
++    batch_size = x.shape[0]
++    
++    return pl.pallas_call(
++        conv3d_gn_mean_kernel,
++        out_shape=jax.ShapeDtypeStruct((batch_size,), x.dtype),
++        grid=(batch_size,),
++        in_specs=(
++            pl.BlockSpec((128, 3, 24, 32, 32), lambda batch_idx: (batch_idx, 0, 0, 0, 0)),
++            pl.BlockSpec((24, 3, 3, 3, 3), lambda: (0, 0, 0, 0, 0)),
++            pl.BlockSpec((24,), lambda: (0,)),
++            pl.BlockSpec((24,), lambda: (0,)),
++            pl.BlockSpec((24,), lambda: (0,)),
++        ),
++        out_specs=pl.BlockSpec((batch_size,), lambda batch_idx: (batch_idx,)),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel",)
++        ),
++    )(x, weight, conv_bias, gamma, beta)

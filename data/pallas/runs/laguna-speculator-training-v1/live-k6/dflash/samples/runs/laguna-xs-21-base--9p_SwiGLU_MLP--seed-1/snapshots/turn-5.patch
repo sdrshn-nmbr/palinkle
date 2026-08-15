@@ -1,0 +1,78 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..8719310 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,71 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as plp
++import jax.interpreters.tpu as pltpu
++
++def workload(x, gate_kernel, up_kernel, down_kernel):
++    """SwiGLU MLP kernel for Llama 3.1 70B.
++    
++    Computes: output = (SiLU(x @ gate_kernel) * (x @ up_kernel)) @ down_kernel
++    """
++    batch, seq_len, emb_dim = x.shape
++    mlp_dim = gate_kernel.shape[1]
++    
++    # Block size for TPU matmul - use multiples of 8 for bf16
++    block_m = 128
++    block_k = 128
++    block_n = 128
++    
++    def swiglu_kernel(ref_x, ref_gate_kernel, ref_up_kernel, ref_down_kernel, ref_out):
++        # Compute x @ gate_kernel -> [batch, seq_len, mlp_dim]
++        # Compute x @ up_kernel -> [batch, seq_len, mlp_dim]
++        # Then (gate * up) @ down_kernel -> [batch, seq_len, emb_dim]
++        
++        # We'll do the computation in a tiled manner
++        # For simplicity, use jnp.dot inside the kernel
++        
++        # Get the slices for this block
++        x_block = ref_x[...]
++        gate_kernel_block = ref_gate_kernel[...]
++        up_kernel_block = ref_up_kernel[...]
++        down_kernel_block = ref_down_kernel[...]
++        
++        # Compute x @ gate_kernel
++        gate = jnp.dot(x_block, gate_kernel_block)
++        # Apply SiLU: x / (1 + exp(-x))
++        gate = jax.nn.silu(gate)
++        
++        # Compute x @ up_kernel
++        up = jnp.dot(x_block, up_kernel_block)
++        
++        # Element-wise multiply
++        hidden = gate * up
++        
++        # Compute (gate * up) @ down_kernel
++        out = jnp.dot(hidden, down_kernel_block)
++        
++        ref_out[...] = out
++    
++    # Output shape
++    out_shape = jax.ShapeDtypeStruct(x.shape, x.dtype)
++    
++    # Grid dimensions based on output shape
++    # Output is [batch, seq_len, emb_dim]
++    grid = (batch, seq_len, emb_dim // block_n)
++    
++    return pl.pallas_call(
++        swiglu_kernel,
++        out_shape=out_shape,
++        grid=grid,
++        in_specs=(
++            pl.BlockSpec((batch, seq_len, emb_dim), lambda b, s, _: (b, s, slice(None))),
++            pl.BlockSpec((emb_dim, mlp_dim), lambda _, __, ___: (slice(None), slice(None))),
++            pl.BlockSpec((emb_dim, mlp_dim), lambda _, __, ___: (slice(None), slice(None))),
++            pl.BlockSpec((mlp_dim, emb_dim), lambda _, __, ___: (slice(None), slice(None))),
++        ),
++        out_specs=pl.BlockSpec((batch, seq_len, emb_dim), lambda b, s, n: (b, s, n * block_n)),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel", "parallel", "parallel")
++        ),
++    )(x, gate_kernel, up_kernel, down_kernel)

@@ -1,0 +1,80 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..b9a1b17 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,73 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import pallas as pl
++import pytpu as pltpu
++
++
++def mish(x):
++    return x * jnp.tanh(jnp.nn.softplus(x))
++
++
++def matmul_mish_mish_kernel(ref_x, ref_weight, ref_bias, ref_out):
++    # Block shapes for TPU
++    block_m = 128
++    block_k = 128
++    block_n = 128
++    
++    m_block = pl.program_id(0)
++    n_block = pl.program_id(1)
++    
++    # Compute tile indices
++    m_start = m_block * block_m
++    n_start = n_block * block_n
++    
++    # Accumulator in float32
++    acc = jnp.zeros((block_m, block_n), dtype=jnp.float32)
++    
++    # Matmul with accumulation
++    for k_block in range(ref_x.shape[1] // block_k):
++        k_start = k_block * block_k
++        
++        # Load tiles
++        x_tile = ref_x[m_start:m_start + block_m, k_start:k_start + block_k]
++        w_tile = ref_weight[k_start:k_start + block_k, n_start:n_start + block_n]
++        
++        # Accumulate in float32
++        acc = acc + jnp.dot(x_tile.astype(jnp.float32), w_tile.astype(jnp.float32))
++    
++    # Add bias
++    bias_tile = ref_bias[n_start:n_start + block_n]
++    acc = acc + bias_tile[None, :]
++    
++    # Convert to bfloat16 and apply Mish twice
++    result = acc.astype(jnp.bfloat16)
++    result = mish(result)
++    result = mish(result)
++    
++    # Write output
++    ref_out[m_start:m_start + block_m, n_start:n_start + block_n] = result
++
++
++def workload(x, weight, bias):
++    block_m = 128
++    block_k = 128
++    block_n = 128
++    
++    # Grid dimensions
++    grid_m = x.shape[0] // block_m
++    grid_n = weight.shape[1] // block_n
++    
++    return pl.pallas_call(
++        matmul_mish_mish_kernel,
++        out_shape=jax.ShapeDtypeStruct((x.shape[0], weight.shape[1]), x.dtype),
++        grid=(grid_m, grid_n),
++        in_specs=(
++            pl.BlockSpec((block_m, block_k), lambda m, n: (m * block_m, 0)),
++            pl.BlockSpec((block_k, block_n), lambda m, n: (0, n * block_n)),
++            pl.BlockSpec((block_n,), lambda m, n: (n * block_n,)),
++        ),
++        out_specs=pl.BlockSpec((block_m, block_n), lambda m, n: (m * block_m, n * block_n)),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel", "parallel")
++        ),
++    )(x, weight, bias)

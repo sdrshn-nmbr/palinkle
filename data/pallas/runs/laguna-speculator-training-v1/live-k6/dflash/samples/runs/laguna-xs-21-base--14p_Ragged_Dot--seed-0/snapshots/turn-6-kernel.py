@@ -1,0 +1,90 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.interpreters.pallas as pallas
+from jax.interpreters import xla_extension as xla
+
+def workload(x, weights):
+    """Grouped matmul (ragged dot) for MoE - Mixtral 8x7B.
+    
+    Computes einsum("gmk,gkn->gmn", x, weights) where:
+    - g: group dimension (8 groups)
+    - m: 1024
+    - k: 4096
+    - n: 14336
+    """
+    # Block size for matmul - must be multiple of 8 for bf16
+    BLOCK_M = 128
+    BLOCK_N = 128
+    BLOCK_K = 128
+    
+    # Grid dimensions: (num_groups, num_m_blocks, num_n_blocks)
+    num_groups = x.shape[0]
+    num_m_blocks = (x.shape[1] + BLOCK_M - 1) // BLOCK_M
+    num_n_blocks = (weights.shape[2] + BLOCK_N - 1) // BLOCK_N
+    
+    def matmul_kernel(ref_x, ref_weights, ref_out):
+        # Get program IDs
+        g = pl.program_id(0)  # group
+        m_block = pl.program_id(1)  # m block
+        n_block = pl.program_id(2)  # n block
+        
+        # Compute tile offsets
+        m_start = m_block * BLOCK_M
+        n_start = n_block * BLOCK_N
+        
+        # Compute tile shapes (handle boundaries)
+        m_tile = min(BLOCK_M, x.shape[1] - m_start)
+        n_tile = min(BLOCK_N, weights.shape[2] - n_start)
+        k_tile = weights.shape[1]  # K dimension is the reduction dimension
+        
+        # Initialize output tile to zero in float32
+        out_tile = jnp.zeros((m_tile, n_tile), dtype=jnp.float32)
+        
+        # Accumulate over K dimension
+        for k_start in range(0, k_tile, BLOCK_K):
+            k_end = min(k_start + BLOCK_K, k_tile)
+            actual_k = k_end - k_start
+            
+            # Get input tiles
+            x_tile = ref_x[g, m_start:m_start + m_tile, k_start:k_end]
+            w_tile = ref_weights[g, k_start:k_end, n_start:n_start + n_tile]
+            
+            # Compute partial matmul and accumulate
+            # Use float32 accumulation for better precision
+            partial = jnp.dot(x_tile.astype(jnp.float32), w_tile.astype(jnp.float32))
+            out_tile = out_tile + partial
+        
+        # Write result back as bfloat16
+        ref_out[g, m_start:m_start + m_tile, n_start:n_start + n_tile] = out_tile.astype(x.dtype)
+    
+    # Output shape
+    out_shape = jax.ShapeDtypeStruct(x.shape, x.dtype)
+    
+    # Grid specification
+    grid = (num_groups, num_m_blocks, num_n_blocks)
+    
+    # Block specifications
+    x_spec = pl.BlockSpec(
+        (num_groups, BLOCK_M, BLOCK_K),
+        lambda g, m_block, n_block: (g, m_block * BLOCK_M, 0)
+    )
+    weights_spec = pl.BlockSpec(
+        (BLOCK_K, BLOCK_N),
+        lambda g, m_block, n_block: (0, n_block * BLOCK_N)
+    )
+    out_spec = pl.BlockSpec(
+        (num_groups, BLOCK_M, BLOCK_N),
+        lambda g, m_block, n_block: (g, m_block * BLOCK_M, n_block * BLOCK_N)
+    )
+    
+    return pl.pallas_call(
+        matmul_kernel,
+        out_shape=out_shape,
+        grid=grid,
+        in_specs=(x_spec, weights_spec),
+        out_specs=out_spec,
+        compiler_params=xla.CompilerParams(
+            dimension_semantics=("parallel", "parallel", "parallel")
+        ),
+    )(x, weights)

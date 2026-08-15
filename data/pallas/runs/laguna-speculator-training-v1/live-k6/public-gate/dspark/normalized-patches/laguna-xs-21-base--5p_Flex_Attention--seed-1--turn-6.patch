@@ -1,0 +1,196 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..edade9b 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,189 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import pallas as pl
++import triton.pallas as pltpu
++
++# Configuration from the workload
++CONFIG = {
++    "batch": 4,
++    "head_dim": 128,
++    "model": "Llama-3.1-70B",
++    "name": "llama3_70b_flex_attention",
++    "num_heads": 64,
++    "operator": "flex_attention",
++    "seq_len": 4096
++}
++
++def workload(q, k, v, rel_pos_bias):
++    """Flex attention kernel with causal mask and relative position bias."""
++    D = CONFIG["head_dim"]  # 128
++    S = CONFIG["seq_len"]   # 4096
++    sm_scale = D ** -0.5
++
++    # Block size for tiling - use multiples of 8 for bf16 and 128 for vectorization
++    BLOCK_Q = 128
++    BLOCK_K = 128
++    BLOCK_D = 128
++
++    def attention_kernel(ref_q, ref_k, ref_v, ref_rel_pos_bias, ref_out):
++        """Pallas kernel for attention computation."""
++        # Get program IDs for batch and head
++        b = pl.program_id(0)
++        h = pl.program_id(1)
++        q_idx = pl.program_id(2)
++
++        # Causal mask: only attend to positions <= current query position
++        # For each query position, we need to compute attention over all keys
++        # but mask out future positions
++
++        # Compute attention scores for this query position
++        q_pos = q_idx * BLOCK_Q
++
++        # Initialize attention output for this query block
++        # We'll accumulate over the key dimension
++        for k_block in range(S // BLOCK_K):
++            k_pos = k_block * BLOCK_K
++
++            # Compute q @ k^T for this block
++            # q: [head_dim], k: [head_dim] -> scalar
++            attn_score = 0.0
++            for d in range(0, D, BLOCK_D):
++                q_block = ref_q[b, h, q_pos, d:d+BLOCK_D]
++                k_block = ref_k[b, h, k_pos, d:d+BLOCK_D]
++                attn_score += jnp.sum(q_block * k_block)
++
++            attn_score *= sm_scale
++
++            # Add relative position bias
++            # rel_pos_bias: [num_heads, seq_len, seq_len]
++            # bias for query position q_pos and key position k_pos
++            if q_pos < S and k_pos < S:
++                attn_score += ref_rel_pos_bias[h, q_pos, k_pos]
++
++            # Apply causal mask
++            # Only keep the score if k_pos <= q_pos (within the same block or earlier)
++            # For simplicity, we apply the mask at the end
++            # The causal mask is: attn[i,j] = 0 if j > i
++
++            # Store attention score (we'll handle masking in softmax)
++            # Actually, let's restructure this...
++
++    # Alternative approach: compute full attention matrix then apply mask
++    # But that's memory intensive. Let's use a more efficient approach.
++
++    # Grid: (batch, heads, num_query_blocks)
++    num_q_blocks = (S + BLOCK_Q - 1) // BLOCK_Q
++    grid = (CONFIG["batch"], CONFIG["num_heads"], num_q_blocks)
++
++    def kernel(ref_q, ref_k, ref_v, ref_rel_pos_bias, ref_out):
++        """Pallas kernel for attention computation."""
++        b = pl.program_id(0)
++        h = pl.program_id(1)
++        q_block_idx = pl.program_id(2)
++
++        q_start = q_block_idx * BLOCK_Q
++        q_end = min(q_start + BLOCK_Q, S)
++
++        # For each query position in this block
++        for q_local in range(BLOCK_Q):
++            q_pos = q_start + q_local
++            if q_pos >= S:
++                break
++
++            # Compute attention scores for this query position
++            # We need to compute scores for all key positions
++            # Then apply causal mask and softmax
++
++            # Initialize max score for numerical stability
++            max_score = -1e30
++
++            # First pass: find max score (for softmax stability)
++            for k_block in range(S // BLOCK_K):
++                k_start = k_block * BLOCK_K
++                k_end = min(k_start + BLOCK_K, S)
++
++                for k_local in range(BLOCK_K):
++                    k_pos = k_start + k_local
++                    if k_pos >= S:
++                        break
++
++                    # Causal mask: only consider k_pos <= q_pos
++                    if k_pos > q_pos:
++                        continue
++
++                    # Compute attention score
++                    score = 0.0
++                    for d in range(0, D, BLOCK_D):
++                        d_end = min(d + BLOCK_D, D)
++                        q_val = ref_q[b, h, q_pos, d:d+d_end]
++                        k_val = ref_k[b, h, k_pos, d:d+d_end]
++                        score += jnp.sum(q_val * k_val)
++
++                    score *= sm_scale
++                    score += ref_rel_pos_bias[h, q_pos, k_pos]
++
++                    max_score = jnp.maximum(max_score, score)
++
++            # Second pass: compute softmax and accumulate output
++            sum_exp = 0.0
++            out_val = 0.0
++
++            for k_block in range(S // BLOCK_K):
++                k_start = k_block * BLOCK_K
++                k_end = min(k_start + BLOCK_K, S)
++
++                for k_local in range(BLOCK_K):
++                    k_pos = k_start + k_local
++                    if k_pos >= S:
++                        break
++
++                    # Causal mask
++                    if k_pos > q_pos:
++                        continue
++
++                    # Compute attention score
++                    score = 0.0
++                    for d in range(0, D, BLOCK_D):
++                        d_end = min(d + BLOCK_D, D)
++                        q_val = ref_q[b, h, q_pos, d:d+d_end]
++                        k_val = ref_k[b, h, k_pos, d:d+d_end]
++                        score += jnp.sum(q_val * k_val)
++
++                    score *= sm_scale
++                    score += ref_rel_pos_bias[h, q_pos, k_pos]
++
++                    # Softmax
++                    exp_score = jnp.exp(score - max_score)
++                    sum_exp += exp_score
++
++                    # Accumulate output: sum over v
++                    for d in range(0, D, BLOCK_D):
++                        d_end = min(d + BLOCK_D, D)
++                        v_val = ref_v[b, h, k_pos, d:d+d_end]
++                        out_val += exp_score * v_val
++
++            # Normalize
++            out_val = out_val / sum_exp
++
++            # Store output
++            ref_out[b, h, q_pos, :] = out_val
++
++    # Use a simpler grid structure
++    # Grid: (batch, heads, num_query_blocks)
++    num_q_blocks = (S + BLOCK_Q - 1) // BLOCK_Q
++
++    return pl.pallas_call(
++        kernel,
++        out_shape=jax.ShapeDtypeStruct(q.shape, q.dtype),
++        grid=(CONFIG["batch"], CONFIG["num_heads"], num_q_blocks),
++        in_specs=(
++            pl.BlockSpec((1, 1, S, D), lambda b, h, q_idx: (b, h, q_idx * BLOCK_Q, 0)),
++            pl.BlockSpec((1, 1, S, D), lambda b, h, q_idx: (b, h, 0, 0)),
++            pl.BlockSpec((1, 1, S, D), lambda b, h, q_idx: (b, h, 0, 0)),
++            pl.BlockSpec((1, S, S), lambda b, h, q_idx: (h, 0, 0)),
++        ),
++        out_specs=pl.BlockSpec((1, 1, BLOCK_Q, D), lambda b, h, q_idx: (b, h, q_idx * BLOCK_Q, 0)),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel", "parallel", "parallel")
++        ),
++    )(q, k, v, rel_pos_bias)

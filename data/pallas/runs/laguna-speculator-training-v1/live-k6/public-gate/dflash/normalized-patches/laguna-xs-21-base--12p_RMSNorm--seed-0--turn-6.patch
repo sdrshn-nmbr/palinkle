@@ -1,0 +1,83 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..4c3fd89 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,76 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import pallas as pl
++import jax.pallas as pltpu
++
++# Configuration
++BATCH = 8
++SEQ_LEN = 4096
++EMB_DIM = 8192
++EPSILON = 1e-5
++
++# Block sizes for TPU
++BLOCK_BATCH = 1
++BLOCK_SEQ = 128  # Tile over seq_len for reduction
++BLOCK_EMB = 128  # Must be multiple of 8 for bf16
++
++def rmsnorm_kernel(x_ref, scale_ref, out_ref):
++    """RMSNorm kernel for TPU.
++
++    Computes: x * rsqrt(mean(x^2, axis=1) + eps) * scale
++    """
++    # Get program indices
++    b = pl.program_id(0)
++    s = pl.program_id(1)
++    e = pl.program_id(2)
++
++    # Read x value at this position
++    x_val = x_ref[b, s, e]
++
++    # Compute mean of squares along seq_len axis
++    # We need to reduce over all seq positions for this (batch, emb_dim)
++    sum_sq = 0.0
++    for seq in range(x_ref.shape[1]):
++        x_seq = x_ref[b, seq, e]
++        sum_sq += x_seq * x_seq
++
++    mean2 = sum_sq / x_ref.shape[1]
++
++    # Compute rsqrt
++    rsqrt_val = 1.0 / jnp.sqrt(mean2 + EPSILON)
++
++    # Compute output
++    out_val = x_val * rsqrt_val * scale_ref[e]
++
++    out_ref[b, s, e] = out_val
++
++
++def workload(x, scale):
++    """RMSNorm workload for TPU Pallas kernel.
++
++    Args:
++        x: Input tensor of shape (batch, seq_len, emb_dim), dtype bfloat16
++        scale: Scale tensor of shape (emb_dim,), dtype bfloat16
++
++    Returns:
++        Output tensor of shape (batch, seq_len, emb_dim), dtype bfloat16
++    """
++    # Grid dimensions: (batch, seq_len, emb_dim)
++    grid = (BATCH, SEQ_LEN, EMB_DIM)
++
++    # Block shapes
++    block_shape = (BLOCK_BATCH, BLOCK_SEQ, BLOCK_EMB)
++
++    return pl.pallas_call(
++        rmsnorm_kernel,
++        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
++        grid=grid,
++        in_specs=(
++            pl.BlockSpec(block_shape, lambda b, s, e: (b, s, e)),
++            pl.BlockSpec((BLOCK_EMB,), lambda e: (e,)),
++        ),
++        out_specs=pl.BlockSpec(block_shape, lambda b, s, e: (b, s, e)),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel", "parallel", "parallel")
++        ),
++    )(x, scale)

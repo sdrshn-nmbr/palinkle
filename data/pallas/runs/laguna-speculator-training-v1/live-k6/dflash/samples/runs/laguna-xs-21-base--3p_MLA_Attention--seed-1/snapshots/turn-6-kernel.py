@@ -1,0 +1,113 @@
+import jax
+import jax.numpy as jnp
+import pallas as pl
+import triton.tpu as pltpu
+
+# Configuration
+CONFIG = {
+    "batch": 4,
+    "emb_dim": 7168,
+    "kv_lora_rank": 512,
+    "model": "DeepSeek-V3-671B",
+    "name": "deepseek_v3_mla",
+    "num_heads": 128,
+    "operator": "mla_attention",
+    "q_lora_rank": 1536,
+    "qk_nope_head_dim": 128,
+    "qk_rope_head_dim": 64,
+    "rope_theta": 10000,
+    "seq_len": 2048,
+    "v_head_dim": 128
+}
+
+
+def _compute_rope(head_dim, seq_len, theta, dtype):
+    """Compute cosine and sine for RoPE."""
+    freqs = 1.0 / (theta ** (jnp.arange(0, head_dim, 2) / head_dim))
+    pos = jnp.arange(seq_len)
+    angles = jnp.outer(pos, freqs)
+    return jnp.cos(angles).astype(dtype), jnp.sin(angles).astype(dtype)
+
+
+def _apply_rope(x, cos, sin):
+    """Apply RoPE to input tensor."""
+    x1 = x[..., ::2]
+    x2 = x[..., 1::2]
+    rotated = jnp.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], axis=-1)
+    return rotated.reshape(x.shape)
+
+
+def workload(x, q_down_proj, q_up_proj, kv_down_proj, k_up_proj, v_up_proj, o_proj):
+    """MLA Attention kernel."""
+    # Extract config values
+    C = CONFIG
+    B, S, E = x.shape
+    H = C["num_heads"]
+    nope = C["qk_nope_head_dim"]
+    rope = C["qk_rope_head_dim"]
+    vd = C["v_head_dim"]
+    kvl = C["kv_lora_rank"]
+    
+    # Q projection: (B, S, E) @ (E, q_lora_rank) @ (q_lora_rank, H * (nope + rope))
+    q = jnp.dot(x, q_down_proj)
+    q = jnp.dot(q, q_up_proj)
+    
+    # Reshape q to (B, S, H, nope + rope)
+    q = q.reshape(B, S, H, nope + rope)
+    
+    # Split q into nope and rope parts
+    q_nope = q[..., :nope]
+    q_rope = q[..., nope:]
+    
+    # KV projection: (B, S, E) @ (E, kvl + rope)
+    kv = jnp.dot(x, kv_down_proj)
+    
+    # Split kv into latent and rope parts
+    k_latent = kv[..., :kvl]
+    k_rope_raw = kv[..., kvl:]
+    
+    # K nope projection: (k_latent @ k_up_proj).reshape(B, S, H, nope)
+    k_nope = jnp.dot(k_latent, k_up_proj)
+    k_nope = k_nope.reshape(B, S, H, nope)
+    
+    # Compute RoPE
+    cos, sin = _compute_rope(rope, S, C["rope_theta"], x.dtype)
+    
+    # Broadcast and apply RoPE to k_rope
+    k_rope = jnp.broadcast_to(k_rope_raw, (B, S, H, rope))
+    k_rope = _apply_rope(k_rope, cos, sin)
+    
+    # Apply RoPE to q_rope
+    q_rope = _apply_rope(q_rope, cos, sin)
+    
+    # V projection: (k_latent @ v_up_proj).reshape(B, S, H, vd).transpose(0, 2, 1, 3)
+    v = jnp.dot(k_latent, v_up_proj)
+    v = v.reshape(B, S, H, vd).transpose(0, 2, 1, 3)
+    
+    # Concatenate q_nope and q_rope, then transpose for attention
+    q_full = jnp.concatenate([q_nope, q_rope], axis=-1)
+    q_full = q_full.transpose(0, 2, 1, 3)  # (B, H, S, nope + rope)
+    
+    # Concatenate k_nope and k_rope, then transpose for attention
+    k_full = jnp.concatenate([k_nope, k_rope], axis=-1)
+    k_full = k_full.transpose(0, 2, 1, 3)  # (B, H, S, nope + rope)
+    
+    # Compute attention scores
+    hd = nope + rope
+    attn = jnp.einsum("bhqd,bhkd->bhqk", q_full, k_full) * (hd ** -0.5)
+    
+    # Causal mask
+    mask = jnp.tril(jnp.ones((S, S)))
+    attn = jnp.where(mask, attn, -1e9)
+    
+    # Softmax
+    attn = jax.nn.softmax(attn, axis=-1)
+    
+    # Compute output
+    out = jnp.einsum("bhqk,bhkd->bhqd", attn, v)
+    
+    # Reshape and transpose
+    out = out.transpose(0, 2, 1, 3).reshape(B, S, H * vd)
+    
+    # Output projection
+    return jnp.dot(out, o_proj)

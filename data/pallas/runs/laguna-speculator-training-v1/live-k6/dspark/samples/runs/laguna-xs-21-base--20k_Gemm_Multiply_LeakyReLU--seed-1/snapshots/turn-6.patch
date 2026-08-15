@@ -1,0 +1,74 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..c1394c3 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,67 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as plp
++import jax.interpreters.tpu as pltpu
++
++
++def kernel(x_ref, weight_ref, bias_ref, out_ref):
++    """Pallas kernel for Gemm + Multiply + LeakyReLU."""
++    m = x_ref.shape[0]
++    k = x_ref.shape[1]
++    n = weight_ref.shape[1]
++    
++    # Compute matmul result in float32 for accumulation
++    # x_ref[m, k] @ weight_ref[k, n] -> [m, n]
++    # Add bias
++    # Multiply by 2.0
++    # LeakyReLU with negative_slope=0.1
++    
++    # Use jnp.dot for matmul inside kernel
++    # Accumulate in float32
++    x = x_ref[...]
++    weight = weight_ref[...]
++    bias = bias_ref[...]
++    
++    # Matmul with float32 accumulation
++    result = jnp.dot(x, weight, precision=jax.lax.Precision.DEFAULT)
++    
++    # Add bias (broadcast along first dimension)
++    result = result + bias
++    
++    # Multiply by 2.0
++    result = result * 2.0
++    
++    # LeakyReLU: where(x >= 0, x, x * 0.1)
++    result = jnp.where(result >= 0, result, result * 0.1)
++    
++    out_ref[...] = result.astype(jnp.bfloat16)
++
++
++def workload(x, weight, bias):
++    """Workload for Gemm + Multiply + LeakyReLU."""
++    block_m = 128
++    block_k = 128
++    block_n = 128
++    
++    m, k = x.shape
++    _, n = weight.shape
++    
++    grid_m = (m + block_m - 1) // block_m
++    grid_k = (k + block_k - 1) // block_k
++    grid_n = (n + block_n - 1) // block_n
++    
++    return pl.pallas_call(
++        kernel,
++        out_shape=jax.ShapeDtypeStruct((m, n), jnp.bfloat16),
++        grid=(grid_m, grid_k, grid_n),
++        in_specs=(
++            pl.BlockSpec((block_m, block_k), lambda i, j, k: (i * block_m, j * block_k)),
++            pl.BlockSpec((block_k, block_n), lambda i, j, k: (j * block_k, k * block_n)),
++            pl.BlockSpec((block_n,), lambda i, j, k: (k * block_n,)),
++        ),
++        out_specs=pl.BlockSpec((block_m, block_n), lambda i, j, k: (i * block_m, j * block_n)),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel", "parallel", "parallel")
++        ),
++    )(x, weight, bias)

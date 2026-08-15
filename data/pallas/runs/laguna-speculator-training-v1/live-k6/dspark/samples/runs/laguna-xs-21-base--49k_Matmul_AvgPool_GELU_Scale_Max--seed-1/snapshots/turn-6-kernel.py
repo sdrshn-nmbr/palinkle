@@ -1,0 +1,82 @@
+import jax
+import jax.numpy as jnp
+import jax.lax as lax
+import pallas as pl
+import pytpu as pltpu
+
+def workload(x, weight, bias):
+    """
+    Implements: Matmul + AvgPool1d + GELU + Scale + Max
+    
+    Steps:
+    1. matmul: x @ weight + bias
+    2. expand_dims on axis 1
+    3. reduce_window (avg pool with kernel 16)
+    4. squeeze on axis 1
+    5. gelu
+    6. scale by 2.0
+    7. max along axis 1
+    """
+    batch_size = x.shape[0]  # 4096
+    in_features = x.shape[1]  # 8192
+    out_features = weight.shape[1]  # 8192
+    pool_kernel_size = 16
+    scale_factor = 2.0
+    
+    # Block size for TPU - need multiples of 8 for bf16
+    block_size = 128
+    
+    def kernel(matmul_ref, out_ref):
+        # Read the matmul result
+        matmul_val = matmul_ref[...]
+        
+        # Expand dims on axis 1: shape becomes [batch, 1, out_features]
+        expanded = jnp.expand_dims(matmul_val, axis=1)
+        
+        # Reduce window (avg pool) with kernel size 16
+        # Window dimensions: [1, 1, 16], strides: [1, 1, 16]
+        pooled = lax.reduce_window(
+            expanded,
+            init_value=0.0,
+            computation=lax.add,
+            window_dimensions=(1, 1, pool_kernel_size),
+            window_strides=(1, 1, pool_kernel_size),
+            padding="VALID"
+        )
+        # Divide by kernel size for average
+        pooled = pooled / pool_kernel_size
+        
+        # Squeeze on axis 1: shape becomes [batch, out_features]
+        squeezed = jnp.squeeze(pooled, axis=1)
+        
+        # GELU activation
+        gelu_out = jax.nn.gelu(squeezed)
+        
+        # Scale by 2.0
+        scaled = gelu_out * scale_factor
+        
+        # Max along axis 1
+        result = jnp.max(scaled, axis=1)
+        
+        out_ref[...] = result
+    
+    # Compute matmul outside the kernel for simplicity
+    # x @ weight + bias
+    matmul_result = jnp.dot(x, weight) + bias
+    
+    # Output shape: [batch_size]
+    out_shape = jax.ShapeDtypeStruct((batch_size,), x.dtype)
+    
+    # Grid: one block per batch element
+    grid = (batch_size // block_size,)
+    
+    return pl.pallas_call(
+        kernel,
+        out_shape=out_shape,
+        grid=grid,
+        in_specs=pl.BlockSpec((block_size, out_features), lambda i: (i * block_size, 0)),
+        out_specs=pl.BlockSpec((block_size,), lambda i: (i * block_size,)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",)
+        ),
+    )(matmul_result)

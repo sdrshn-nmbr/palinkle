@@ -1,0 +1,103 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..8531f76 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,96 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as plp
++import jax.interpreters.pallas as pj
++import jax.random as random
++
++def workload(x, weight, bias, bn_scale, bn_bias, bn_mean, bn_var, scale):
++    """
++    GEMM + BatchNorm + Scaling + Softmax kernel.
++
++    Semantic order:
++    1. x = x @ weight + bias
++    2. x_normalized = (x - bn_mean) / sqrt(bn_var + eps)
++    3. x = bn_scale * x_normalized + bn_bias
++    4. x = scale * x
++    5. x = softmax(x, axis=1)
++    """
++    eps = 1e-5
++
++    def kernel(ref_x, ref_weight, ref_bias, ref_bn_scale, ref_bn_bias,
++               ref_bn_mean, ref_bn_var, ref_scale, ref_out):
++        # Get program IDs for parallel execution
++        m = pl.program_id(0)  # batch dimension
++        n = pl.program_id(1)  # output feature dimension
++
++        # Block size for inner dimension
++        k_block = 128
++
++        # GEMM: x[m, :] @ weight[:, n] -> accumulate
++        # We need to compute the full row of x @ weight for each output element
++        # Actually, let's think about this differently
++
++        # For each output element (m, n), we need to compute:
++        # sum over k of x[m, k] * weight[k, n] + bias[n]
++
++        # Let's tile the computation
++        # We'll use a block-wise approach
++
++        # Get the full row of x for this batch element
++        x_row = ref_x[m, :]
++        # Get the full column of weight for this output feature
++        weight_col = ref_weight[:, n]
++
++        # Compute GEMM for this output element
++        # x[m, :] @ weight[:, n]
++        result = 0.0
++        for k in range(x_row.shape[0] // k_block):
++            x_block = x_row[k * k_block:(k + 1) * k_block]
++            w_block = weight_col[k * k_block:(k + 1) * k_block]
++            result += jnp.sum(x_block * w_block)
++        # Handle remainder
++        remainder = x_row.shape[0] % k_block
++        if remainder > 0:
++            result += jnp.sum(x_row[-remainder:] * weight_col[-remainder:])
++
++        # Add bias
++        result = result + ref_bias[n]
++
++        # BatchNorm: (result - bn_mean[n]) / sqrt(bn_var[n] + eps)
++        result = (result - ref_bn_mean[n]) / jnp.sqrt(ref_bn_var[n] + eps)
++
++        # Scale and shift
++        result = ref_bn_scale[n] * result + ref_bn_bias[n]
++
++        # Final scaling
++        result = ref_scale[0] * result
++
++        # Write to output
++        ref_out[m, n] = result.astype(jnp.bfloat16)
++
++    # Grid dimensions: batch_size x out_features
++    grid = (x.shape[0], x.shape[1])
++
++    # Block specs
++    block_size = 128
++
++    return pl.pallas_call(
++        kernel,
++        out_shape=jax.ShapeDtypeStruct((x.shape[0], x.shape[1]), jnp.bfloat16),
++        grid=grid,
++        in_specs=(
++            pl.BlockSpec((x.shape[0], x.shape[1]), lambda m, n: (m, slice(None))),  # x
++            pl.BlockSpec((x.shape[1], x.shape[1]), lambda m, n: (slice(None), n)),  # weight
++            pl.BlockSpec((x.shape[1],), lambda m, n: (n,)),  # bias
++            pl.BlockSpec((x.shape[1],), lambda m, n: (n,)),  # bn_scale
++            pl.BlockSpec((x.shape[1],), lambda m, n: (n,)),  # bn_bias
++            pl.BlockSpec((x.shape[1],), lambda m, n: (n,)),  # bn_mean
++            pl.BlockSpec((x.shape[1],), lambda m, n: (n,)),  # bn_var
++            pl.BlockSpec((1,), lambda m, n: (0,)),  # scale
++        ),
++        out_specs=pl.BlockSpec((x.shape[0], x.shape[1]), lambda m, n: (m, n)),
++        compiler_params=jax.pallas TPUCompilerParams(
++            dimension_semantics=("parallel", "parallel")
++        ),
++    )(x, weight, bias, bn_scale, bn_bias, bn_mean, bn_var, scale)

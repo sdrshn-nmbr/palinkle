@@ -1,0 +1,145 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as plp
+import jax.interpreters.pallas as pallas
+from jax.interpreters import pallas as pl
+from jax.pallas import lib as pllib
+import jax.lax as lax
+
+def workload(x, weight, bias):
+    """Conv2d + GELU + GlobalAvgPool kernel."""
+    # Input shapes:
+    # x: [128, 8, 256, 256] (NCHW) -> transpose to NHWC [128, 256, 256, 8]
+    # weight: [64, 8, 3, 3] (OIHW) -> transpose to HWIO [3, 3, 8, 64]
+    # bias: [64]
+    # Output: [128, 64]
+    
+    batch_size = 128
+    in_channels = 8
+    out_channels = 64
+    height = 256
+    width = 256
+    kernel_h = 3
+    kernel_w = 3
+    
+    # Transpose x from NCHW to NHWC
+    x_nhwc = jnp.transpose(x, (0, 2, 3, 1))  # [128, 256, 256, 8]
+    
+    # Transpose weight from OIHW to HWIO
+    kernel_hwio = jnp.transpose(weight, (2, 3, 1, 0))  # [3, 3, 8, 64]
+    
+    # Reshape bias for broadcasting: [1, 1, 1, 64]
+    bias_reshaped = jnp.reshape(bias, (1, 1, 1, out_channels))
+    
+    def conv_gelu_pool_kernel(
+        x_ref,
+        kernel_ref,
+        bias_ref,
+        out_ref,
+        *,
+        batch_s,
+        out_c_s,
+    ):
+        """Pallas kernel for Conv2d + GELU + GlobalAvgPool."""
+        # Grid indices
+        b = pl.program_id(0)  # batch index
+        oc = pl.program_id(1)  # output channel index
+        
+        # Compute output spatial dimensions after conv (VALID padding)
+        out_h = height - kernel_h + 1  # 254
+        out_w = width - kernel_w + 1   # 254
+        
+        # Accumulator for sum (use float32 for accumulation)
+        acc = jnp.zeros((), dtype=jnp.float32)
+        
+        # Iterate over spatial dimensions and input channels for conv
+        for oh in pl.range(out_h):
+            for ow in pl.range(out_w):
+                for ic in pl.range(in_channels):
+                    # Get input value
+                    x_val = x_ref[b, oh, ow, ic].astype(jnp.float32)
+                    
+                    # Get kernel value
+                    k_val = kernel_ref[kernel_h - 1 - oh % kernel_h, kernel_w - 1 - ow % kernel_w, ic, oc].astype(jnp.float32)
+                    
+                    # Actually, let me reconsider the convolution indexing
+                    # For a proper conv, we need to iterate over kernel positions
+                    pass
+        
+        # This approach is getting complex. Let me use a simpler approach
+        # with jnp operations inside the kernel
+        
+    # Actually, let me use a different approach - use jnp.conv_general_dilated
+    # inside a pallas kernel with proper tiling
+    
+    # Let me implement a tiled version
+    block_batch = 16
+    block_out_c = 16
+    
+    def kernel_fn(
+        x_ref: pl.Ref,
+        kernel_ref: pl.Ref,
+        bias_ref: pl.Ref,
+        out_ref: pl.Ref,
+        *,
+        batch_s: int,
+        out_c_s: int,
+    ):
+        # Get program indices
+        b_idx = pl.program_id(0)
+        oc_idx = pl.program_id(1)
+        
+        # Compute output spatial dimensions
+        out_h = height - kernel_h + 1  # 254
+        out_w = width - kernel_w + 1   # 254
+        
+        # Initialize accumulator for sum over spatial dimensions
+        total_sum = 0.0
+        
+        # Iterate over output spatial dimensions and input channels
+        for oh in range(out_h):
+            for ow in range(out_w):
+                for ic in range(in_channels):
+                    # Input position in NHWC format
+                    ih = oh  # VALID padding means no offset
+                    iw = ow
+                    
+                    # Get input value (convert to float32 for accumulation)
+                    x_val = x_ref[b_idx, ih, iw, ic].astype(jnp.float32)
+                    
+                    # Get kernel value
+                    # kernel is [3, 3, 8, 64] in HWIO format
+                    k_val = kernel_ref[ih % kernel_h, iw % kernel_w, ic, oc_idx].astype(jnp.float32)
+                    
+                    # Multiply and accumulate
+                    total_sum = total_sum + x_val * k_val
+        
+        # Add bias
+        total_sum = total_sum + bias_ref[oc_idx].astype(jnp.float32)
+        
+        # Apply GELU
+        gelu_val = 0.5 * total_sum * (1.0 + jnp.tanh(jnp.sqrt(2.0 / jnp.pi) * (total_sum + 0.044715 * total_sum ** 3)))
+        
+        # Store result
+        out_ref[b_idx, oc_idx] = gelu_val.astype(x.dtype)
+    
+    # Grid dimensions
+    grid = (batch_size // block_batch, out_channels // block_out_c)
+    
+    # Call pallas kernel
+    return pl.pallas_call(
+        kernel_fn,
+        out_shape=jax.ShapeDtypeStruct((batch_size, out_channels), x.dtype),
+        grid=grid,
+        in_specs=(
+            pl.BlockSpec((batch_s, height, width, in_channels), lambda b, oc: (b, 0, 0, 0)),
+            pl.BlockSpec((kernel_h, kernel_w, in_channels, out_c_s), lambda b, oc: (0, 0, 0, oc * out_c_s)),
+            pl.BlockSpec((out_c_s,), lambda b, oc: (oc * out_c_s,)),
+        ),
+        out_specs=pl.BlockSpec((batch_s, out_c_s), lambda b, oc: (b, oc * out_c_s)),
+        compiler_params=plp.CompilerParams(
+            dimension_semantics=("parallel", "parallel")
+        ),
+        scratch_shapes=(),
+    )(x_nhwc, kernel_hwio, bias_reshaped)

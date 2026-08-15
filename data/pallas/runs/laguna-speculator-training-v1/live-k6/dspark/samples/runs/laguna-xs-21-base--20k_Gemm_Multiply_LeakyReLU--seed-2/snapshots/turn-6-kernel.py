@@ -1,0 +1,73 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as plp
+import jax.interpreters.tpu as pltpu
+
+def workload(x, weight, bias):
+    """Gemm + Multiply + LeakyReLU kernel."""
+    
+    # Block size for tiling - use multiples of 8 for bf16 on TPU
+    block_m = 128
+    block_n = 128
+    block_k = 128
+    
+    # Grid dimensions
+    grid_m = x.shape[0] // block_m
+    grid_n = x.shape[1] // block_n
+    
+    def kernel(ref_x, ref_weight, ref_bias, ref_out):
+        # Accumulator in float32 for better precision
+        acc = ref_out[0]
+        
+        # Initialize accumulator to zero
+        pl.when(pl.program_id(0) == 0)(acc[...] = 0.0)
+        
+        # Tiled matmul
+        for k_block in range(x.shape[1] // block_k):
+            # Load tiles from x and weight
+            x_tile = ref_x[
+                pl.program_id(0) * block_m : (pl.program_id(0) + 1) * block_m,
+                k_block * block_k : (k_block + 1) * block_k
+            ]
+            w_tile = ref_weight[
+                k_block * block_k : (k_block + 1) * block_k,
+                pl.program_id(1) * block_n : (pl.program_id(1) + 1) * block_n
+            ]
+            
+            # Compute matmul and accumulate
+            acc[...] = acc[...] + jnp.dot(x_tile, w_tile, precision=jax.lax.Precision.DEFAULT)
+        
+        # Add bias
+        bias_tile = ref_bias[
+            pl.program_id(1) * block_n : (pl.program_id(1) + 1) * block_n
+        ]
+        acc[...] = acc[...] + bias_tile
+        
+        # Multiply by 2.0
+        acc[...] = acc[...] * 2.0
+        
+        # LeakyReLU: where(x >= 0, x, x * 0.1)
+        result = jnp.where(acc[...] >= 0, acc[...], acc[...] * 0.1)
+        
+        # Store result as bfloat16
+        ref_out[0] = result.astype(jnp.bfloat16)
+    
+    # Output shape
+    out_shape = jax.ShapeDtypeStruct(x.shape, x.dtype)
+    
+    return pl.pallas_call(
+        kernel,
+        out_shape=out_shape,
+        grid=(grid_m, grid_n),
+        in_specs=(
+            pl.BlockSpec((block_m, block_k), lambda i, j: (i * block_m, j * block_k)),
+            pl.BlockSpec((block_k, block_n), lambda i, j: (j * block_k, i * block_n)),
+            pl.BlockSpec((block_n,), lambda i, j: (j * block_n,)),
+        ),
+        out_specs=pl.BlockSpec((1,), lambda i, j: (0,)),
+        scratch_shapes=(jax.ShapeDtypeStruct((block_m, block_n), jnp.float32),),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel")
+        ),
+    )(x, weight, bias)

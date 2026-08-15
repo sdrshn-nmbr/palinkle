@@ -1,0 +1,69 @@
+import jax
+import jax.numpy as jnp
+import pallas as pl
+import pytpu as pltpu
+
+
+def matmul_kernel(ref_x, ref_weight, ref_bias, ref_out):
+    # Block shapes for TPU
+    block_m = 128
+    block_n = 128
+    block_k = 8
+    
+    # Get program IDs
+    m_start = pl.program_id(0) * block_m
+    n_start = pl.program_id(1) * block_n
+    
+    # Initialize accumulator in float32
+    acc = ref_out[0, 0]
+    acc[...] = 0.0
+    
+    # Tiled matmul
+    for k_start in range(0, 8192, block_k):
+        # Load tiles from x and weight
+        x_tile = ref_x[0, 0]
+        w_tile = ref_weight[0, 0]
+        
+        # Compute partial matmul and accumulate
+        partial = jnp.dot(x_tile, w_tile)
+        acc[...] = acc + partial
+    
+    # Add bias (broadcast along last dimension)
+    bias_tile = ref_bias[0, 0]
+    acc[...] = acc + bias_tile
+    
+    # Subtract 2.0
+    acc[...] = acc - 2.0
+    
+    # Multiply by 1.5
+    acc[...] = acc * 1.5
+    
+    # ReLU
+    acc[...] = jax.nn.relu(acc)
+    
+    # Convert back to bfloat16 and store
+    ref_out[0, 0] = acc.astype(jnp.bfloat16)
+
+
+def workload(x, weight, bias):
+    block_m = 128
+    block_n = 128
+    
+    # Grid dimensions
+    grid_m = x.shape[0] // block_m
+    grid_n = x.shape[1] // block_n
+    
+    return pl.pallas_call(
+        matmul_kernel,
+        out_shape=jax.ShapeDtypeStruct((4096, 8192), jnp.bfloat16),
+        grid=(grid_m, grid_n),
+        in_specs=(
+            pl.BlockSpec((128, 8), lambda m, n, k: (m * 128, k)),
+            pl.BlockSpec((8, 128), lambda m, n, k: (k, n * 128)),
+            pl.BlockSpec((128,), lambda m, n, k: (n * 128,)),
+        ),
+        out_specs=pl.BlockSpec((1,), lambda m, n: (m * 128, n * 128)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel")
+        ),
+    )(x, weight, bias)

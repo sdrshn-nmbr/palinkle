@@ -1,0 +1,61 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..8959a76 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,54 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as plp
++from jax import lax
++
++def workload(query, key, value):
++    """Multi-scale retention kernel for RetNet.
++    
++    Implements: Retention(X) = (Q K^T ⊙ D) V
++    where D[i,j] = γ^(i-j) if i >= j, else 0
++    
++    Each head has a different decay rate γ_h, creating multi-scale representation.
++    """
++    B, H, S, D = query.shape
++    
++    # Compute gammas for each head: exp2(1.0 - 5.0 / H)
++    gammas = jnp.exp2(1.0 - 5.0 / H)
++    
++    # Compute positions and distance matrix
++    positions = jnp.arange(S, dtype=jnp.float32)
++    distance = positions[:, None] - positions[None, :]  # [S, S]
++    
++    # Causal mask: 1 where distance >= 0, else 0
++    causal_mask = (distance >= 0).astype(jnp.float32)
++    
++    # Log gamma for each head
++    log_gamma = jnp.log(gammas)  # [H]
++    
++    # Compute decay: exp(log_gamma * max(distance, 0)) * causal_mask
++    # log_gamma needs to be broadcast to [S, S] for each head
++    # decay[h, i, j] = exp(log_gamma[h] * max(i-j, 0)) if i >= j else 0
++    decay = jnp.exp(
++        jnp.maximum(distance, 0.0)[None, :, :] * log_gamma[:, None, None]
++    ) * causal_mask[None, :, :]  # [H, S, S]
++    
++    # Convert to bfloat16 for computation
++    query_f32 = query.astype(jnp.float32)
++    key_f32 = key.astype(jnp.float32)
++    
++    # Compute QK^T: [B, H, S, S]
++    qk = jnp.einsum("bhsd,bhtd->bhst", query_f32, key_f32)
++    
++    # Apply decay
++    qk = qk * decay[None, :, :, :]  # broadcast over batch
++    
++    # Normalize by sum of absolute values
++    retention_sum = jnp.maximum(jnp.abs(qk).sum(axis=-1, keepdims=True), 1.0)
++    qk = qk / retention_sum
++    
++    # Compute output: [B, H, S, D]
++    output = jnp.einsum("bhst,bhtd->bhsd", qk.astype(query.dtype), value)
++    
++    return output

@@ -1,0 +1,38 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..c374cf6 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,31 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import pallas as pl
++import pytensor as pltpu
++
++def workload(query, key, value):
++    """
++    Standard scaled dot-product attention with causal mask.
++    QK^T -> mask -> softmax -> AV
++    """
++    B, H, S, D = query.shape
++
++    # Scale factor
++    scale = D ** -0.5
++
++    # Compute attention scores: QK^T
++    attn = jnp.einsum("bhqd,bhkd->bhqk", query, key) * scale
++
++    # Create causal mask (lower triangular)
++    mask = jnp.tril(jnp.ones((S, S)))
++
++    # Apply mask: set masked positions to large negative value
++    attn = jnp.where(mask, attn, -1e9)
++
++    # Softmax along the last axis
++    attn = jax.nn.softmax(attn, axis=-1)
++
++    # Compute output: attention * V
++    output = jnp.einsum("bhqk,bhkd->bhqd", attn, value)
++
++    return output

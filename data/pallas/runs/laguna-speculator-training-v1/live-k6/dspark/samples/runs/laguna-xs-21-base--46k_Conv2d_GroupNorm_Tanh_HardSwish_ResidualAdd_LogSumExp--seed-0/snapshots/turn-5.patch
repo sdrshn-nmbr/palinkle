@@ -1,0 +1,83 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..3cb7db8 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,76 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as plu
++import jax.interpreters.pallas as pallas
++from jax.interpreters import pallas as pl
++from jax.pallas import lib as pllib
++import jax.lax as lax
++
++def workload(x, conv_weight, conv_bias, gn_weight, gn_bias):
++    """
++    Conv2d + GroupNorm + Tanh + HardSwish + ResidualAdd + LogSumExp
++    
++    Input shapes:
++    - x: [128, 8, 128, 128] (NCHW)
++    - conv_weight: [64, 8, 3, 3]
++    - conv_bias: [64]
++    - gn_weight: [64]
++    - gn_bias: [64]
++    
++    Output shape: [128, 1, 126, 126]
++    """
++    groups = 16
++    eps = 1e-5
++    
++    # Step 1: Transpose x from NCHW to NHWC
++    x_nhwc = jnp.transpose(x, (0, 2, 3, 1))  # [128, 128, 128, 8]
++    
++    # Step 2: Transpose conv_weight from OIHW to HWIO
++    kernel = jnp.transpose(conv_weight, (2, 3, 1, 0))  # [3, 3, 8, 64]
++    
++    # Step 3: Conv2D with VALID padding
++    x_conv = lax.conv_general_dilated(
++        x_nhwc,
++        kernel,
++        window_strides=(1, 1),
++        padding='VALID',
++        dimension_numbers=('NHWC', 'HWIO', 'NHWC')
++    )  # [128, 126, 126, 64]
++    
++    # Step 4: Add bias (reshaped to broadcast)
++    x_conv = x_conv + jnp.reshape(conv_bias, (1, 1, 1, 64))  # [128, 126, 126, 64]
++    
++    # Step 5: Transpose to NCHW
++    x_conv_nchw = jnp.transpose(x_conv, (0, 3, 1, 2))  # [128, 64, 126, 126]
++    
++    # Step 6: Reshape for GroupNorm: [N, groups, C/groups, H, W]
++    N, C, H, W = x_conv_nchw.shape
++    x = jnp.reshape(x_conv_nchw, (N, groups, C // groups, H, W))  # [128, 16, 4, 126, 126]
++    
++    # Step 7: GroupNorm - compute mean and variance across H, W, C/groups
++    mean = jnp.mean(x, axis=(2, 3, 4), keepdims=True)  # [128, 16, 1, 1, 1]
++    var = jnp.var(x, axis=(2, 3, 4), keepdims=True)  # [128, 16, 1, 1, 1]
++    
++    # Step 8: Normalize
++    x_norm = (x - mean) / jnp.sqrt(var + eps)  # [128, 16, 4, 126, 126]
++    
++    # Step 9: Reshape back to NCHW
++    x = jnp.reshape(x_norm, (N, C, H, W))  # [128, 64, 126, 126]
++    
++    # Step 10: Apply scale and bias
++    x_norm = x * jnp.reshape(gn_weight, (1, C, 1, 1)) + jnp.reshape(gn_bias, (1, C, 1, 1))  # [128, 64, 126, 126]
++    
++    # Step 11: Apply tanh
++    x_tanh = jnp.tanh(x_norm)  # [128, 64, 126, 126]
++    
++    # Step 12: Apply HardSwish
++    x_hard_swish = x_tanh * jnp.minimum(jnp.maximum(x_tanh + 3, 0), 6) / 6  # [128, 64, 126, 126]
++    
++    # Step 13: Residual add (conv output before transpose)
++    x_res = x_conv_nchw + x_hard_swish  # [128, 64, 126, 126]
++    
++    # Step 14: LogSumExp across channels (axis=1)
++    x_logsumexp = jax.scipy.special.logsumexp(x_res, axis=1, keepdims=True)  # [128, 1, 126, 126]
++    
++    return x_logsumexp

@@ -1,0 +1,58 @@
+import jax
+import jax.numpy as jnp
+import pallas as pl
+import pytpu as pltpu
+
+
+def matmul_swish_scaling_kernel(ref_x, ref_weight, ref_bias, ref_out):
+    """Pallas kernel for Matmul + Swish + Scaling."""
+    m, k = ref_x.shape
+    n = ref_weight.shape[1]
+    
+    # Accumulate matmul result in float32 for better precision
+    acc = jnp.zeros((m, n), dtype=jnp.float32)
+    
+    # Perform matmul with accumulation
+    for i in range(k):
+        acc = acc + ref_x[:, i].astype(jnp.float32) * ref_weight[i, :].astype(jnp.float32)
+    
+    # Add bias (broadcast along first dimension)
+    acc = acc + ref_bias.astype(jnp.float32)
+    
+    # Convert back to bfloat16 for swish
+    acc_bf16 = acc.astype(jnp.bfloat16)
+    
+    # Swish activation: x * sigmoid(x)
+    swish_out = acc_bf16 * jax.nn.sigmoid(acc_bf16)
+    
+    # Scaling by 2.0
+    result = swish_out * 2.0
+    
+    ref_out[...] = result
+
+
+def workload(x, weight, bias):
+    """Compute Matmul + Swish + Scaling."""
+    block_size = 128
+    
+    m, k = x.shape
+    _, n = weight.shape
+    
+    # Grid dimensions
+    grid_m = (m + block_size - 1) // block_size
+    grid_n = (n + block_size - 1) // block_size
+    
+    return pl.pallas_call(
+        matmul_swish_scaling_kernel,
+        out_shape=jax.ShapeDtypeStruct((m, n), jnp.bfloat16),
+        grid=(grid_m, grid_n),
+        in_specs=(
+            pl.BlockSpec((block_size, k), lambda i, j: (i * block_size, 0)),
+            pl.BlockSpec((k, block_size), lambda i, j: (0, j * block_size)),
+            pl.BlockSpec((n,), lambda i, j: (0,)),
+        ),
+        out_specs=pl.BlockSpec((block_size, block_size), lambda i, j: (i * block_size, j * block_size)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel")
+        ),
+    )(x, weight, bias)

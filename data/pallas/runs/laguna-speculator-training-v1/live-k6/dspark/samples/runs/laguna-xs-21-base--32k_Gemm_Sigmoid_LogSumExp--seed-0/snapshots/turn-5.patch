@@ -1,0 +1,51 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..30c4d1d 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,44 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as pltpu
++
++
++def kernel(x_ref, w1_ref, b1_ref, w2_ref, b2_ref, out_ref):
++    """Pallas kernel for Gemm + Sigmoid + Gemm + LogSumExp."""
++    i = pl.program_id(0)
++    
++    # Load the entire row of x
++    x_row = x_ref[i, :]
++    
++    # First matmul: x @ w1.T + b1
++    hidden = jnp.dot(x_row, w1_ref.T) + b1_ref
++    hidden = jax.nn.sigmoid(hidden)
++    
++    # Second matmul: hidden @ w2.T + b2
++    output_row = jnp.dot(hidden, w2_ref.T) + b2_ref
++    
++    # LogSumExp
++    result = jax.scipy.special.logsumexp(output_row)
++    
++    out_ref[i] = result
++
++
++def workload(x, w1, b1, w2, b2):
++    """Workload for 45_Gemm_Sigmoid_LogSumExp."""
++    return pl.pallas_call(
++        kernel,
++        out_shape=jax.ShapeDtypeStruct((x.shape[0],), x.dtype),
++        grid=(x.shape[0],),
++        in_specs=(
++            pl.BlockSpec((1, x.shape[1]), lambda i: (i, 0)),  # x
++            pl.no_block_spec,  # w1
++            pl.no_block_spec,  # b1
++            pl.no_block_spec,  # w2
++            pl.no_block_spec,  # b2
++        ),
++        out_specs=pl.BlockSpec((1,), lambda i: (i,)),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel",)
++        ),
++    )(x, w1, b1, w2, b2)

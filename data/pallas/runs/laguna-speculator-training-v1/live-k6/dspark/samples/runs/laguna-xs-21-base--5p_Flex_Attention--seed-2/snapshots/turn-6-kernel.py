@@ -1,0 +1,146 @@
+import jax
+import jax.numpy as jnp
+import pallas as pl
+import jax.pallas as plu
+import jax.pallas.lib as pll
+import jax.pallas.triton as pltr
+import jax.pallas.tpu as pltpu
+
+# Configuration
+CONFIG = {
+    "batch": 4,
+    "head_dim": 128,
+    "model": "Llama-3.1-70B",
+    "name": "llama3_70b_flex_attention",
+    "num_heads": 64,
+    "operator": "flex_attention",
+    "seq_len": 4096
+}
+
+def workload(q, k, v, rel_pos_bias):
+    """Flex attention kernel with causal mask and relative position bias."""
+    
+    D = CONFIG["head_dim"]  # 128
+    S = CONFIG["seq_len"]   # 4096
+    B = CONFIG["batch"]     # 4
+    H = CONFIG["num_heads"] # 64
+    
+    sm_scale = D ** -0.5
+    
+    # Define block sizes for TPU
+    # For TPU, block sizes should be multiples of 8 for bf16
+    BLOCK_Q = 64  # Block size for query sequence dimension
+    BLOCK_K = 64  # Block size for key sequence dimension
+    BLOCK_D = 128 # Block size for head dimension
+    
+    def flex_attention_kernel(ref_q, ref_k, ref_v, ref_rel_pos_bias, ref_out):
+        """Pallas kernel for flex attention."""
+        
+        # Get program IDs for parallel dimensions
+        b = pl.program_id(0)  # batch
+        h = pl.program_id(1)  # head
+        m = pl.program_id(2)  # query block index
+        n = pl.program_id(3)  # key block index
+        
+        # Compute the starting indices for this block
+        q_start = m * BLOCK_Q
+        k_start = n * BLOCK_K
+        
+        # Compute the actual block sizes (handle boundary)
+        q_block_size = min(BLOCK_Q, S - q_start)
+        k_block_size = min(BLOCK_K, S - k_start)
+        
+        # Initialize attention accumulator in float32 for numerical stability
+        attn_block = jnp.zeros((q_block_size, k_block_size), dtype=jnp.float32)
+        
+        # Compute q @ k.T for this block
+        # q: [B, H, S, D], k: [B, H, S, D]
+        # We need to compute q[b, h, q_start:q_start+q_block_size, :] @ k[b, h, k_start:k_start+k_block_size, :].T
+        
+        # Accumulate over head dimension
+        for d in range(0, D, BLOCK_D):
+            d_block_size = min(BLOCK_D, D - d)
+            
+            # Load q block: [q_block_size, d_block_size]
+            q_block = ref_q[b, h, q_start:q_start+q_block_size, d:d+d_block_size].astype(jnp.float32)
+            
+            # Load k block: [k_block_size, d_block_size]
+            k_block = ref_k[b, h, k_start:k_start+k_block_size, d:d+d_block_size].astype(jnp.float32)
+            
+            # Compute partial attention: q_block @ k_block.T
+            # Result shape: [q_block_size, k_block_size]
+            attn_block = attn_block + jnp.dot(q_block, k_block.T)
+        
+        # Scale by sm_scale
+        attn_block = attn_block * sm_scale
+        
+        # Add relative position bias
+        # rel_pos_bias: [H, S, S]
+        # We need to add bias for positions q_start:q_start+q_block_size and k_start:k_start+k_block_size
+        for q_offset in range(q_block_size):
+            for k_offset in range(k_block_size):
+                q_pos = q_start + q_offset
+                k_pos = k_start + k_offset
+                # Add relative position bias
+                attn_block = attn_block.at[q_offset, k_offset] += ref_rel_pos_bias[h, q_pos, k_pos]
+        
+        # Apply causal mask: only allow attention to positions <= current position
+        for q_offset in range(q_block_size):
+            for k_offset in range(k_block_size):
+                q_pos = q_start + q_offset
+                k_pos = k_start + k_offset
+                if k_pos > q_pos:
+                    attn_block = attn_block.at[q_offset, k_offset].set(-1e30)
+        
+        # Softmax along the key dimension (axis=1)
+        # For numerical stability, subtract max
+        max_val = jnp.max(attn_block, axis=1, keepdims=True)
+        attn_block = attn_block - max_val
+        exp_attn = jnp.exp(attn_block)
+        sum_exp = jnp.sum(exp_attn, axis=1, keepdims=True)
+        attn_block = exp_attn / sum_exp
+        
+        # Compute output: attn @ v
+        # v: [B, H, S, D]
+        # We need to accumulate the output
+        out_block = jnp.zeros((q_block_size, D), dtype=jnp.float32)
+        
+        for d in range(0, D, BLOCK_D):
+            d_block_size = min(BLOCK_D, D - d)
+            
+            # Load v block: [k_block_size, d_block_size]
+            v_block = ref_v[b, h, k_start:k_start+k_block_size, d:d+d_block_size].astype(jnp.float32)
+            
+            # Compute partial output: attn_block @ v_block
+            out_block = out_block + jnp.dot(attn_block, v_block)
+        
+        # Write output
+        ref_out[b, h, q_start:q_start+q_block_size, :].set(out_block.astype(ref_out.dtype))
+    
+    # Grid dimensions: batch, head, seq_len_blocks
+    grid = (B, H, (S + BLOCK_Q - 1) // BLOCK_Q, (S + BLOCK_K - 1) // BLOCK_K)
+    
+    # Define input specs
+    in_specs = (
+        pl.BlockSpec((B, H, S, D), lambda b, h, m, n: (b, h, m * BLOCK_Q, 0)),  # q
+        pl.BlockSpec((B, H, S, D), lambda b, h, m, n: (b, h, n * BLOCK_K, 0)),  # k
+        pl.BlockSpec((B, H, S, D), lambda b, h, m, n: (b, h, n * BLOCK_K, 0)),  # v
+        pl.BlockSpec((H, S, S), lambda b, h, m, n: (h, m * BLOCK_Q, n * BLOCK_K)),  # rel_pos_bias
+    )
+    
+    # Define output spec
+    out_specs = (
+        pl.BlockSpec((B, H, S, D), lambda b, h, m, n: (b, h, m * BLOCK_Q, 0)),  # out
+    )
+    
+    # Call the Pallas kernel
+    return pl.pallas_call(
+        flex_attention_kernel,
+        out_shape=jax.ShapeDtypeStruct((B, H, S, D), q.dtype),
+        grid=grid,
+        in_specs=in_specs,
+        out_specs=out_specs,
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel", "parallel", "parallel")
+        ),
+    )(q, k, v, rel_pos_bias)

@@ -1,0 +1,62 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..2d9f7cb 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,55 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as plp
++import jax.interpreters.tpu as pltpu
++
++def workload(x, weight, bias):
++    """Gemm + Multiply + LeakyReLU kernel."""
++
++    M, K = x.shape
++    K2, N = weight.shape
++
++    # Block sizes for TPU - need multiples of 8 for bf16
++    block_m = 128
++    block_n = 128
++    block_k = 128
++
++    def kernel(ref_x, ref_weight, ref_bias, ref_out):
++        # Compute matmul result in float32 for accumulation
++        # x @ weight + bias
++        x_block = ref_x[...]
++        weight_block = ref_weight[...]
++
++        # Matmul with float32 accumulation
++        result = jnp.dot(x_block, weight_block, preferred_element_type=jax.dtypes.float32)
++
++        # Add bias
++        result = result + ref_bias[...]
++
++        # Multiply by 2.0
++        result = result * 2.0
++
++        # LeakyReLU: where(x >= 0, x, x * 0.1)
++        result = jnp.where(result >= 0, result, result * 0.1)
++
++        ref_out[...] = result.astype(jnp.bfloat16)
++
++    # Grid dimensions
++    grid_m = (M + block_m - 1) // block_m
++    grid_n = (N + block_n - 1) // block_n
++
++    return pl.pallas_call(
++        kernel,
++        out_shape=jax.ShapeDtypeStruct((M, N), jnp.bfloat16),
++        grid=(grid_m, grid_n),
++        in_specs=(
++            pl.BlockSpec((block_m, K), lambda mi, ni: (mi * block_m, slice(None))),
++            pl.BlockSpec((K, block_n), lambda mi, ni: (slice(None), ni * block_n)),
++            pl.BlockSpec((N,), lambda mi, ni: (slice(None),)),
++        ),
++        out_specs=pl.BlockSpec((block_m, block_n), lambda mi, ni: (mi * block_m, ni * block_n)),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel", "parallel")
++        ),
++    )(x, weight, bias)

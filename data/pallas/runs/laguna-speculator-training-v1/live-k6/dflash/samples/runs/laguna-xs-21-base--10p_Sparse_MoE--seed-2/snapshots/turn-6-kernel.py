@@ -1,0 +1,106 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as plp
+import jax
+
+def workload(x, router_weights, expert_gate_kernels, expert_up_kernels, expert_down_kernels):
+    """Sparse MoE kernel using Pallas."""
+    B, S, E = x.shape
+    N = router_weights.shape[0]  # sequence length
+    num_experts = expert_gate_kernels.shape[0]
+    M = expert_gate_kernels.shape[2]  # mlp_dim
+    K = 2  # num_experts_per_tok
+    
+    def sparse_moe_kernel(
+        x_ref,
+        router_weights_ref,
+        expert_gate_kernels_ref,
+        expert_up_kernels_ref,
+        expert_down_kernels_ref,
+        out_ref,
+    ):
+        # Get the token index from the grid
+        b = pl.program_id(0)
+        s = pl.program_id(1)
+        
+        # Compute logits for this token: x[b, s, :] @ router_weights[s, :]
+        # x[b, s, :] has shape (E,) = (4096,)
+        # router_weights[s, :] has shape (num_experts,) = (8,)
+        # logits shape: (num_experts,) = (8,)
+        
+        # Load x for this token
+        x_token = x_ref[b, s, :]  # (E,)
+        
+        # Load router weights for this token
+        router_weights_token = router_weights_ref[s, :]  # (num_experts,)
+        
+        # Compute logits: dot product
+        logits = jnp.dot(x_token, router_weights_token)  # (num_experts,)
+        
+        # Get top_k indices and values
+        top_k_values, top_k_indices = jax.lax.top_k(logits, K)  # (K,), (K,)
+        
+        # Compute router probs (softmax over top_k)
+        router_probs = jax.nn.softmax(top_k_values)  # (K,)
+        
+        # Compute gate_out = silu(einsum("bse,nem->bsnm", x, expert_gate_kernels))
+        # For this token: silu(x_token @ expert_gate_kernels[:, :, :])
+        # expert_gate_kernels has shape (num_experts, S, M)
+        # x_token @ expert_gate_kernels[:, s, :] gives shape (num_experts, M)
+        gate_out = jnp.einsum('e, nem -> nm', x_token, expert_gate_kernels_ref[:, s, :])
+        gate_out = jax.nn.silu(gate_out)  # (num_experts, M)
+        
+        # Compute up_out = einsum("bse,nem->bsnm", x, expert_up_kernels)
+        up_out = jnp.einsum('e, nem -> nm', x_token, expert_up_kernels_ref[:, s, :])  # (num_experts, M)
+        
+        # hidden = gate_out * up_out
+        hidden = gate_out * up_out  # (num_experts, M)
+        
+        # expert_outputs = einsum("bsnm,nme->bsne", hidden, expert_down_kernels)
+        # For this token: hidden @ expert_down_kernels
+        # hidden has shape (num_experts, M)
+        # expert_down_kernels has shape (num_experts, M, E)
+        # Result: (num_experts, E)
+        expert_outputs = jnp.einsum('nm, nme -> ne', hidden, expert_down_kernels_ref)  # (num_experts, E)
+        
+        # Create one_hot from top_k_indices
+        one_hot = jax.nn.one_hot(top_k_indices, num_experts)  # (K, num_experts)
+        
+        # weighted = one_hot * router_probs
+        weighted = one_hot * router_probs[:, None]  # (K, num_experts)
+        
+        # expert_weights = sum(weighted, axis=0)
+        expert_weights = jnp.sum(weighted, axis=0)  # (num_experts,)
+        
+        # output = einsum("bsne,bsn->bse", expert_outputs, expert_weights)
+        # For this token: expert_outputs[b, s, :] * expert_weights
+        output = jnp.sum(expert_outputs * expert_weights[None, :], axis=0)  # (E,)
+        
+        # Write output
+        out_ref[b, s, :] = output
+    
+    # Grid: one block per (batch, token)
+    grid = (B, S)
+    
+    # Block shapes
+    block_b = 1
+    block_s = 1
+    block_e = E
+    
+    return jax.pallas.pallas_call(
+        sparse_moe_kernel,
+        out_shape=jax.ShapeDtypeStruct((B, S, E), jnp.float32),
+        grid=grid,
+        in_specs=(
+            pl.BlockSpec((block_b, S, E), lambda b, s: (b, 0, 0)),
+            pl.BlockSpec((S, num_experts), lambda b, s: (0, 0)),
+            pl.BlockSpec((num_experts, S, M), lambda b, s: (0, 0, 0)),
+            pl.BlockSpec((num_experts, S, M), lambda b, s: (0, 0, 0)),
+            pl.BlockSpec((num_experts, M, E), lambda b, s: (0, 0, 0)),
+        ),
+        out_specs=pl.BlockSpec((block_b, block_s, block_e), lambda b, s: (b, s, 0)),
+        compiler_params=jax.pallas TPUCompilerParams(
+            dimension_semantics=("parallel", "parallel", "contract")
+        ),
+    )(x, router_weights, expert_gate_kernels, expert_up_kernels, expert_down_kernels)

@@ -1,0 +1,157 @@
+diff --git a/__pycache__/kernel.cpython-312.pyc b/__pycache__/kernel.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..693cfcc828a57dad4c2457e306ee7f1bcdf49682
+GIT binary patch
+literal 223
+zcmX@j%ge<81TU2;vgCpEV-N=h7@>^MASKfoQW#noq8KU}HJOrODqu7_knx!Xtg4bh
+zlhJP_khsN`nO9I+Qd|r&M&Xx;etCXTc5y*sa;koIYEfQlj$T3KEe?=iPJUua5gSky
+zNM$iAkZ54I!NUF-$YAi(WCTkUF#|b8AbW~H3T|=O<mRW8=A_ycaR9ksjUZQkU}j`w
+M{LIA2$N^Rh069V_DgXcg
+
+literal 0
+HcmV?d00001
+
+diff --git a/kernel.py b/kernel.py
+index a877f2f..3b79847 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,137 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as plp
++import jax.interpreters.tpu as pltpu
++
++def workload(pair_act, mask, left_proj_w, right_proj_w, left_gate_w, right_gate_w, center_scale, out_proj_w, out_gate_w):
++    """Triangle Multiplicative Update (Outgoing) — AlphaFold2 768."""
++    
++    # Define block size for tiling
++    BLOCK_I = 128
++    BLOCK_J = 128
++    BLOCK_K = 128
++    BLOCK_C = 128
++    
++    N = 1536  # First dimension
++    M = 1536  # Second dimension
++    C = 128   # Channel dimension
++    
++    def triangle_mult_kernel(
++        pair_act_ref,
++        mask_ref,
++        left_proj_w_ref,
++        right_proj_w_ref,
++        left_gate_w_ref,
++        right_gate_w_ref,
++        center_scale_ref,
++        out_proj_w_ref,
++        out_gate_w_ref,
++        out_ref,
++    ):
++        # Get program IDs for tiling
++        i_block = pl.program_id(0)
++        j_block = pl.program_id(1)
++        c_block = pl.program_id(2)
++        
++        # Calculate tile boundaries
++        i_start = i_block * BLOCK_I
++        j_start = j_block * BLOCK_J
++        c_start = c_block * BLOCK_C
++        
++        i_end = min(i_start + BLOCK_I, N)
++        j_end = min(j_start + BLOCK_J, M)
++        c_end = min(c_start + BLOCK_C, C)
++        
++        # Initialize output tile
++        out_ref[...] = jnp.zeros((i_end - i_start, j_end - j_start, c_end - c_start), dtype=jnp.float32)
++        
++        # For each k in the contracted dimension, accumulate
++        for k_start in range(0, M, BLOCK_K):
++            k_end = min(k_start + BLOCK_K, M)
++            
++            # Load tiles from pair_act and mask
++            act_tile = pair_act_ref[i_start:i_end, k_start:k_end, :]
++            mask_tile = mask_ref[i_start:i_end, k_start:k_end, :]
++            
++            # Element-wise multiply pair_act by mask
++            act = act_tile * mask_tile
++            
++            # Load projection weights
++            left_proj_w_tile = left_proj_w_ref[:]
++            right_proj_w_tile = right_proj_w_ref[:]
++            left_gate_w_tile = left_gate_w_ref[:]
++            right_gate_w_tile = right_gate_w_ref[:]
++            
++            # Compute left_proj = act @ left_proj_w
++            left_proj = jnp.dot(act, left_proj_w_tile)
++            
++            # Compute right_proj = act @ right_proj_w
++            right_proj = jnp.dot(act, right_proj_w_tile)
++            
++            # Compute left_gate = sigmoid(act @ left_gate_w)
++            left_gate = jax.nn.sigmoid(jnp.dot(act, left_gate_w_tile))
++            
++            # Compute right_gate = sigmoid(act @ right_gate_w)
++            right_gate = jax.nn.sigmoid(jnp.dot(act, right_gate_w_tile))
++            
++            # Apply gates
++            left_proj = left_proj * left_gate
++            right_proj = right_proj * right_gate
++            
++            # Load right_proj tile for einsum
++            right_proj_j_tile = right_proj_ref[j_start:j_end, k_start:k_end, :]
++            
++            # Einsum: "ikc,jkc->ijc" - contract over k
++            # left_proj[i, k, c] * right_proj[j, k, c] -> result[i, j, c]
++            result_tile = jnp.einsum("ikc,jkc->ijc", left_proj, right_proj_j_tile)
++            
++            # Accumulate to output
++            out_ref[...] = out_ref[...] + result_tile.astype(jnp.float32)
++        
++        # RMS normalization
++        eps = 1e-6
++        rms = jnp.sqrt(jnp.mean(out_ref[...] ** 2, axis=-1, keepdims=True) + eps)
++        out_ref[...] = (out_ref[...] / rms) * center_scale_ref[c_start:c_end]
++        
++        # Output projection
++        out_proj_w_tile = out_proj_w_ref[:]
++        out_ref[...] = jnp.dot(out_ref[...], out_proj_w_tile)
++        
++        # Output gate
++        out_gate_w_tile = out_gate_w_ref[:]
++        gate_tile = out_gate_w_ref[:]
++        
++        # Compute gate = sigmoid(pair_act @ out_gate_w)
++        # We need to load pair_act for the gate computation
++        pair_act_i_tile = pair_act_ref[i_start:i_end, :, :]
++        gate = jax.nn.sigmoid(jnp.dot(pair_act_i_tile, gate_tile))
++        
++        # Final output
++        out_ref[...] = out_ref[...] * gate
++    
++    # Grid dimensions
++    grid_i = (N + BLOCK_I - 1) // BLOCK_I
++    grid_j = (M + BLOCK_J - 1) // BLOCK_J
++    grid_c = (C + BLOCK_C - 1) // BLOCK_C
++    
++    return pl.pallas_call(
++        triangle_mult_kernel,
++        out_shape=jax.ShapeDtypeStruct((N, M, C), pair_act.dtype),
++        grid=(grid_i, grid_j, grid_c),
++        in_specs=(
++            pl.BlockSpec((N, M, C), lambda: (0, 0, 0)),  # pair_act
++            pl.BlockSpec((N, M, 1), lambda: (0, 0, 0)),  # mask
++            pl.BlockSpec((C, C), lambda: (0, 0)),  # left_proj_w
++            pl.BlockSpec((C, C), lambda: (0, 0)),  # right_proj_w
++            pl.BlockSpec((C, C), lambda: (0, 0)),  # left_gate_w
++            pl.BlockSpec((C, C), lambda: (0, 0)),  # right_gate_w
++            pl.BlockSpec((C,), lambda: (0,)),  # center_scale
++            pl.BlockSpec((C, C), lambda: (0, 0)),  # out_proj_w
++            pl.BlockSpec((C, C), lambda: (0, 0)),  # out_gate_w
++        ),
++        out_specs=pl.BlockSpec((BLOCK_I, BLOCK_J, BLOCK_C), lambda i, j, c: (i * BLOCK_I, j * BLOCK_J, c * BLOCK_C)),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel", "parallel", "parallel")
++        ),
++    )(*inputs)

@@ -1,0 +1,45 @@
+import jax
+import jax.numpy as jnp
+import pallas as pl
+import pallas.core as plc
+import jax.pallas as plu
+
+def workload(x, y, bmm_weight, bmm_bias, in_weight, in_bias):
+    """BMM + InstanceNorm + Sum + ResidualAdd + Multiply kernel."""
+    
+    # Constants
+    eps = 1e-5
+    
+    # BMM: x @ bmm_weight.T + bmm_bias
+    # x: [4096, 8192], bmm_weight: [8192, 8192], bmm_bias: [8192]
+    x_bmm = jnp.dot(x, bmm_weight.T) + bmm_bias
+    
+    # Expand dims to 4D for instance norm: [4096, 1, 1, 8192]
+    x_4d = jnp.expand_dims(jnp.expand_dims(x_bmm, axis=1), axis=2)
+    
+    # InstanceNorm: compute mean and variance over axes 2 and 3
+    mean = jnp.mean(x_4d, axis=(2, 3), keepdims=True)
+    var = jnp.var(x_4d, axis=(2, 3), keepdims=True)
+    
+    # Normalize: (x - mean) / sqrt(var + eps)
+    x_norm = (x_4d - mean) / jnp.sqrt(var + eps)
+    
+    # Reshape in_weight and in_bias to [1, 1, 1, 8192]
+    # in_weight: [8192] -> [1, 1, 1, 8192]
+    # in_bias: [8192] -> [1, 1, 1, 8192]
+    in_weight_4d = jnp.reshape(in_weight, (1, 1, 1, 8192))
+    in_bias_4d = jnp.reshape(in_bias, (1, 1, 1, 8192))
+    
+    # Apply scale and bias: x * in_weight + in_bias
+    x_scaled = x_norm * in_weight_4d + in_bias_4d
+    
+    # Squeeze back to 2D: [4096, 8192]
+    x_2d = jnp.squeeze(jnp.squeeze(x_scaled, axis=2), axis=2)
+    
+    # Add y (residual)
+    x_residual = x_2d + y
+    
+    # Multiply by y
+    result = x_residual * y
+    
+    return result

@@ -1,0 +1,97 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..3bc920b 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,90 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as plp
++import jax.interpreters.tpu as pltpu
++
++
++def matmul_gelu_softmax_kernel(
++    x_ref,
++    weight_ref,
++    bias_ref,
++    out_ref,
++):
++    """Pallas kernel for Matmul + GELU + Softmax."""
++    m = x_ref.shape[0]
++    k = x_ref.shape[1]
++    n = weight_ref.shape[1]
++    
++    # Tile sizes - use multiples of 8 for bf16 and 128 for vectorized dims
++    block_m = 128
++    block_k = 128
++    block_n = 128
++    
++    # Get program indices
++    row_block = pl.program_id(0)
++    col_block = pl.program_id(1)
++    
++    # Initialize output tile in float32 for accumulation
++    tile = jnp.zeros((block_m, block_n), dtype=jnp.float32)
++    
++    # Matmul: accumulate in float32
++    for k_block in range(0, k, block_k):
++        # Load x tile
++        x_tile = x_ref[
++            row_block * block_m : (row_block + 1) * block_m,
++            k_block : k_block + block_k
++        ]
++        # Load weight tile
++        w_tile = weight_ref[
++            k_block : k_block + block_k,
++            col_block * block_n : (col_block + 1) * block_n
++        ]
++        # Compute partial matmul and accumulate
++        tile = tile + jnp.dot(x_tile.astype(jnp.float32), w_tile.astype(jnp.float32))
++    
++    # Add bias
++    bias_tile = bias_ref[col_block * block_n : (col_block + 1) * block_n]
++    tile = tile + bias_tile.astype(jnp.float32)
++    
++    # Apply GELU
++    tile = jax.nn.gelu(tile)
++    
++    # Apply softmax along axis 1 (columns)
++    tile = jax.nn.softmax(tile, axis=1)
++    
++    # Store result
++    out_ref[
++        row_block * block_m : (row_block + 1) * block_m,
++        col_block * block_n : (col_block + 1) * block_n
++    ] = tile.astype(jnp.bfloat16)
++
++
++def workload(x, weight, bias):
++    """Workload: Matmul + GELU + Softmax."""
++    batch_size = x.shape[0]  # 4096
++    in_features = x.shape[1]  # 8192
++    out_features = weight.shape[1]  # 8192
++    
++    # Block sizes for TPU
++    block_m = 128
++    block_n = 128
++    
++    # Grid dimensions
++    grid_m = (batch_size + block_m - 1) // block_m
++    grid_n = (out_features + block_n - 1) // block_n
++    
++    return pl.pallas_call(
++        matmul_gelu_softmax_kernel,
++        out_shape=jax.ShapeDtypeStruct((batch_size, out_features), jnp.bfloat16),
++        grid=(grid_m, grid_n),
++        in_specs=(
++            pl.BlockSpec((grid_m * block_m, in_features), lambda rm, rc: (rm * block_m, 0)),
++            pl.BlockSpec((in_features, grid_n * block_n), lambda rm, rc: (0, rc * block_n)),
++            pl.BlockSpec((out_features,), lambda rm, rc: (rc * block_n,)),
++        ),
++        out_specs=pl.BlockSpec((grid_m * block_m, grid_n * block_n), lambda rm, rc: (rm * block_m, rc * block_n)),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel", "parallel")
++        ),
++    )(x, weight, bias)

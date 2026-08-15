@@ -1,0 +1,88 @@
+diff --git a/__pycache__/kernel.cpython-312.pyc b/__pycache__/kernel.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..d08004b0343c15734a5ef3c57fa882a266b11b38
+GIT binary patch
+literal 1550
+zcmZuxO>Y}T7@qa6ch_sLKN6=&3W{7QBr*X9S2UuiLPUZFM1qhiTFD4mThGQ_cfZ(=
+z#7)<V4+trzl2d%-Sd<=+_z8#;7e|d$YajxNQ*J@=i4*UvcNHgMWY6=w&%Dpf>^rmj
+zn=DHR+Rwl4w!TXu^fwLSmWar?4&(q~gc%*xM#vb68q170XC!O<7#AWg8mUHtL55V5
+zLM5T6jZ7^QaRgkBGP6dmmIKayi)#5NOqn~SOMhNw2;0_`1{-aJLJIygKHp-(O)(u7
+zCpw%5(WtfJZN~y&fCA<)(u2efD4pb(gBweYXpqG03oiC_cu$CPT4KyDFyL|0<Kws$
+zmNbq=h*``A>?ZUP@-KwL$PutRY1ol4wxi5tH;n?}(vCzg8|Sq0F}uLl<OPpeARb0l
+z>ZF2H!0o_+ccigZi*e=!2GXTf(?R+kDvLXZQVH6I;u*ePS}Lt>HNUVdy^4XaeZ2l9
+zz`cf|tAHCyJIoEc_WPx;-hJox%3G!Ps<&@`U3$2wTZ&g*2?w`Tt@+4<3_A9|84oqZ
+zjmEEdE#I?!>ZP+^89SxrX-1Fq;VCTvTr5s$Yi_I}lDxmV{^>{MB#|^z^XglQ?yDr-
+zund@1@ifaMg>B8m)^;6hhHAQ?xFj1%uIFf2b%|gr7;9#;oF;6`v<ZtXkEGSMt(chl
+zT*B%~o5+re{f1f}xd{s<BDml9s=A|s5i$~{Nw}t}`-C-=b~!_sHsMG0Asnp&$=gux
+z`eW5GRlV+NV9dC*;`L3X;aLumjqq&hj_UflN5s)4R7`kk1QeqMF-g;f;zT~21=2=F
+zmtI7A)N%W_xV&vSk6l}7sLP|}EA|s2QW4G)I}2c-_uu^mx-L4KKr`3-TyZdYt-C%H
+z(bUYr+WuN^wYT-MxbVDqRD8R;G2~Hx^4ad*Zm;uG^*DE{`^iv3*}^M%?ns^+h<Wh-
+zQJki}!E3Mgl>Uus|N70r%xtgPpR4qzmk0Ujp)6$ivn)!@{*x23v)#MHBAxT;-qYU7
+zbLKerCd|pB$!iA-`wIt4`%Aq?FDDkepPlh2JKMW+Brk#kc;VTDy$9dl|KY~5Jm0<h
+zSGv&MIETkT<$^N>KvHlx71KB1iIX8X^d%$`m2E}W;b8a(6ShuRTery+9n?%ub!<n4
+z-mMtA=8(*|M7U7PUrlxBmyQS^*Wo)Dk_y})rvP$T=^v4^NckHyPrPGT*w@t$oLdmm
+od+t*GjAa<+cO;#l>F_u6Cz|i0`4dz+L31Z)>YQ6*Cc<g{1A~!<AOHXW
+
+literal 0
+HcmV?d00001
+
+diff --git a/kernel.py b/kernel.py
+index a877f2f..3f88a8f 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,53 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as plp
++import jax.interpreters.mlir as mlir
++from jax.interpreters import xla
++from jax import xla as jax_xla
++import jax.lax as lax
++
++def workload(x, weight, bias):
++    """
++    Matmul + AvgPool1d + GELU + Scale + Max
++    
++    x: [4096, 8192] bfloat16
++    weight: [8192, 8192] bfloat16
++    bias: [8192] bfloat16
++    output: [4096] bfloat16
++    """
++    pool_kernel_size = 16
++    scale_factor = 2.0
++    
++    # Matmul: x @ weight + bias
++    # Result shape: [4096, 8192]
++    matmul_result = jnp.dot(x, weight) + bias
++    
++    # Expand dims on axis 1: [4096, 1, 8192]
++    expanded = jnp.expand_dims(matmul_result, axis=1)
++    
++    # AvgPool1d with kernel size 16, stride 16, VALID padding
++    # Window dimensions: [1, 1, 16], strides: [1, 1, 16]
++    # Result shape: [4096, 1, 512]
++    pooled = lax.reduce_window(
++        expanded,
++        init_value=0.0,
++        computation=lax.add,
++        window_dimensions=(1, 1, pool_kernel_size),
++        window_strides=(1, 1, pool_kernel_size),
++        padding="VALID"
++    ) / pool_kernel_size
++    
++    # Squeeze on axis 1: [4096, 512]
++    squeezed = jnp.squeeze(pooled, axis=1)
++    
++    # GELU activation
++    gelu_result = jax.nn.gelu(squeezed)
++    
++    # Scale by 2.0
++    scaled = gelu_result * scale_factor
++    
++    # Max along axis 1: [4096]
++    result = jnp.max(scaled, axis=1)
++    
++    return result

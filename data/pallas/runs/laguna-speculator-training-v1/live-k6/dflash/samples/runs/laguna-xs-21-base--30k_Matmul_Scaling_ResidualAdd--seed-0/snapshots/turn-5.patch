@@ -1,0 +1,73 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..d86fc49 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,66 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as plp
++import jax.interpreters.tpu as pltpu
++
++def workload(x, weight, bias):
++    """Matmul + Scaling + ResidualAdd kernel."""
++    block_size = 128  # Block size for tiling
++    
++    def kernel(ref_x, ref_weight, ref_bias, out_ref):
++        # Get program IDs for tiling
++        m_block = pl.program_id(0)
++        n_block = pl.program_id(1)
++        
++        # Accumulator in float32 for better precision
++        acc = jnp.zeros((block_size, block_size), dtype=jnp.float32)
++        
++        # Matmul with accumulation
++        for k_block in range(x.shape[1] // block_size):
++            # Load blocks
++            x_block = ref_x[
++                m_block * block_size:(m_block + 1) * block_size,
++                k_block * block_size:(k_block + 1) * block_size
++            ]
++            w_block = ref_weight[
++                k_block * block_size:(k_block + 1) * block_size,
++                n_block * block_size:(n_block + 1) * block_size
++            ]
++            
++            # Accumulate in float32
++            acc = acc + jnp.dot(x_block.astype(jnp.float32), w_block.astype(jnp.float32))
++        
++        # Add bias (broadcast along last dimension)
++        acc = acc + ref_bias[n_block * block_size:(n_block + 1) * block_size][None, :]
++        
++        # Convert to bfloat16 and scale by 0.5
++        scaled = (acc * 0.5).astype(jnp.bfloat16)
++        
++        # Load original x for residual add
++        original_x = ref_x[
++            m_block * block_size:(m_block + 1) * block_size,
++            n_block * block_size:(n_block + 1) * block_size
++        ]
++        
++        # Residual add
++        out_ref[...] = scaled + original_x
++    
++    # Grid dimensions
++    m_blocks = x.shape[0] // block_size
++    n_blocks = x.shape[1] // block_size
++    
++    return pl.pallas_call(
++        kernel,
++        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
++        grid=(m_blocks, n_blocks),
++        in_specs=(
++            pl.BlockSpec((block_size, block_size), lambda m, n: (m * block_size, n * block_size)),
++            pl.BlockSpec((block_size, block_size), lambda m, n: (n * block_size, n * block_size)),
++            pl.BlockSpec((block_size,), lambda n: (n * block_size,)),
++        ),
++        out_specs=pl.BlockSpec((block_size, block_size), lambda m, n: (m * block_size, n * block_size)),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel", "parallel")
++        ),
++    )(x, weight, bias)

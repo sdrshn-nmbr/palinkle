@@ -1,0 +1,66 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as plp
+import jax.interpreters.pallas as pl
+import jaxlib.xla_extension as pltpu
+
+def workload(x, weight):
+    """
+    Implements: Gemm + Divide + Sum + Scaling
+    1. x = dot_general(x, weight.T, precision=HIGHEST)
+    2. x = x / 2.0
+    3. x = sum(x, axis=1, keepdims=True)
+    4. x = x * 1.5
+    """
+    batch_size = x.shape[0]  # 4096
+    hidden_size = x.shape[1]  # 8192
+    input_size = weight.shape[0]  # 8192
+    
+    block_size = 128  # Block size for tiling
+    
+    def kernel(ref_x, ref_weight, ref_out):
+        # Initialize output to zero
+        ref_out[...] = jnp.zeros((1,), dtype=jnp.float32)
+        
+        # Accumulate the dot product in float32
+        acc = jnp.zeros((), dtype=jnp.float32)
+        
+        # Tile over the reduction dimension (input_size = 8192)
+        for k in range(input_size // block_size):
+            # Load blocks
+            x_block = ref_x[k * block_size:(k + 1) * block_size]
+            w_block = ref_weight[:, k * block_size:(k + 1) * block_size]
+            
+            # Compute dot product for each row
+            # x_block: [batch_size, block_size]
+            # w_block: [block_size, block_size]
+            # result: [batch_size, block_size]
+            partial = jnp.dot(x_block, w_block)
+            
+            # Sum along the second dimension to get contribution to output
+            # This gives us sum over the block dimension
+            acc = acc + jnp.sum(partial, axis=1)
+        
+        # Apply divide by 2 and multiply by 1.5
+        result = (acc / 2.0) * 1.5
+        
+        # Store result (keepdims=True means shape is [batch_size, 1])
+        ref_out[...] = result.reshape(-1, 1)
+    
+    # Grid is based on batch dimension
+    grid = (batch_size,)
+    
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((batch_size, 1), jnp.bfloat16),
+        grid=grid,
+        in_specs=(
+            pl.BlockSpec((input_size, hidden_size), lambda i: (0, i)),
+            pl.BlockSpec((hidden_size, input_size), lambda i: (i, 0)),
+        ),
+        out_specs=pl.BlockSpec((1,), lambda i: (i, 0)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",)
+        ),
+    )(x, weight)

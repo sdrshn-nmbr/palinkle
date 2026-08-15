@@ -1,0 +1,65 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..0c2c0f1 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,58 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import pallas as pl
++import jax.pallas as pltpu
++
++def gemm_kernel(ref_a, ref_b, ref_c):
++    """TPU Pallas kernel for GEMM: C = A @ B"""
++    m = ref_a.shape[0]
++    k = ref_a.shape[1]
++    n = ref_b.shape[1]
++    
++    # Get thread indices
++    i = pl.program_id(0)  # row index
++    j = pl.program_id(1)  # column index
++    
++    # Accumulator in float32 for better precision
++    acc = jnp.zeros((), dtype=jnp.float32)
++    
++    # Tile along K dimension
++    block_k = 128  # Must be multiple of 8 for bf16
++    
++    for kk in range(0, k, block_k):
++        # Load tiles from A and B
++        a_tile = ref_a[i, kk:kk + block_k]
++        b_tile = ref_b[kk:kk + block_k, j]
++        
++        # Compute dot product and accumulate
++        acc = acc + jnp.dot(a_tile, b_tile)
++    
++    # Convert back to bf16 and store
++    ref_c[i, j] = acc.astype(jnp.bfloat16)
++
++def workload(A, B):
++    """GEMM workload for Llama-70B FFN dimensions."""
++    M, K = A.shape  # 8192, 8192
++    _, N = B.shape  # 8192, 28672
++    
++    # Block sizes - must be multiples of 8 for bf16 on TPU
++    block_m = 128
++    block_n = 128
++    
++    # Grid dimensions
++    grid_m = (M + block_m - 1) // block_m
++    grid_n = (N + block_n - 1) // block_n
++    
++    return pl.pallas_call(
++        gemm_kernel,
++        out_shape=jax.ShapeDtypeStruct((M, N), jnp.bfloat16),
++        grid=(grid_m, grid_n),
++        in_specs=(
++            pl.BlockSpec((block_m, K), lambda i, j: (i, 0)),
++            pl.BlockSpec((K, block_n), lambda i, j: (0, j)),
++        ),
++        out_specs=pl.BlockSpec((block_m, block_n), lambda i, j: (i, j)),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel", "parallel")
++        ),
++    )(A, B)

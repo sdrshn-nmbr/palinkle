@@ -1,0 +1,109 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as plp
+import jax.interpreters.pallas as pl
+import jax.pallas.tpu as pltpu
+
+
+def workload(hidden, weight, labels):
+    """Fused Linear + Cross-Entropy Loss kernel for Llama 3.1 8B."""
+    
+    # Output is a scalar float32
+    out_shape = jax.ShapeDtypeStruct((), jnp.float32)
+    
+    # Block size for TPU - need multiples of 8 for bf16
+    block_m = 128  # batch dimension block
+    block_k = 128  # reduction dimension (hidden_dim)
+    block_n = 128  # vocab dimension block
+    
+    def cross_entropy_kernel(
+        hidden_ref,
+        weight_ref,
+        labels_ref,
+        out_ref,
+    ):
+        # Get program IDs for grid traversal
+        m_idx = pl.program_id(0)  # batch block index
+        n_idx = pl.program_id(1)  # vocab block index
+        
+        # Compute the global indices
+        m_start = m_idx * block_m
+        n_start = n_idx * block_n
+        
+        # Compute actual block sizes (handle boundary)
+        m_block = min(block_m, hidden.shape[0] - m_start)
+        n_block = min(block_n, weight.shape[1] - n_start)
+        
+        # Accumulator for the loss sum
+        loss_sum = 0.0
+        
+        # Iterate over hidden dimension for matmul
+        for k in range(0, hidden.shape[1], block_k):
+            k_block = min(block_k, hidden.shape[1] - k)
+            
+            # Load hidden block [m_block, k_block]
+            hidden_block = hidden_ref[
+                pl.slice_(m_start, m_start + m_block),
+                pl.slice_(k, k + k_block)
+            ]
+            
+            # Load weight block [k_block, n_block]
+            weight_block = weight_ref[
+                pl.slice_(k, k + k_block),
+                pl.slice_(n_start, n_start + n_block)
+            ]
+            
+            # Compute partial logits: [m_block, n_block]
+            # Use float32 accumulation for better precision
+            partial_logits = jnp.dot(
+                hidden_block.astype(jnp.float32),
+                weight_block.astype(jnp.float32)
+            ).astype(jnp.bfloat16)
+            
+            # Accumulate logits (we'll do softmax later)
+            # For now, just accumulate
+            if k == 0:
+                logits = partial_logits
+            else:
+                logits = logits + partial_logits
+        
+        # Now compute log_softmax and cross-entropy for this block
+        # log_probs = log_softmax(logits, axis=-1)
+        log_probs = jax.nn.log_softmax(logits, axis=-1)
+        
+        # Get labels for this batch block
+        labels_block = labels_ref[pl.slice_(m_start, m_start + m_block)]
+        
+        # Create one-hot encoding
+        vocab_size = weight.shape[1]
+        one_hot = jax.nn.one_hot(labels_block, vocab_size, axis=-1)
+        
+        # Compute cross-entropy: -sum(one_hot * log_probs, axis=-1)
+        # This gives per-example loss
+        per_example_loss = -jnp.sum(one_hot * log_probs, axis=-1)
+        
+        # Sum the losses for this block
+        block_loss_sum = jnp.sum(per_example_loss)
+        
+        # Write to output
+        out_ref[...] = block_loss_sum
+    
+    # Grid dimensions - need to cover all batch and vocab elements
+    grid_m = (hidden.shape[0] + block_m - 1) // block_m
+    grid_n = (weight.shape[1] + block_n - 1) // block_n
+    
+    return pl.pallas_call(
+        cross_entropy_kernel,
+        out_shape=out_shape,
+        grid=(grid_m, grid_n),
+        in_specs=(
+            pl.BlockSpec((block_m, block_k), lambda m, n: (m * block_m, 0)),
+            pl.BlockSpec((block_k, block_n), lambda m, n: (0, n * block_n)),
+            pl.BlockSpec((block_m,), lambda m, n: (m * block_m,)),
+        ),
+        out_specs=pl.BlockSpec((), lambda m, n: ()),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel")
+        ),
+    )(hidden, weight, labels)

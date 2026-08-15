@@ -1,0 +1,129 @@
+import jax
+import jax.numpy as jnp
+import pallas as pl
+import triton.tpu as pltpu
+
+# Configuration
+CONFIG = {
+    "batch": 4,
+    "emb_dim": 7168,
+    "kv_lora_rank": 512,
+    "model": "DeepSeek-V3-671B",
+    "name": "deepseek_v3_mla",
+    "num_heads": 128,
+    "operator": "mla_attention",
+    "q_lora_rank": 1536,
+    "qk_nope_head_dim": 128,
+    "qk_rope_head_dim": 64,
+    "rope_theta": 10000,
+    "seq_len": 2048,
+    "v_head_dim": 128
+}
+
+
+def _compute_rope(head_dim, seq_len, theta, dtype):
+    """Compute cosine and sine for rotary position embeddings."""
+    freqs = 1.0 / (theta ** (jnp.arange(0, head_dim, 2) / head_dim))
+    pos = jnp.arange(seq_len)
+    angles = jnp.outer(pos, freqs)
+    return jnp.cos(angles).astype(dtype), jnp.sin(angles).astype(dtype)
+
+
+def _apply_rope(x, cos, sin):
+    """Apply rotary position embeddings to input."""
+    x1 = x[..., ::2]
+    x2 = x[..., 1::2]
+    rotated = jnp.stack([
+        x1 * cos - x2 * sin,
+        x1 * sin + x2 * cos
+    ], axis=-1)
+    return rotated.reshape(x.shape)
+
+
+def workload(x, q_down_proj, q_up_proj, kv_down_proj, k_up_proj, v_up_proj, o_proj):
+    """
+    Multi-head Latent Attention (MLA) kernel for DeepSeek V3 671B.
+    
+    Args:
+        x: Input tensor [B, S, E]
+        q_down_proj: Q down projection [E, q_lora_rank]
+        q_up_proj: Q up projection [q_lora_rank, H * (nope + rope)]
+        kv_down_proj: KV down projection [E, 2 * kvl]
+        k_up_proj: K up projection [kvl, H * nope]
+        v_up_proj: V up projection [kvl, H * vd]
+        o_proj: Output projection [H * (nope + rope), E]
+    
+    Returns:
+        Output tensor [B, S, E]
+    """
+    C = CONFIG
+    B, S, E = x.shape
+    H = C["num_heads"]
+    nope = C["qk_nope_head_dim"]
+    rope = C["qk_rope_head_dim"]
+    vd = C["v_head_dim"]
+    kvl = C["kv_lora_rank"]
+    rope_theta = C["rope_theta"]
+    
+    # Q projection: (B, S, E) -> (B, S, H, nope + rope)
+    q = jnp.dot(x, q_down_proj)  # [B, S, q_lora_rank]
+    q = jnp.dot(q, q_up_proj)    # [B, S, H * (nope + rope)]
+    q = q.reshape(B, S, H, nope + rope)
+    
+    # Split Q into nope and rope parts
+    q_nope = q[..., :nope]   # [B, S, H, nope]
+    q_rope = q[..., nope:]  # [B, S, H, rope]
+    
+    # KV projection: (B, S, E) -> (B, S, 2 * kvl)
+    kv = jnp.dot(x, kv_down_proj)  # [B, S, 2 * kvl]
+    
+    # Split KV into latent and rope parts
+    k_latent = kv[..., :kvl]      # [B, S, kvl]
+    k_rope_raw = kv[..., kvl:]   # [B, S, kvl]
+    
+    # K projection: (B, S, kvl) -> (B, S, H * nope) -> (B, S, H, nope)
+    k_nope = jnp.dot(k_latent, k_up_proj)  # [B, S, H * nope]
+    k_nope = k_nope.reshape(B, S, H, nope)
+    
+    # Compute RoPE
+    cos, sin = _compute_rope(rope, S, rope_theta, x.dtype)
+    
+    # Broadcast k_rope to [B, S, H, rope]
+    k_rope = jnp.broadcast_to(k_rope_raw, (B, S, H, rope))
+    
+    # Apply RoPE to Q and K
+    q_rope = _apply_rope(q_rope, cos, sin)
+    k_rope = _apply_rope(k_rope, cos, sin)
+    
+    # V projection: (B, S, kvl) -> (B, S, H * vd) -> (B, S, H, vd)
+    v = jnp.dot(k_latent, v_up_proj)  # [B, S, H * vd]
+    v = v.reshape(B, S, H, vd)
+    
+    # Concatenate Q and K along last dimension, then transpose for attention
+    q_full = jnp.concatenate([q_nope, q_rope], axis=-1)  # [B, S, H, nope + rope]
+    k_full = jnp.concatenate([k_nope, k_rope], axis=-1)  # [B, S, H, nope + rope]
+    
+    # Transpose to [B, H, S, head_dim] for attention
+    q_full = q_full.transpose(0, 2, 1, 3)  # [B, H, S, nope + rope]
+    k_full = k_full.transpose(0, 2, 1, 3)  # [B, H, S, nope + rope]
+    v = v.transpose(0, 2, 1, 3)            # [B, H, S, vd]
+    
+    # Attention
+    hd = nope + rope
+    attn = jnp.einsum('bhqd,bhkd->bhqk', q_full, k_full)  # [B, H, S, S]
+    attn = attn * (hd ** -0.5)
+    
+    # Causal mask
+    mask = jnp.tril(jnp.ones((S, S)))
+    attn = jnp.where(mask, attn, -1e9)
+    
+    # Softmax
+    attn = jax.nn.softmax(attn, axis=-1)
+    
+    # Output
+    out = jnp.einsum('bhqk,bhkd->bhqd', attn, v)  # [B, H, S, vd]
+    out = out.transpose(0, 2, 1, 3)  # [B, S, H, vd]
+    out = out.reshape(B, S, H * vd)  # [B, S, H * vd]
+    
+    # Final projection
+    return jnp.dot(out, o_proj)  # [B, S, E]

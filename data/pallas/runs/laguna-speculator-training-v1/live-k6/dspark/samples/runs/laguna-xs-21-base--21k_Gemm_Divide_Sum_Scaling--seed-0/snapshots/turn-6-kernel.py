@@ -1,0 +1,66 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas.lib as pllib
+import jax.pallas.tpu as pltpu
+
+def workload(x, weight):
+    """GEMM + Divide + Sum + Scaling kernel.
+    
+    Computes: (x @ weight) / 2.0 -> sum(axis=1, keepdims=True) -> * 1.5
+    """
+    batch_size = x.shape[0]  # 4096
+    hidden_size = x.shape[1]  # 8192
+    input_size = weight.shape[0]  # 8192
+    
+    # Block size for matmul - use multiples of 8 for bf16
+    block_size = 128
+    
+    def kernel(ref_x, ref_weight, ref_out):
+        # Accumulate in float32 for better precision
+        acc = jnp.zeros((ref_x.shape[0],), dtype=jnp.float32)
+        
+        # Matmul: x @ weight
+        # x is [M, K], weight is [K, N]
+        # We want output [M, N]
+        for k in range(ref_weight.shape[0] // block_size):
+            x_block = ref_x[:, k * block_size:(k + 1) * block_size]
+            w_block = ref_weight[k * block_size:(k + 1) * block_size, :]
+            acc = acc + jnp.dot(x_block, w_block, precision=jax.lax.Precision.HIGHEST)
+        
+        # Handle remaining columns if any
+        remaining = ref_weight.shape[0] % block_size
+        if remaining > 0:
+            x_block = ref_x[:, -remaining:]
+            w_block = ref_weight[-remaining:, :]
+            acc = acc + jnp.dot(x_block, w_block, precision=jax.lax.Precision.HIGHEST)
+        
+        # Divide by 2.0
+        acc = acc / 2.0
+        
+        # Sum along axis 1 (which is now the last dimension after matmul)
+        # Actually after matmul we have [M, N], sum along axis 1 gives [M]
+        # But we need keepdims to get [M, 1]
+        result = jnp.sum(acc, axis=1, keepdims=True)
+        
+        # Multiply by scaling factor 1.5
+        result = result * 1.5
+        
+        ref_out[...] = result.astype(jnp.bfloat16)
+    
+    # Grid: one block per batch element
+    grid = (batch_size,)
+    
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((batch_size, 1), jnp.bfloat16),
+        grid=grid,
+        in_specs=(
+            pl.BlockSpec((batch_size, block_size), lambda i: (i, 0)),
+            pl.BlockSpec((block_size, hidden_size), lambda i: (0, i)),
+        ),
+        out_specs=pl.BlockSpec((batch_size, 1), lambda i: (i, 0)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",)
+        ),
+    )(x, weight)

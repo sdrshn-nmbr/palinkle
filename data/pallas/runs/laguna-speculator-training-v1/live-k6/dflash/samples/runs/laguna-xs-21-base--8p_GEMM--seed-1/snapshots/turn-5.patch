@@ -1,0 +1,91 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..7ef8fcc 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,84 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import pallas as pl
++import jax.pallas as pltpu
++
++
++def gemm_kernel(ref_a, ref_b, ref_c):
++    """Pallas kernel for GEMM: C = A @ B"""
++    m = ref_a.shape[0]
++    k = ref_a.shape[1]
++    n = ref_b.shape[1]
++    
++    # Initialize output to zero
++    ref_c[...] = jnp.zeros((m, n), dtype=jnp.float32)
++    
++    # Perform matrix multiplication
++    # C = A @ B
++    for i in range(m):
++        for j in range(n):
++            # Accumulate dot product in float32
++            ref_c[i, j] = jnp.sum(ref_a[i, :] * ref_b[:, j])
++
++
++def workload(A, B):
++    """Compute GEMM: C = A @ B using Pallas kernel"""
++    M, K = A.shape
++    K2, N = B.shape
++    
++    assert K == K2, f"K dimension mismatch: {K} != {K2}"
++    
++    # Block size for TPU - must be multiple of 8 for bf16
++    block_size = 128
++    
++    # Grid dimensions
++    grid_m = (M + block_size - 1) // block_size
++    grid_n = (N + block_size - 1) // block_size
++    
++    def kernel(ref_a, ref_b, ref_c):
++        # Get program IDs
++        m_idx = pl.program_id(0)
++        n_idx = pl.program_id(1)
++        
++        # Compute tile offsets
++        m_start = m_idx * block_size
++        n_start = n_idx * block_size
++        
++        # Compute tile shapes (handle boundaries)
++        m_tile = min(block_size, M - m_start)
++        n_tile = min(block_size, N - n_start)
++        
++        # Initialize output tile to zero in float32
++        ref_c[...] = jnp.zeros((m_tile, n_tile), dtype=jnp.float32)
++        
++        # Accumulate over K dimension
++        for k_idx in range(0, K, block_size):
++            k_tile = min(block_size, K - k_idx)
++            
++            # Load A tile (m_start:m_start+m_tile, k_idx:k_idx+k_tile)
++            a_tile = ref_a[m_start:m_start+m_tile, k_idx:k_idx+k_tile]
++            
++            # Load B tile (k_idx:k_idx+k_tile, n_start:n_start+n_tile)
++            b_tile = ref_b[k_idx:k_idx+k_tile, n_start:n_start+n_tile]
++            
++            # Compute partial dot product and accumulate
++            # Use jnp.dot for the matmul
++            partial = jnp.dot(a_tile, b_tile)
++            ref_c[...] = ref_c[...] + partial
++        
++        # Convert back to bf16 for output
++        ref_c[...] = ref_c[...].astype(jnp.bfloat16)
++    
++    return pl.pallas_call(
++        kernel,
++        out_shape=jax.ShapeDtypeStruct((M, N), jnp.bfloat16),
++        grid=(grid_m, grid_n),
++        in_specs=(
++            pl.BlockSpec((block_size, block_size), lambda mi, ni: (mi * block_size, 0)),
++            pl.BlockSpec((block_size, block_size), lambda mi, ni: (0, ni * block_size)),
++        ),
++        out_specs=pl.BlockSpec((block_size, block_size), lambda mi, ni: (mi * block_size, ni * block_size)),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel", "parallel")
++        ),
++    )(A, B)

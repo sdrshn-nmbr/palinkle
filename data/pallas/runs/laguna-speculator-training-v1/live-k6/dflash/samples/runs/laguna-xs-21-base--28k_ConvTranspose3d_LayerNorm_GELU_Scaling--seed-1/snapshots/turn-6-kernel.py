@@ -1,0 +1,253 @@
+import jax
+import jax.numpy as jnp
+import jax.lax as lax
+import jax.nn as nn
+import pallas as pl
+import pytpu
+
+def workload(x, conv_weight, conv_bias, ln_weight, ln_bias):
+    # Constants from the configuration
+    stride = 2
+    padding = 1
+    kernel_size = 4
+    eps = 1e-05
+    scaling_factor = 1.0
+    
+    # Step 1: Transpose x from [batch, d_in, h_in, w_in, channels] to [batch, d_in, h_in, w_in, channels]
+    # Original: [32, 32, 16, 32, 32] -> [32, 16, 32, 32, 32]
+    x = jnp.transpose(x, (0, 2, 3, 4, 1))
+    
+    # Step 2: Transpose kernel from [in_ch, out_ch, k, k, k] to [out_ch, k, k, k, in_ch]
+    # [32, 64, 4, 4, 4] -> [64, 4, 4, 4, 32]
+    kernel = jnp.transpose(conv_weight, (1, 2, 3, 4, 0))
+    
+    # Step 3: Flip kernel on first 3 axes
+    kernel = jnp.flip(kernel, axis=(0, 1, 2))
+    
+    # Get input dimensions
+    batch_size, d_in, h_in, w_in, channels = x.shape
+    
+    # Step 4: Compute dilated dimensions
+    d_dilated = d_in + (d_in - 1) * (stride - 1)
+    h_dilated = h_in + (h_in - 1) * (stride - 1)
+    w_dilated = w_in + (w_in - 1) * (stride - 1)
+    
+    # Step 5: Create dilated input
+    x_dilated = jnp.zeros((batch_size, d_dilated, h_dilated, w_dilated, channels), dtype=x.dtype)
+    
+    # Step 6: Set dilated positions
+    x_dilated = x_dilated.at[0:d_dilated:stride, 0:h_dilated:stride, 0:w_dilated:stride, :].set(x)
+    
+    # Step 7: Compute padding for conv
+    pad = kernel_size - 1 - padding  # = 4 - 1 - 1 = 2
+    jax_padding = ((pad, pad), (pad, pad), (pad, pad))
+    
+    # Step 8: Apply ConvTranspose3d via conv_general_dilated
+    x = lax.conv_general_dilated(
+        x_dilated,
+        kernel,
+        window_strides=(1, 1, 1),
+        padding=jax_padding,
+        dimension_numbers=('NDHWC', 'DHWOI', 'NDHWC')
+    )
+    
+    # Step 9: Add bias
+    bias_reshaped = jnp.reshape(conv_bias, (1, 1, 1, 1, 64))
+    x = x + bias_reshaped - 1.0
+    
+    # Step 10: Transpose output
+    # [32, 64, 32, 64, 64] -> [32, 32, 64, 64, 64]
+    x = jnp.transpose(x, (0, 2, 3, 4, 1))
+    
+    # Step 11: LayerNorm along axis 1 (the channel dimension after transpose)
+    mean = jnp.mean(x, axis=1, keepdims=True)
+    var = jnp.mean((x - mean) ** 2, axis=1, keepdims=True)
+    x = (x - mean) / jnp.sqrt(var + eps)
+    
+    # Step 12: Apply LN weight and bias
+    x = x * ln_weight + ln_bias
+    
+    # Step 13: Apply GELU
+    x = nn.gelu(x)
+    
+    # Step 14: Scale
+    x = x * scaling_factor
+    
+    return x
+
+
+def _conv_transpose_kernel(x_ref, kernel_ref, bias_ref, out_ref):
+    """Pallas kernel for ConvTranspose3d + LayerNorm + GELU + Scaling"""
+    # Grid dimensions
+    b = pl.program_id(0)  # batch
+    d_out = pl.program_id(1)  # output depth
+    h_out = pl.program_id(2)  # output height
+    w_out = pl.program_id(3)  # output width
+    c_out = pl.program_id(4)  # output channel
+    
+    # Constants
+    stride = 2
+    kernel_size = 4
+    eps = 1e-05
+    scaling_factor = 1.0
+    
+    # Input dimensions
+    d_in = 16
+    h_in = 32
+    w_in = 32
+    c_in = 32
+    
+    # Compute input position from output position
+    d_in_pos = d_out // stride
+    h_in_pos = h_out // stride
+    w_in_pos = w_out // stride
+    
+    # Check if input position is valid
+    if d_in_pos >= d_in or h_in_pos >= h_in or w_in_pos >= w_in:
+        out_ref[b, d_out, h_out, w_out, c_out] = 0.0
+        return
+    
+    # ConvTranspose3d: accumulate over kernel and input channels
+    acc = 0.0
+    for kd in range(kernel_size):
+        for kh in range(kernel_size):
+            for kw in range(kernel_size):
+                # Input position for this kernel element
+                d_in_k = d_out - kd
+                h_in_k = h_out - kh
+                w_in_k = w_out - kw
+                
+                # Check bounds
+                if 0 <= d_in_k < d_dilated and 0 <= h_in_k < h_dilated and 0 <= w_in_k < w_dilated:
+                    # Check if this position is in the dilated input
+                    if d_in_k % stride == 0 and h_in_k % stride == 0 and w_in_k % stride == 0:
+                        d_orig = d_in_k // stride
+                        h_orig = h_in_k // stride
+                        w_orig = w_in_k // stride
+                        
+                        if 0 <= d_orig < d_in and 0 <= h_orig < h_in and 0 <= w_orig < w_in:
+                            # Get kernel weight
+                            k_d = kernel_size - 1 - kd
+                            k_h = kernel_size - 1 - kh
+                            k_w = kernel_size - 1 - kw
+                            
+                            # Accumulate
+                            acc += x_ref[b, d_orig, h_orig, w_orig, c_in] * kernel_ref[c_out, k_d, k_h, k_w, c_in]
+    
+    # Add bias
+    acc += bias_ref[c_out] - 1.0
+    
+    out_ref[b, d_out, h_out, w_out, c_out] = acc
+
+
+def workload_pallas(x, conv_weight, conv_bias, ln_weight, ln_bias):
+    """Pallas implementation of ConvTranspose3d + LayerNorm + GELU + Scaling"""
+    
+    # First, do the transpose and dilation operations in JAX
+    # Transpose x
+    x_t = jnp.transpose(x, (0, 2, 3, 4, 1))
+    
+    # Transpose and flip kernel
+    kernel = jnp.transpose(conv_weight, (1, 2, 3, 4, 0))
+    kernel = jnp.flip(kernel, axis=(0, 1, 2))
+    
+    # Get dimensions
+    batch_size, d_in, h_in, w_in, channels = x_t.shape
+    
+    # Compute dilated dimensions
+    stride = 2
+    d_dilated = d_in + (d_in - 1) * (stride - 1)
+    h_dilated = h_in + (h_in - 1) * (stride - 1)
+    w_dilated = w_in + (w_in - 1) * (stride - 1)
+    
+    # Create dilated input
+    x_dilated = jnp.zeros((batch_size, d_dilated, h_dilated, w_dilated, channels), dtype=x_t.dtype)
+    x_dilated = x_dilated.at[0:d_dilated:stride, 0:h_dilated:stride, 0:w_dilated:stride, :].set(x_t)
+    
+    # Output dimensions
+    out_d = d_dilated + kernel.shape[0] - 1
+    out_h = h_dilated + kernel.shape[1] - 1
+    out_w = w_dilated + kernel.shape[2] - 1
+    out_c = kernel.shape[3]
+    
+    # Padding
+    pad = kernel_size - 1 - padding  # = 2
+    
+    # Define the Pallas kernel for convolution
+    def conv_kernel(x_ref, kernel_ref, out_ref):
+        b = pl.program_id(0)
+        d_out = pl.program_id(1)
+        h_out = pl.program_id(2)
+        w_out = pl.program_id(3)
+        c_out = pl.program_id(4)
+        
+        # Compute input position
+        d_in_pos = d_out // stride
+        h_in_pos = h_out // stride
+        w_in_pos = w_out // stride
+        
+        # Check if input position is valid
+        if d_in_pos >= d_in or h_in_pos >= h_in or w_in_pos >= w_in:
+            out_ref[b, d_out, h_out, w_out, c_out] = 0.0
+            return
+        
+        # ConvTranspose3d
+        acc = 0.0
+        for kd in range(kernel_size):
+            for kh in range(kernel_size):
+                for kw in range(kernel_size):
+                    d_in_k = d_out - kd
+                    h_in_k = h_out - kh
+                    w_in_k = w_out - kw
+                    
+                    if 0 <= d_in_k < d_dilated and 0 <= h_in_k < h_dilated and 0 <= w_in_k < w_dilated:
+                        if d_in_k % stride == 0 and h_in_k % stride == 0 and w_in_k % stride == 0:
+                            d_orig = d_in_k // stride
+                            h_orig = h_in_k // stride
+                            w_orig = w_in_k // stride
+                            
+                            if 0 <= d_orig < d_in and 0 <= h_orig < h_in and 0 <= w_orig < w_in:
+                                k_d = kernel_size - 1 - kd
+                                k_h = kernel_size - 1 - kh
+                                k_w = kernel_size - 1 - kw
+                                
+                                acc += x_ref[b, d_orig, h_orig, w_orig, c_in] * kernel_ref[c_out, k_d, k_h, k_w, c_in]
+        
+        out_ref[b, d_out, h_out, w_out, c_out] = acc
+    
+    # Call Pallas
+    out_conv = pl.pallas_call(
+        conv_kernel,
+        out_shape=jax.ShapeDtypeStruct((batch_size, out_d, out_h, out_w, out_c), x.dtype),
+        grid=(batch_size, out_d, out_h, out_w, out_c),
+        in_specs=(
+            pl.BlockSpec((batch_size, d_in, h_in, w_in, channels), lambda b, d, h, w, c: (b, d, h, w, c)),
+            pl.BlockSpec((out_c, kernel_size, kernel_size, kernel_size, c_in), lambda b, d, h, w, c: (c, 0, 0, 0, 0)),
+        ),
+        out_specs=pl.BlockSpec((batch_size, out_d, out_h, out_w, out_c), lambda b, d, h, w, c: (b, d, h, w, c)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel", "parallel", "parallel", "parallel")
+        ),
+    )(x_dilated, kernel)
+    
+    # Add bias
+    out_conv = out_conv + jnp.reshape(conv_bias, (1, 1, 1, 1, out_c)) - 1.0
+    
+    # Transpose output
+    out_t = jnp.transpose(out_conv, (0, 2, 3, 4, 1))
+    
+    # LayerNorm
+    mean = jnp.mean(out_t, axis=1, keepdims=True)
+    var = jnp.mean((out_t - mean) ** 2, axis=1, keepdims=True)
+    out_ln = (out_t - mean) / jnp.sqrt(var + eps)
+    
+    # Apply LN weight and bias
+    out_ln = out_ln * ln_weight + ln_bias
+    
+    # Apply GELU
+    out_gelu = nn.gelu(out_ln)
+    
+    # Scale
+    out = out_gelu * scaling_factor
+    
+    return out

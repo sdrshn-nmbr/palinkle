@@ -1,0 +1,153 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..6380b42 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,146 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as plp
++import jax.interpreters.pallas as pallas
++from jax.interpreters import pallas as pl
++from jax.pallas import lib as pllib
++import jax.numpy as jnp
++
++# TPU-specific imports
++try:
++    from jax.interpreters import pallas
++    from jax.pallas import lib as pllib
++    import jax.pallas as pl
++except ImportError:
++    pass
++
++# Configuration
++CONFIG = {
++    "batch": 4,
++    "head_dim": 128,
++    "model": "Llama-3.1-70B",
++    "name": "llama3_70b_flex_attention",
++    "num_heads": 64,
++    "operator": "flex_attention",
++    "seq_len": 4096
++}
++
++def workload(q, k, v, rel_pos_bias):
++    """Flex attention kernel with causal mask and relative position bias."""
++    
++    D = CONFIG["head_dim"]  # 128
++    S = CONFIG["seq_len"]   # 4096
++    sm_scale = 1.0 / (D ** 0.5)
++    
++    # Define block sizes for TPU
++    # For TPU, block sizes should be multiples of 8 for bf16
++    BLOCK_Q = 64  # Query block size
++    BLOCK_K = 64  # Key/Value block size
++    BLOCK_D = 128  # Head dimension (full)
++    
++    def attention_kernel(ref_q, ref_k, ref_v, ref_rel_pos_bias, ref_out, 
++                         m0, m1, m2, m3):
++        """Pallas kernel for attention computation."""
++        
++        # Get indices
++        b = m0
++        h = m1
++        q_start = m2 * BLOCK_Q
++        k_start = m3 * BLOCK_K
++        
++        # Bounds check
++        q_end = min(q_start + BLOCK_Q, S)
++        k_end = min(k_start + BLOCK_K, S)
++        
++        if q_end <= q_start or k_end <= k_start:
++            return
++        
++        # Compute attention scores for this block
++        # Shape: [BLOCK_Q, BLOCK_K]
++        attn_block = jnp.zeros((BLOCK_Q, BLOCK_K), dtype=jnp.float32)
++        
++        # Compute q @ k^T for this block
++        for q_offset in range(0, BLOCK_Q, BLOCK_D):
++            q_end_offset = min(q_offset + BLOCK_D, BLOCK_Q)
++            for k_offset in range(0, BLOCK_K, BLOCK_D):
++                k_end_offset = min(k_offset + BLOCK_D, BLOCK_K)
++                
++                # Get slices
++                q_slice = ref_q[b, h, q_start:q_end, q_offset:q_end_offset]
++                k_slice = ref_k[b, h, k_start:k_end, k_offset:k_end_offset]
++                
++                # Compute dot product
++                dot = jnp.dot(q_slice, k_slice.T)
++                attn_block = attn_block.at[q_offset:q_end_offset, k_offset:k_end_offset].add(
++                    dot * sm_scale
++                )
++        
++        # Add relative position bias
++        for q_offset in range(0, BLOCK_Q, BLOCK_D):
++            q_end_offset = min(q_offset + BLOCK_D, BLOCK_Q)
++            for k_offset in range(0, BLOCK_K, BLOCK_D):
++                k_end_offset = min(k_offset + BLOCK_D, BLOCK_K)
++                
++                # Get relative position bias
++                rel_bias = ref_rel_pos_bias[h, q_start:q_end, k_start:k_end]
++                rel_bias_slice = rel_bias[q_offset:q_end_offset, k_offset:k_end_offset]
++                
++                attn_block = attn_block.at[q_offset:q_end_offset, k_offset:k_end_offset].add(
++                    rel_bias_slice.astype(jnp.float32)
++                )
++        
++        # Apply causal mask
++        for q_idx in range(BLOCK_Q):
++            for k_idx in range(BLOCK_K):
++                if q_start + q_idx < k_start + k_idx:
++                    attn_block = attn_block.at[q_idx, k_idx].set(-1e30)
++        
++        # Softmax
++        attn_block = jax.nn.softmax(attn_block, axis=1)
++        
++        # Compute output
++        for q_offset in range(0, BLOCK_Q, BLOCK_D):
++            q_end_offset = min(q_offset + BLOCK_D, BLOCK_Q)
++            for v_offset in range(0, S, BLOCK_D):
++                v_end_offset = min(v_offset + BLOCK_D, S)
++                
++                # Get value block
++                v_block = ref_v[b, h, v_start:v_end, :]
++                
++                # Compute output
++                out_block = jnp.dot(attn_block[q_offset:q_end_offset, :], v_block.T)
++                ref_out[b, h, q_start:q_end, v_start:v_end] = out_block.T
++    
++    # Grid dimensions
++    grid = (CONFIG["batch"], CONFIG["num_heads"], S // BLOCK_Q, S // BLOCK_K)
++    
++    # Define block specs
++    def index_map(m0, m1, m2, m3):
++        return (m0, m1, m2 * BLOCK_Q, m3 * BLOCK_K)
++    
++    in_specs = (
++        pl.BlockSpec((CONFIG["batch"], CONFIG["num_heads"], BLOCK_Q, BLOCK_D), 
++                     lambda b, h, q_idx, d_idx: (b, h, q_idx, d_idx)),
++        pl.BlockSpec((CONFIG["batch"], CONFIG["num_heads"], BLOCK_K, BLOCK_D),
++                     lambda b, h, k_idx, d_idx: (b, h, k_idx, d_idx)),
++        pl.BlockSpec((CONFIG["batch"], CONFIG["num_heads"], S, BLOCK_D),
++                     lambda b, h, k_idx, d_idx: (b, h, k_idx, d_idx)),
++        pl.BlockSpec((CONFIG["num_heads"], S, S),
++                     lambda h, q_idx, k_idx: (h, q_idx, k_idx)),
++    )
++    
++    out_specs = pl.BlockSpec((CONFIG["batch"], CONFIG["num_heads"], BLOCK_Q, BLOCK_D),
++                             lambda b, h, q_idx, d_idx: (b, h, q_idx, d_idx))
++    
++    # Call the kernel
++    return pl.pallas_call(
++        attention_kernel,
++        out_shape=jax.ShapeDtypeStruct(q.shape, q.dtype),
++        grid=grid,
++        in_specs=in_specs,
++        out_specs=out_specs,
++        compiler_params=jax.interpreters.pallas.CompilerParams(
++            dimension_semantics=("parallel", "parallel", "parallel", "parallel")
++        ),
++    )(q, k, v, rel_pos_bias)

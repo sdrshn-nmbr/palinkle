@@ -39,6 +39,9 @@ DFLASH_BOUNDARIES = (
     "base_logits",
     "proposal_token_ids",
 )
+TARGET_FEATURE_LAYERS = 5
+TARGET_FEATURE_MIN_COSINE = 0.999
+TARGET_FEATURE_MAX_RELATIVE_L2 = 0.03
 
 
 def canonical_sha256(value: Any) -> str:
@@ -137,6 +140,150 @@ def _bound_artifact(root_name: str, item: dict[str, Any]) -> dict[str, Any]:
         **item,
         "path": f"{root_name}/{item['path']}",
     }
+
+
+def build_target_feature_conformance_report(
+    *,
+    source_root: Path,
+    source_capture: dict[str, Any],
+    adapter_root: Path,
+    adapter_capture: dict[str, Any],
+) -> dict[str, Any]:
+    if source_capture.get("prompt_token_ids") != adapter_capture.get(
+        "prompt_token_ids"
+    ):
+        raise ConformanceError("TARGET_FEATURE_PROMPT_TOKEN_IDS_MISMATCH")
+    source_item = source_capture.get("boundaries", {}).get("raw_target_features")
+    adapter_item = adapter_capture.get("boundaries", {}).get("raw_target_features")
+    if source_item is None or adapter_item is None:
+        raise ConformanceError("TARGET_FEATURE_BOUNDARY_MISSING")
+    source_path = source_root / source_item["path"]
+    adapter_path = adapter_root / adapter_item["path"]
+    if file_sha256(source_path) != source_item["sha256"]:
+        raise ConformanceError("TARGET_FEATURE_SOURCE_HASH_MISMATCH")
+    if file_sha256(adapter_path) != adapter_item["sha256"]:
+        raise ConformanceError("TARGET_FEATURE_ADAPTER_HASH_MISMATCH")
+    source = np.load(source_path, allow_pickle=False)
+    adapter = np.load(adapter_path, allow_pickle=False)
+    source = source.reshape(-1, source.shape[-1]).astype(np.float64)
+    adapter = adapter.reshape(-1, adapter.shape[-1]).astype(np.float64)
+    if source.shape != adapter.shape or source.shape[-1] % TARGET_FEATURE_LAYERS:
+        raise ConformanceError(
+            f"TARGET_FEATURE_SHAPE_MISMATCH:{source.shape}:{adapter.shape}"
+        )
+    width = source.shape[-1] // TARGET_FEATURE_LAYERS
+    cosine_matrix: list[list[float]] = []
+    layer_metrics: list[dict[str, Any]] = []
+    for source_index in range(TARGET_FEATURE_LAYERS):
+        source_layer = source[:, source_index * width : (source_index + 1) * width]
+        row: list[float] = []
+        for adapter_index in range(TARGET_FEATURE_LAYERS):
+            adapter_layer = adapter[
+                :, adapter_index * width : (adapter_index + 1) * width
+            ]
+            denominator = np.linalg.norm(source_layer) * np.linalg.norm(adapter_layer)
+            row.append(
+                float(np.dot(source_layer.ravel(), adapter_layer.ravel()) / denominator)
+                if denominator
+                else 1.0
+            )
+        cosine_matrix.append(row)
+        matching = adapter[:, source_index * width : (source_index + 1) * width]
+        relative_l2 = float(
+            np.linalg.norm(source_layer - matching) / np.linalg.norm(source_layer)
+        )
+        per_token = []
+        for token_index, (source_token, adapter_token) in enumerate(
+            zip(source_layer, matching, strict=True)
+        ):
+            denominator = np.linalg.norm(source_token) * np.linalg.norm(adapter_token)
+            token_cosine = (
+                float(np.dot(source_token, adapter_token) / denominator)
+                if denominator
+                else 1.0
+            )
+            token_relative_l2 = float(
+                np.linalg.norm(source_token - adapter_token)
+                / np.linalg.norm(source_token)
+            )
+            per_token.append(
+                {
+                    "token_index": token_index,
+                    "cosine_similarity": token_cosine,
+                    "relative_l2_error": token_relative_l2,
+                    "passed": bool(
+                        token_cosine >= TARGET_FEATURE_MIN_COSINE
+                        and token_relative_l2 <= TARGET_FEATURE_MAX_RELATIVE_L2
+                    ),
+                }
+            )
+        aligned = int(np.argmax(row)) == source_index
+        layer_metrics.append(
+            {
+                "layer_index": source_index,
+                "cosine_similarity": row[source_index],
+                "relative_l2_error": relative_l2,
+                "best_adapter_layer": int(np.argmax(row)),
+                "worst_token_cosine_similarity": min(
+                    item["cosine_similarity"] for item in per_token
+                ),
+                "maximum_token_relative_l2_error": max(
+                    item["relative_l2_error"] for item in per_token
+                ),
+                "final_token": per_token[-1],
+                "per_token": per_token,
+                "passed": bool(aligned and all(item["passed"] for item in per_token)),
+            }
+        )
+    report: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "opjax_laguna_target_feature_conformance",
+        "contract": {
+            "layers": TARGET_FEATURE_LAYERS,
+            "layer_width": width,
+            "minimum_cosine_similarity": TARGET_FEATURE_MIN_COSINE,
+            "maximum_relative_l2_error": TARGET_FEATURE_MAX_RELATIVE_L2,
+            "layer_order_policy": "matching layer must have maximum cosine",
+            "position_policy": "every token position must pass",
+        },
+        "source_manifest_sha256": source_capture["manifest_sha256"],
+        "adapter_manifest_sha256": adapter_capture["manifest_sha256"],
+        "source_boundary": _bound_artifact(source_root.name, source_item),
+        "adapter_boundary": _bound_artifact(adapter_root.name, adapter_item),
+        "cosine_matrix": cosine_matrix,
+        "layers": layer_metrics,
+        "passed": all(item["passed"] for item in layer_metrics),
+    }
+    report["report_sha256"] = canonical_sha256(report)
+    return report
+
+
+def validate_target_feature_conformance_report(
+    report: dict[str, Any], *, root: Path, require_pass: bool = True
+) -> None:
+    expected = canonical_sha256(
+        {key: value for key, value in report.items() if key != "report_sha256"}
+    )
+    if report.get("report_sha256") != expected:
+        raise ConformanceError("TARGET_FEATURE_REPORT_HASH_MISMATCH")
+    if report.get("kind") != "opjax_laguna_target_feature_conformance":
+        raise ConformanceError("TARGET_FEATURE_REPORT_KIND_INVALID")
+    for key in ("source_boundary", "adapter_boundary"):
+        artifact = report.get(key, {})
+        path = root / artifact.get("path", "")
+        if not path.is_file():
+            raise ConformanceError(f"TARGET_FEATURE_ARTIFACT_MISSING:{path}")
+        if file_sha256(path) != artifact.get("sha256"):
+            raise ConformanceError(f"TARGET_FEATURE_ARTIFACT_HASH_MISMATCH:{path}")
+    if not report.get("layers"):
+        raise ConformanceError("TARGET_FEATURE_LAYERS_MISSING")
+    observed_pass = all(
+        layer.get("passed") is True for layer in report.get("layers", [])
+    )
+    if report.get("passed") is not observed_pass:
+        raise ConformanceError("TARGET_FEATURE_PASS_STATE_INVALID")
+    if require_pass and not observed_pass:
+        raise ConformanceError("TARGET_FEATURE_CONFORMANCE_FAILED")
 
 
 def build_dflash_conformance_report(

@@ -1,0 +1,109 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as plp
+import jax.interpreters.pallas as pj
+import jax.random as random
+
+def workload(x, weight, linear_bias, bn_scale, bn_bias, bn_mean, bn_var, bias):
+    """
+    Matmul + BatchNorm + BiasAdd + Divide + Swish kernel.
+    
+    Operations:
+    1. x = x @ weight + linear_bias
+    2. x_normalized = (x - bn_mean) / sqrt(bn_var + bn_eps)
+    3. x = bn_scale * x_normalized + bn_bias
+    4. x = x + bias
+    5. x = x / divide_value (1.0)
+    6. x = x * sigmoid(x)  # Swish
+    """
+    bn_eps = 1e-05
+    divide_value = 1.0
+    
+    # Output shape
+    out_shape = jax.ShapeDtypeStruct(x.shape, x.dtype)
+    
+    # Block size for TPU - must be multiple of 8 for bf16
+    block_size = 128
+    
+    def kernel(ref_out, x_ref, weight_ref, linear_bias_ref, 
+               bn_scale_ref, bn_bias_ref, bn_mean_ref, bn_var_ref, bias_ref):
+        # Get program indices
+        m = pl.program_id(0)
+        n = pl.program_id(1)
+        
+        # Compute matmul result for this tile
+        # x[m, :] @ weight[:, n] + linear_bias[n]
+        # Accumulate in float32 for better precision
+        acc = pj.asarray(0.0, dtype=jnp.float32)
+        
+        # Tile size for matmul reduction
+        k_block = 128
+        num_k_tiles = weight.shape[0] // k_block
+        
+        for k in range(num_k_tiles):
+            # Load x tile [block_size, k_block]
+            x_tile = x_ref[m, k * k_block:(k + 1) * k_block].astype(jnp.float32)
+            # Load weight tile [k_block, block_size]
+            w_tile = weight_ref[k * k_block:(k + 1) * k_block, n].astype(jnp.float32)
+            # Accumulate
+            acc = acc + jnp.sum(x_tile * w_tile, axis=0)
+        
+        # Load remaining k elements if any
+        remaining_k = weight.shape[0] % k_block
+        if remaining_k > 0:
+            x_tile = x_ref[m, num_k_tiles * k_block:num_k_tiles * k_block + remaining_k].astype(jnp.float32)
+            w_tile = weight_ref[num_k_tiles * k_block:num_k_tiles * k_block + remaining_k, n].astype(jnp.float32)
+            acc = acc + jnp.sum(x_tile * w_tile, axis=0)
+        
+        # Add linear bias
+        acc = acc + linear_bias_ref[n].astype(jnp.float32)
+        
+        # Convert back to bf16 for batch norm operations
+        x_val = acc.astype(jnp.bfloat16)
+        
+        # BatchNorm: (x - mean) / sqrt(var + eps)
+        x_normalized = (x_val - bn_mean_ref[n]) / jnp.sqrt(bn_var_ref[n] + bn_eps)
+        
+        # Scale and bias
+        x_val = bn_scale_ref[n] * x_normalized + bn_bias_ref[n]
+        
+        # Add bias
+        x_val = x_val + bias_ref[0]
+        
+        # Divide
+        x_val = x_val / divide_value
+        
+        # Swish: x * sigmoid(x)
+        x_val = x_val * jax.nn.sigmoid(x_val)
+        
+        # Write output
+        ref_out[...] = x_val
+    
+    # Grid dimensions based on output shape
+    grid = (x.shape[0] // block_size, x.shape[1] // block_size)
+    
+    # For remaining tiles, we need to handle edge cases
+    # Use ceiling division for grid
+    grid_m = (x.shape[0] + block_size - 1) // block_size
+    grid_n = (x.shape[1] + block_size - 1) // block_size
+    
+    return pl.pallas_call(
+        kernel,
+        out_shape=out_shape,
+        grid=(grid_m, grid_n),
+        in_specs=(
+            pl.BlockSpec((grid_m, block_size), lambda m, n: (m, slice(None))),
+            pl.BlockSpec((block_size, weight.shape[1]), lambda m, n: (slice(None), n)),
+            pl.BlockSpec((weight.shape[1],), lambda m, n: (n,)),
+            pl.BlockSpec((bn_scale.shape[0],), lambda m, n: (n,)),
+            pl.BlockSpec((bn_bias.shape[0],), lambda m, n: (n,)),
+            pl.BlockSpec((bn_mean.shape[0],), lambda m, n: (n,)),
+            pl.BlockSpec((bn_var.shape[0],), lambda m, n: (n,)),
+            pl.BlockSpec((bias.shape[0],), lambda m, n: (0,)),
+        ),
+        out_specs=pl.BlockSpec((block_size, block_size), lambda m, n: (m, n)),
+        compiler_params=jax.pallas TPUCompilerParams(
+            dimension_semantics=("parallel", "parallel")
+        ),
+    )(x, weight, linear_bias, bn_scale, bn_bias, bn_mean, bn_var, bias)

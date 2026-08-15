@@ -1,0 +1,96 @@
+import jax
+import jax.numpy as jnp
+import jax.lax as lax
+import pallas as pl
+import pallas.triton as pltpu
+
+def workload(x, weight, conv_bias, in_weight, in_bias):
+    """Conv2d + InstanceNorm + Divide kernel."""
+    
+    def kernel(x_ref, weight_ref, conv_bias_ref, in_weight_ref, in_bias_ref, out_ref):
+        # Get program indices
+        b = pl.program_id(0)
+        m = pl.program_id(1)
+        n = pl.program_id(2)
+        
+        # Output shape: [128, 128, 126, 126] in NHWC
+        # We'll process the entire output in one block for simplicity
+        # The kernel computes: conv(x, weight) + bias, then inst norm, then scale/shift/divide
+        
+        # Read input data
+        x_nhwc = x_ref[:]
+        weight_hwio = weight_ref[:]
+        conv_b = conv_bias_ref[:]
+        in_w = in_weight_ref[:]
+        in_b = in_bias_ref[:]
+        
+        # Step 1: Transpose x from NHWC to NCHW
+        x_nchw = jnp.transpose(x_nhwc, (0, 3, 1, 2))
+        
+        # Step 2: Transpose weight from HWIO to OIHW
+        kernel_transposed = jnp.transpose(weight_hwio, (2, 3, 0, 1))
+        
+        # Step 3: Conv2d with VALID padding
+        x_conv = lax.conv_general_dilated(
+            x_nchw,
+            kernel_transposed,
+            window_strides=(1, 1),
+            padding="VALID",
+            dimension_numbers=("NCHW", "OIHW", "NCHW")
+        )
+        
+        # Step 4: Add conv_bias (reshaped to [1, 128, 1, 1])
+        conv_bias_reshaped = jnp.reshape(conv_b, (1, -1, 1, 1))
+        x_conv = x_conv + conv_bias_reshaped
+        
+        # Step 5: Transpose back to NHWC
+        x_nhwc_out = jnp.transpose(x_conv, (0, 2, 3, 1))
+        
+        # Step 6: InstanceNorm - compute mean and variance over spatial dimensions (2, 3)
+        mean = jnp.mean(x_nhwc_out, axis=(2, 3), keepdims=True)
+        var = jnp.var(x_nhwc_out, axis=(2, 3), keepdims=True)
+        
+        # Normalize
+        x_norm = (x_nhwc_out - mean) / jnp.sqrt(var + 1e-5)
+        
+        # Step 7: Scale and shift
+        in_weight_reshaped = jnp.reshape(in_w, (1, 1, 1, -1))
+        in_bias_reshaped = jnp.reshape(in_b, (1, 1, 1, -1))
+        x_scaled = x_norm * in_weight_reshaped + in_bias_reshaped
+        
+        # Step 8: Divide by 2.0
+        result = x_scaled / 2.0
+        
+        # Write output
+        out_ref[...] = result
+    
+    # Output shape: [128, 128, 126, 126] in NHWC
+    out_shape = jax.ShapeDtypeStruct((128, 128, 126, 126), jnp.bfloat16)
+    
+    # Grid: process entire output in one block
+    grid = (1, 1, 1)
+    
+    # Block shapes for inputs
+    x_shape = (128, 64, 128, 128)
+    weight_shape = (128, 64, 3, 3)
+    conv_bias_shape = (128,)
+    in_weight_shape = (128,)
+    in_bias_shape = (128,)
+    out_shape_block = (128, 128, 126, 126)
+    
+    return pl.pallas_call(
+        kernel,
+        out_shape=out_shape,
+        grid=grid,
+        in_specs=(
+            pl.BlockSpec(x_shape, lambda b, m, n: (0, 0, 0, 0)),
+            pl.BlockSpec(weight_shape, lambda b, m, n: (0, 0, 0, 0)),
+            pl.BlockSpec(conv_bias_shape, lambda b, m, n: (0,)),
+            pl.BlockSpec(in_weight_shape, lambda b, m, n: (0,)),
+            pl.BlockSpec(in_bias_shape, lambda b, m, n: (0,)),
+        ),
+        out_specs=pl.BlockSpec(out_shape_block, lambda b, m, n: (0, 0, 0, 0)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel", "parallel")
+        ),
+    )(x, weight, conv_bias, in_weight, in_bias)

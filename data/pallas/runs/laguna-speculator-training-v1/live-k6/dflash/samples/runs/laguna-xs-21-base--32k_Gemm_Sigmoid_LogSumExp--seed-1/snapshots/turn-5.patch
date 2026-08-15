@@ -1,0 +1,114 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..d48d1fc 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,107 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import pallas as pl
++import jax.pallas as pltpu
++
++def workload(x, w1, b1, w2, b2):
++    """
++    Implements: Gemm + Sigmoid + Gemm + LogSumExp
++    
++    x: [16384, 2048] bfloat16
++    w1: [4096, 2048] bfloat16
++    b1: [4096] bfloat16
++    w2: [1024, 4096] bfloat16
++    b2: [1024] bfloat16
++    
++    Output: [16384] bfloat16
++    """
++    
++    def kernel(ref_x, ref_w1, ref_b1, ref_w2, ref_b2, ref_out):
++        # Get program IDs for parallel execution
++        m = pl.program_id(0)  # batch dimension
++        
++        # Block sizes for matmul tiling
++        # For bf16 on TPU, use multiples of 8
++        k_block = 128  # reduction dimension block
++        n1_block = 128  # first output dimension block
++        n2_block = 128  # second output dimension block
++        
++        # First matmul: x[m, :] @ w1.T -> [4096]
++        # x shape: [16384, 2048], w1 shape: [4096, 2048]
++        # output shape: [4096]
++        
++        # Accumulate in float32 for better precision
++        acc1 = jnp.zeros((4096,), dtype=jnp.float32)
++        
++        # Tile along the reduction dimension (2048)
++        for k_start in range(0, 2048, k_block):
++            k_end = min(k_start + k_block, 2048)
++            
++            # Load x row and w1 column slice
++            x_val = ref_x[m, k_start:k_end]  # [k_block]
++            w1_vals = ref_w1[:, k_start:k_end]  # [4096, k_block]
++            
++            # Compute partial matmul
++            partial = jnp.dot(x_val, w1_vals.T)  # [4096]
++            acc1 = acc1 + partial.astype(jnp.float32)
++        
++        # Add bias
++        acc1 = acc1 + ref_b1.astype(jnp.float32)
++        
++        # Apply sigmoid
++        x_val = jax.nn.sigmoid(acc1.astype(jnp.bfloat16)).astype(jnp.float32)
++        
++        # Second matmul: x[m, :] @ w2.T -> [1024]
++        # x shape: [4096], w2 shape: [1024, 4096]
++        # output shape: [1024]
++        
++        acc2 = jnp.zeros((1024,), dtype=jnp.float32)
++        
++        # Tile along the reduction dimension (4096)
++        for k_start in range(0, 4096, k_block):
++            k_end = min(k_start + k_block, 4096)
++            
++            # Load x slice and w2 column slice
++            x_slice = x_val[k_start:k_end]  # [k_block]
++            w2_vals = ref_w2[:, k_start:k_end]  # [1024, k_block]
++            
++            # Compute partial matmul
++            partial = jnp.dot(x_slice, w2_vals.T)  # [1024]
++            acc2 = acc2 + partial.astype(jnp.float32)
++        
++        # Add bias
++        acc2 = acc2 + ref_b2.astype(jnp.float32)
++        
++        # LogSumExp along axis 0 (since we're working with a 1D vector)
++        # For a 1D array, logsumexp is just the log-sum-exp of all elements
++        result = jax.scipy.special.logsumexp(acc2.astype(jnp.bfloat16))
++        
++        ref_out[m] = result
++    
++    # Grid: one program per batch element
++    grid = (x.shape[0],)
++    
++    # Block specs for inputs
++    # x: [batch, 2048] - we process one row at a time
++    # w1: [4096, 2048] - full matrix needed
++    # b1: [4096] - full vector needed
++    # w2: [1024, 4096] - full matrix needed
++    # b2: [1024] - full vector needed
++    # out: [batch] - one element per program
++    
++    return pl.pallas_call(
++        kernel,
++        out_shape=jax.ShapeDtypeStruct(x.shape[:1], x.dtype),
++        grid=grid,
++        in_specs=(
++            pl.BlockSpec((1, 2048), lambda m, _: (m, 0)),  # x: one row per program
++            pl.BlockSpec((4096, 2048), lambda m, _: (0, 0)),  # w1: full matrix
++            pl.BlockSpec((4096,), lambda m, _: (0,)),  # b1: full vector
++            pl.BlockSpec((1024, 4096), lambda m, _: (0, 0)),  # w2: full matrix
++            pl.BlockSpec((1024,), lambda m, _: (0,)),  # b2: full vector
++        ),
++        out_specs=pl.BlockSpec((1,), lambda m, _: (m,)),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel",)
++        ),
++    )(x, w1, b1, w2, b2)

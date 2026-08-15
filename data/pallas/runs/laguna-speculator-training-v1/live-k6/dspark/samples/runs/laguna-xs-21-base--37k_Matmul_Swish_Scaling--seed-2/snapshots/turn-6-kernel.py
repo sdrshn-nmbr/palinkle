@@ -1,0 +1,69 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as plp
+import jax.interpreters.tpu as pltpu
+
+def workload(x, weight, bias):
+    # Block size for tiling - use multiples of 8 for bf16 and 128 for vectorization
+    block_m = 128
+    block_n = 128
+    block_k = 128
+    
+    def matmul_swish_kernel(x_ref, weight_ref, bias_ref, out_ref):
+        # Get program IDs for grid indexing
+        m_block = pl.program_id(0)
+        n_block = pl.program_id(1)
+        
+        # Compute tile indices
+        m_start = m_block * block_m
+        n_start = n_block * block_n
+        
+        # Accumulator in float32 for better precision
+        acc = jnp.zeros((block_m, block_n), dtype=jnp.float32)
+        
+        # Tiled matmul with bias
+        for k_block in range(x.shape[1] // block_k):
+            k_start = k_block * block_k
+            
+            # Load tiles
+            x_tile = x_ref[m_start:m_start + block_m, k_start:k_start + block_k]
+            w_tile = weight_ref[k_start:k_start + block_k, n_start:n_start + block_n]
+            
+            # Matmul and accumulate
+            acc = acc + jnp.dot(x_tile, w_tile)
+        
+        # Add bias (broadcast along m dimension)
+        bias_tile = bias_ref[n_start:n_start + block_n]
+        acc = acc + bias_tile[None, :]
+        
+        # Convert to bfloat16 for swish computation
+        acc_bf16 = acc.astype(jnp.bfloat16)
+        
+        # Swish: x * sigmoid(x)
+        swish_out = acc_bf16 * jax.nn.sigmoid(acc_bf16)
+        
+        # Scale by 2.0
+        result = swish_out * 2.0
+        
+        # Write output
+        out_ref[m_start:m_start + block_m, n_start:n_start + block_n] = result
+    
+    # Grid dimensions
+    grid_m = x.shape[0] // block_m
+    grid_n = x.shape[1] // block_n
+    
+    return pl.pallas_call(
+        matmul_swish_kernel,
+        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+        grid=(grid_m, grid_n),
+        in_specs=(
+            pl.BlockSpec((block_m, block_k), lambda m, n, k: (m * block_m, k * block_k)),
+            pl.BlockSpec((block_k, block_n), lambda m, n, k: (k * block_k, n * block_n)),
+            pl.BlockSpec((block_n,), lambda m, n, k: (n * block_n,)),
+        ),
+        out_specs=pl.BlockSpec((block_m, block_n), lambda m, n: (m * block_m, n * block_n)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel")
+        ),
+    )(x, weight, bias)

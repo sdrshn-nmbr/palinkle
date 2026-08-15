@@ -1,0 +1,125 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..cf9cec3 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,118 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.random as jrandom
++import jax.lax as jlax
++import jax.nn as jnn
++import math
++import pallas as pl
++import pallas.triton as pltpu
++
++# Configuration constants from the spec
++CONFIG = {
++    "head_dim": 128,
++    "max_num_batched_tokens": 4096,
++    "max_num_seqs": 64,
++    "model": "Llama-3.1-70B",
++    "num_kv_heads": 8,
++    "num_q_heads": 64,
++    "operator": "ragged_paged_attention",
++    "page_size": 16,
++    "pages_per_seq": 256
++}
++
++DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.float32).max)
++
++
++def workload(queries, kv_pages, kv_lens, page_indices, cu_q_lens, num_seqs):
++    """Ragged paged attention kernel for Llama-3.1-70B mixed prefill+decode.
++    
++    Args:
++        queries: [max_num_batched_tokens, num_q_heads, head_dim] - query tensor
++        kv_pages: [num_pages, page_size, 2, head_dim] - paged KV cache
++        kv_lens: [max_num_seqs] - length of KV for each sequence
++        page_indices: [max_num_seqs, pages_per_seq] - indices to pages for each sequence
++        cu_q_lens: [max_num_seqs + 1] - cumulative query lengths
++        num_seqs: [1] - number of sequences
++    
++    Returns:
++        Output tensor of shape [max_num_batched_tokens, num_q_heads, head_dim]
++    """
++    head_dim = CONFIG["head_dim"]
++    max_num_batched_tokens = CONFIG["max_num_batched_tokens"]
++    max_num_seqs = CONFIG["max_num_seqs"]
++    num_kv_heads = CONFIG["num_kv_heads"]
++    num_q_heads = CONFIG["num_q_heads"]
++    pages_per_seq = CONFIG["pages_per_seq"]
++    
++    sm_scale = 1.0 / math.sqrt(head_dim)
++    mask_value = DEFAULT_MASK_VALUE
++    
++    # Compute derived dimensions
++    _, num_combined_kv_heads, _ = kv_pages.shape
++    num_kv_heads_derived = num_combined_kv_heads // 2
++    num_query_per_kv = num_q_heads // num_kv_heads_derived
++    
++    tokens_per_seq = max_num_batched_tokens // max_num_seqs
++    
++    # Process each sequence independently
++    outputs = []
++    
++    for i in range(max_num_seqs):
++        # Get sequence-specific data
++        q_start = cu_q_lens[i]
++        kv_len = kv_lens[i]
++        indices = page_indices[i]
++        
++        # Extract query slice for this sequence
++        q = jlax.dynamic_slice(
++            queries,
++            (q_start, 0, 0),
++            (tokens_per_seq, num_q_heads, head_dim)
++        )
++        
++        # Extract K and V from paged KV cache
++        # K is from even pages (indices, :, 0, :)
++        k_raw = kv_pages[indices, :, 0, :]
++        # V is from odd pages (indices, :, 1, :)
++        v_raw = kv_pages[indices, :, 1, :]
++        
++        # Reshape to combine page dimension
++        # k_raw shape: [pages_per_seq, page_size, head_dim]
++        # We need to reshape to [pages_per_seq * page_size, head_dim]
++        k = jnp.reshape(k_raw, (-1, head_dim))
++        v = jnp.reshape(v_raw, (-1, head_dim))
++        
++        # Repeat K and V for query-per-kv heads
++        k = jnp.repeat(k, num_query_per_kv, axis=0)
++        v = jnp.repeat(v, num_query_per_kv, axis=0)
++        
++        # Compute attention scores
++        attn = jnp.einsum("qhd,khd->hqk", q, k, preferred_element_type=jnp.float32)
++        attn = attn * sm_scale
++        
++        # Create causal mask
++        # q_span: position in query space (relative to sequence start)
++        # kv_span: position in KV space
++        q_span = kv_len - tokens_per_seq + jnp.broadcasted_iota(jnp.int32, attn.shape, 0)
++        kv_span = jnp.broadcasted_iota(jnp.int32, attn.shape, 1)
++        
++        # Mask: attend only to positions before q_span and within kv_len
++        mask = (kv_span < q_span) | (kv_span >= kv_len)
++        
++        # Apply mask
++        attn = jnp.where(mask, mask_value, attn)
++        
++        # Softmax
++        attn = jnn.softmax(attn.astype(v.dtype), axis=-1)
++        
++        # Compute output
++        out = jnp.einsum("hqk,khd->qhd", attn, v).astype(queries.dtype)
++        
++        # Zero out invalid sequences
++        is_valid = i < num_seqs[0]
++        out = jnp.where(is_valid, out, 0.0)
++        
++        outputs.append(out)
++    
++    # Concatenate all outputs
++    return jnp.concatenate(outputs, axis=0)

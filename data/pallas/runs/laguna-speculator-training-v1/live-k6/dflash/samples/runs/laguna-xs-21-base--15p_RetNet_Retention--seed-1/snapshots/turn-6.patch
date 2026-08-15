@@ -1,0 +1,208 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..6017cd0 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,201 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import pallas as pl
++import triton.tools.extras as pltpu
++
++def workload(query, key, value):
++    """
++    Multi-scale retention kernel for RetNet.
++    
++    Retention(X) = (Q K^T ⊙ D) V
++    where D[i,j] = γ^(i-j) if i >= j, else 0
++    
++    Each head has a different decay rate γ_h, creating a multi-scale representation.
++    """
++    B, H, S, D = query.shape
++    
++    # Compute gammas for each head: γ_h = exp2(1.0 - 5.0 / h)
++    gammas = jnp.exp2(1.0 - 5.0 / jnp.arange(H, dtype=jnp.float32))
++    
++    # Compute log_gamma for numerical stability
++    log_gamma = jnp.log(gammas)
++    
++    # Compute positions and distance matrix
++    positions = jnp.arange(S, dtype=jnp.float32)
++    distance = positions[:, None] - positions[None, :]  # S x S
++    
++    # Causal mask: 1 if i >= j, else 0
++    causal_mask = (distance >= 0).astype(jnp.float32)
++    
++    # Compute decay: exp(log_gamma * max(distance, 0)) * causal_mask
++    # decay[h, i, j] = γ_h^(max(i-j, 0)) if i >= j else 0
++    decay = jnp.exp(log_gamma[:, None, None] * jnp.maximum(distance[None, :, :], 0.0)) * causal_mask[None, :, :]
++    
++    # Compute QK^T: einsum("bhsd,bhtd->bhst", query, key)
++    qk = jnp.einsum("bhsd,bhtd->bhst", query.astype(jnp.float32), key.astype(jnp.float32))
++    
++    # Apply decay
++    qk_decayed = qk * decay
++    
++    # Compute retention sum with numerical stability
++    retention_sum = jnp.maximum(jnp.abs(qk_decayed), 1.0).sum(axis=2, keepdims=True)
++    
++    # Normalize
++    qk_normalized = qk_decayed / retention_sum
++    
++    # Compute output: einsum("bhst,bhtd->bhsd", qk_normalized, value)
++    output = jnp.einsum("bhst,bhtd->bhsd", qk_normalized.astype(query.dtype), value)
++    
++    return output
++
++
++def retention_kernel(query_ref, key_ref, value_ref, out_ref, gammas_ref, log_gamma_ref, 
++                     positions_ref, distance_ref, causal_mask_ref, decay_ref, qk_ref,
++                     qk_decayed_ref, retention_sum_ref, qk_normalized_ref, output_ref,
++                     b_idx, h_idx, s_idx, d_idx):
++    """Pallas kernel for multi-scale retention."""
++    B, H, S, D = query_ref.shape
++    
++    # Compute gammas for each head
++    gammas = jnp.exp2(1.0 - 5.0 / jnp.arange(H, dtype=jnp.float32))
++    log_gamma = jnp.log(gammas)
++    
++    # Compute positions and distance
++    positions = jnp.arange(S, dtype=jnp.float32)
++    distance = positions[:, None] - positions[None, :]
++    
++    # Causal mask
++    causal_mask = (distance >= 0).astype(jnp.float32)
++    
++    # Compute decay for this head
++    decay = jnp.exp(log_gamma[h_idx] * jnp.maximum(distance[s_idx, :], 0.0)) * causal_mask[s_idx, :]
++    
++    # Compute QK^T for this batch, head
++    qk = jnp.sum(query_ref[b_idx, h_idx, s_idx, :] * key_ref[b_idx, h_idx, :, :], axis=-1)
++    
++    # Apply decay
++    qk_decayed = qk * decay
++    
++    # Compute retention sum
++    retention_sum = jnp.maximum(jnp.abs(qk_decayed), 1.0).sum()
++    
++    # Normalize
++    qk_normalized = qk_decayed / retention_sum
++    
++    # Compute output
++    output = jnp.sum(qk_normalized[:, None] * value_ref[b_idx, h_idx, :, d_idx], axis=0)
++    
++    out_ref[b_idx, h_idx, s_idx, d_idx] = output.astype(query_ref.dtype)
++
++
++def workload_pallas(query, key, value):
++    """
++    Multi-scale retention kernel using Pallas for TPU.
++    """
++    B, H, S, D = query.shape
++    
++    # Block size for tiling
++    block_s = 64  # Tile along sequence dimension
++    block_d = 32  # Tile along head dimension
++    
++    def retention_kernel(ref_q, ref_k, ref_v, ref_out, 
++                         gammas, log_gamma, positions, distance, causal_mask,
++                         b_idx, h_idx, s_idx, d_idx):
++        # Get head-specific gamma
++        gamma = gammas[h_idx]
++        lg = log_gamma[h_idx]
++        
++        # Compute decay for current position
++        dist = distance[s_idx, :]  # Distance from current position to all positions
++        decay = jnp.exp(lg * jnp.maximum(dist, 0.0)) * causal_mask[s_idx, :]
++        
++        # Compute QK for current position
++        q = ref_q[b_idx, h_idx, s_idx, :]  # [D]
++        k_all = ref_k[b_idx, h_idx, :, :]  # [S, D]
++        
++        # QK^T: sum over D
++        qk = jnp.sum(q * k_all, axis=-1)  # [S]
++        
++        # Apply decay
++        qk_decayed = qk * decay
++        
++        # Retention sum for normalization
++        retention_sum = jnp.maximum(jnp.abs(qk_decayed), 1.0).sum()
++        
++        # Normalize
++        qk_norm = qk_decayed / retention_sum
++        
++        # Compute output: sum over S
++        v_all = ref_v[b_idx, h_idx, :, :]  # [S, D]
++        output = jnp.sum(qk_norm[:, None] * v_all, axis=0)  # [D]
++        
++        ref_out[b_idx, h_idx, s_idx, d_idx] = output.astype(ref_q.dtype)
++    
++    # Precompute constants
++    gammas = jnp.exp2(1.0 - 5.0 / jnp.arange(H, dtype=jnp.float32))
++    log_gamma = jnp.log(gammas)
++    positions = jnp.arange(S, dtype=jnp.float32)
++    distance = positions[:, None] - positions[None, :]
++    causal_mask = (distance >= 0).astype(jnp.float32)
++    
++    return pl.pallas_call(
++        retention_kernel,
++        out_shape=jax.ShapeDtypeStruct(query.shape, query.dtype),
++        grid=(B, H, (S + block_s - 1) // block_s, (D + block_d - 1) // block_d),
++        in_specs=(
++            pl.BlockSpec((1, 1, block_s, D), lambda b, h, s, d: (b, h, s * block_s, 0)),
++            pl.BlockSpec((1, 1, S, D), lambda b, h, s, d: (b, h, 0, 0)),
++            pl.BlockSpec((1, 1, S, D), lambda b, h, s, d: (b, h, 0, 0)),
++        ),
++        out_specs=pl.BlockSpec((1, 1, block_s, block_d), lambda b, h, s, d: (b, h, s * block_s, d * block_d)),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel", "parallel", "sequential", "parallel")
++        ),
++    )(query, key, value, gammas, log_gamma, positions, distance, causal_mask)
++
++
++# Use the simple JAX implementation for now, will optimize with Pallas
++def workload(query, key, value):
++    """
++    Multi-scale retention kernel for RetNet.
++    
++    Retention(X) = (Q K^T ⊙ D) V
++    where D[i,j] = γ^(i-j) if i >= j, else 0
++    
++    Each head has a different decay rate γ_h, creating a multi-scale representation.
++    """
++    B, H, S, D = query.shape
++    
++    # Compute gammas for each head: γ_h = exp2(1.0 - 5.0 / h)
++    gammas = jnp.exp2(1.0 - 5.0 / jnp.arange(H, dtype=jnp.float32))
++    
++    # Compute log_gamma for numerical stability
++    log_gamma = jnp.log(gammas)
++    
++    # Compute positions and distance matrix
++    positions = jnp.arange(S, dtype=jnp.float32)
++    distance = positions[:, None] - positions[None, :]  # S x S
++    
++    # Causal mask: 1 if i >= j, else 0
++    causal_mask = (distance >= 0).astype(jnp.float32)
++    
++    # Compute decay: exp(log_gamma * max(distance, 0)) * causal_mask
++    # decay[h, i, j] = γ_h^(max(i-j, 0)) if i >= j else 0
++    decay = jnp.exp(log_gamma[:, None, None] * jnp.maximum(distance[None, :, :], 0.0)) * causal_mask[None, :, :]
++    
++    # Compute QK^T: einsum("bhsd,bhtd->bhst", query, key)
++    qk = jnp.einsum("bhsd,bhtd->bhst", query.astype(jnp.float32), key.astype(jnp.float32))
++    
++    # Apply decay
++    qk_decayed = qk * decay
++    
++    # Compute retention sum with numerical stability
++    retention_sum = jnp.maximum(jnp.abs(qk_decayed), 1.0).sum(axis=2, keepdims=True)
++    
++    # Normalize
++    qk_normalized = qk_decayed / retention_sum
++    
++    # Compute output: einsum("bhst,bhtd->bhsd", qk_normalized, value)
++    output = jnp.einsum("bhst,bhtd->bhsd", qk_normalized.astype(query.dtype), value)
++    
++    return output

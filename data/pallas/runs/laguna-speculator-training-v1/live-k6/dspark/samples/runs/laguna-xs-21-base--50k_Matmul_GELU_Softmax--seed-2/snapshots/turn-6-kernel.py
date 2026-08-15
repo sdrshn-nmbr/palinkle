@@ -1,0 +1,104 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as plp
+import jax.interpreters.tpu as pltpu
+
+
+def workload(x, weight, bias):
+    """Matmul + GELU + Softmax kernel."""
+    batch_size, in_features = x.shape
+    out_features = weight.shape[1]
+    
+    # Block size for TPU - use multiples of 8 for bf16
+    block_m = 128  # rows per block
+    block_k = 128  # reduction dimension
+    block_n = 128  # columns per block
+    
+    # Grid dimensions
+    grid_m = (batch_size + block_m - 1) // block_m
+    grid_n = (out_features + block_n - 1) // block_n
+    
+    def kernel(ref_x, ref_weight, ref_bias, ref_out):
+        # Get program IDs
+        m_block = pl.program_id(0)
+        n_block = pl.program_id(1)
+        
+        # Tile indices
+        m_start = m_block * block_m
+        n_start = n_block * block_n
+        
+        # Accumulator for matmul result in float32
+        acc = jnp.zeros((block_m, block_n), dtype=jnp.float32)
+        
+        # Matmul: x @ weight
+        # x is [batch_size, in_features], weight is [in_features, out_features]
+        for k_block in range((in_features + block_k - 1) // block_k):
+            k_start = k_block * block_k
+            
+            # Load x tile [block_m, block_k]
+            x_tile = ref_x[
+                m_start:min(m_start + block_m, batch_size),
+                k_start:min(k_start + block_k, in_features)
+            ]
+            
+            # Load weight tile [block_k, block_n]
+            w_tile = ref_weight[
+                k_start:min(k_start + block_k, in_features),
+                n_start:min(n_start + block_n, out_features)
+            ]
+            
+            # Pad tiles if needed
+            x_padded = jnp.pad(x_tile, ((0, block_m - x_tile.shape[0]), (0, block_k - x_tile.shape[1])))
+            w_padded = jnp.pad(w_tile, ((0, block_k - w_tile.shape[0]), (0, block_n - w_tile.shape[1])))
+            
+            # Accumulate in float32
+            acc = acc + jnp.dot(x_padded.astype(jnp.float32), w_padded.astype(jnp.float32))
+        
+        # Add bias
+        bias_tile = ref_bias[n_start:n_start + block_n]
+        bias_padded = jnp.pad(bias_tile, (0, block_n - bias_tile.shape[0]))
+        acc = acc + bias_padded
+        
+        # Apply GELU: x * sigmoid(1.7159 * x) approximately
+        # Using the approximation: gelu(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+        gelu_acc = acc * 0.5 * (1 + jnp.tanh(
+            jnp.sqrt(2.0 / jnp.pi) * (acc + 0.044715 * acc * acc * acc)
+        ))
+        
+        # Softmax along axis 1 (columns)
+        # Subtract max for numerical stability
+        max_val = jnp.max(gelu_acc, axis=1, keepdims=True)
+        shifted = gelu_acc - max_val
+        exp_shifted = jnp.exp(shifted)
+        sum_exp = jnp.sum(exp_shifted, axis=1, keepdims=True)
+        softmax_result = exp_shifted / sum_exp
+        
+        # Write output
+        ref_out[
+            m_start:min(m_start + block_m, batch_size),
+            n_start:min(n_start + block_n, out_features)
+        ] = softmax_result[
+            :min(block_m, batch_size - m_start),
+            :min(block_n, out_features - n_start)
+        ].astype(ref_out.dtype)
+    
+    # Define output shape
+    out_shape = jax.ShapeDtypeStruct((batch_size, out_features), x.dtype)
+    
+    # Block specs
+    x_spec = pl.BlockSpec((block_m, block_k), lambda m, n: (m * block_m, n * block_k))
+    w_spec = pl.BlockSpec((block_k, block_n), lambda m, n: (m * block_k, n * block_n))
+    b_spec = pl.BlockSpec((block_n,), lambda n: (n * block_n,))
+    out_spec = pl.BlockSpec((block_m, block_n), lambda m, n: (m * block_m, n * block_n))
+    
+    return pl.pallas_call(
+        kernel,
+        out_shape=out_shape,
+        grid=(grid_m, grid_n),
+        in_specs=(x_spec, w_spec, b_spec),
+        out_specs=out_spec,
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel")
+        ),
+    )(x, weight, bias)

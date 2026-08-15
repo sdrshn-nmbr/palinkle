@@ -1,0 +1,102 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..90e3ea2 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,95 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas.lib as pllib
++import jax.pallas.tpu as pltpu
++
++def workload(x, weight, bias):
++    """Conv2d + GELU + GlobalAvgPool kernel."""
++    # Input shapes:
++    # x: [128, 8, 256, 256] (NCHW)
++    # weight: [64, 8, 3, 3] (OCHW)
++    # bias: [64]
++
++    # Output shape: [128, 64]
++
++    batch_size = 128
++    in_channels = 8
++    out_channels = 64
++    height = 256
++    width = 256
++    kernel_size = 3
++
++    def conv_gelu_gap_kernel(x_ref, weight_ref, bias_ref, out_ref):
++        # x_ref: [batch, in_channels, height, width]
++        # weight_ref: [out_channels, in_channels, kernel, kernel]
++        # bias_ref: [out_channels]
++        # out_ref: [batch, out_channels]
++
++        batch_idx = pl.program_id(0)
++        out_ch_idx = pl.program_id(1)
++
++        # Read input slice for this batch
++        x_block = x_ref[batch_idx]  # [in_channels, height, width]
++
++        # Read weight slice for this output channel
++        weight_block = weight_ref[out_ch_idx]  # [in_channels, kernel, kernel]
++
++        # Read bias
++        b = bias_ref[out_ch_idx]
++
++        # Perform convolution using einsum
++        # x_block: [in_channels, height, width]
++        # weight_block: [in_channels, kernel, kernel]
++        # Result: [height - kernel + 1, width - kernel + 1]
++
++        # Use jax.lax.conv_general_dilated
++        # Reshape for conv: [1, height, width, in_channels] (NHWC)
++        x_nhwc = jnp.transpose(x_block, (1, 2, 0))  # [height, width, in_channels]
++        x_nhwc = jnp.expand_dims(x_nhwc, 0)  # [1, height, width, in_channels]
++
++        # Weight: [kernel, kernel, in_channels, out_channels] (HWIO)
++        w_hwio = jnp.transpose(weight_block, (2, 1, 0))  # [kernel, kernel, in_channels]
++        w_hwio = jnp.expand_dims(w_hwio, -1)  # [kernel, kernel, in_channels, 1]
++
++        # Conv2D
++        conv_out = jax.lax.conv_general_dilated(
++            x_nhwc,
++            w_hwio,
++            window_strides=(1, 1),
++            padding="VALID",
++            dimension_numbers=("NHWC", "HWIO", "NHWC")
++        )  # [1, height-k+1, width-k+1, 1]
++
++        conv_out = jnp.squeeze(conv_out, axis=-1)  # [1, height-k+1, width-k+1]
++        conv_out = jnp.squeeze(conv_out, axis=0)  # [height-k+1, width-k+1]
++
++        # Add bias
++        conv_out = conv_out + b
++
++        # Apply GELU
++        gelu_out = jax.nn.gelu(conv_out)
++
++        # Global average pooling over spatial dimensions
++        gap_out = jnp.mean(gelu_out, axis=(0, 1))
++
++        # Write output
++        out_ref[batch_idx, out_ch_idx] = gap_out
++
++    # Grid: [batch_size, out_channels]
++    grid = (batch_size, out_channels)
++
++    return pl.pallas_call(
++        conv_gelu_gap_kernel,
++        out_shape=jax.ShapeDtypeStruct((batch_size, out_channels), jnp.bfloat16),
++        grid=grid,
++        in_specs=(
++            pl.BlockSpec((batch_size, in_channels, height, width), lambda batch, out_ch: (0, slice(None), slice(None), slice(None))),
++            pl.BlockSpec((out_channels, in_channels, kernel_size, kernel_size), lambda batch, out_ch: (out_ch, slice(None), slice(None), slice(None))),
++            pl.BlockSpec((out_channels,), lambda batch, out_ch: (slice(None),)),
++        ),
++        out_specs=pl.BlockSpec((batch_size, out_channels), lambda batch, out_ch: (batch, out_ch)),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel", "parallel")
++        ),
++    )(x, weight, bias)

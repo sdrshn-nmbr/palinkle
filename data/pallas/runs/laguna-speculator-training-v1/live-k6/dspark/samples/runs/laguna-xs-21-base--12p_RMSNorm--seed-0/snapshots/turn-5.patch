@@ -1,0 +1,93 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..be05a6d 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,86 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.lax as lax
++import jax.pallas as pl
++import jax.pallas as plp
++import jax.interpreters.tpu as pltpu
++
++def workload(x, scale):
++    """RMSNorm kernel for Llama-3.1-70B.
++    
++    Computes: x * rsqrt(mean(x^2, axis=1, keepdims=True) + epsilon) * scale
++    
++    Args:
++        x: Input tensor of shape (batch=8, seq_len=4096, emb_dim=8192), dtype bfloat16
++        scale: Scale tensor of shape (emb_dim=8192,), dtype bfloat16
++    
++    Returns:
++        Output tensor of shape (8, 4096, 8192), dtype bfloat16
++    """
++    epsilon = 1e-5
++    
++    # Block shapes optimized for TPU
++    # emb_dim=8192, use 128 as block size (multiple of 8 for bf16)
++    block_emb = 128
++    # seq_len=4096, use 128 as block size
++    block_seq = 128
++    # batch=8, use 8 as block size
++    block_batch = 8
++    
++    def rmsnorm_kernel(
++        x_ref,
++        scale_ref,
++        out_ref,
++    ):
++        # Get program IDs for parallel dimensions
++        batch_idx = pl.program_id(0)
++        seq_idx = pl.program_id(1)
++        emb_idx = pl.program_id(2)
++        
++        # Compute the mean of squares along the sequence dimension
++        # We need to reduce over all sequence positions for this (batch, emb) element
++        # Initialize accumulator for sum of squares
++        sum_sq = 0.0
++        
++        # Loop over all sequence positions
++        for seq_pos in range(x_ref.shape[0]):
++            # Read x value and square it
++            x_val = x_ref[seq_pos, 0, 0]  # Read single element
++            sum_sq = sum_sq + float(x_val) * float(x_val)
++        
++        # Compute mean
++        mean_sq = sum_sq / float(x_ref.shape[0])
++        
++        # Compute rsqrt(mean + epsilon)
++        rsqrt_val = 1.0 / jnp.sqrt(mean_sq + epsilon)
++        
++        # Apply normalization and scale
++        # Read the input value
++        x_val = x_ref[0, 0, 0]
++        
++        # Normalize and scale
++        result = float(x_val) * rsqrt_val * float(scale_ref[0])
++        
++        # Write output
++        out_ref[0, 0, 0] = jnp.bfloat16(result)
++    
++    # Grid dimensions
++    grid = (block_batch, block_seq, block_emb)
++    
++    # Block specs
++    in_specs = (
++        pl.BlockSpec((block_seq, 1, block_emb), lambda b, s, e: (b, s, e)),
++        pl.BlockSpec((block_emb,), lambda e: (e,)),
++    )
++    out_specs = pl.BlockSpec((block_seq, 1, block_emb), lambda b, s, e: (b, s, e))
++    
++    return pl.pallas_call(
++        rmsnorm_kernel,
++        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
++        grid=grid,
++        in_specs=in_specs,
++        out_specs=out_specs,
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel", "parallel", "parallel")
++        ),
++    )(x, scale)

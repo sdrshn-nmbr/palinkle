@@ -1,0 +1,101 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..8d566b9 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,94 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as plu
++import jax.interpreters.tpu as pltpu
++
++def workload(query, key, value):
++    """Flash attention kernel for causal multi-head attention."""
++    B, H, S, D = query.shape
++    
++    # Block sizes for TPU optimization
++    # Use multiples of 8 for bf16 and 128 for vectorized dimensions
++    block_q = 64  # Query block size
++    block_k = 64  # Key block size
++    block_d = 128  # Head dimension block size
++    
++    def flash_attention_kernel(
++        query_ref,
++        key_ref,
++        value_ref,
++        out_ref,
++    ):
++        """Pallas kernel for flash attention."""
++        # Get program IDs for batch, head, and query block
++        b = pl.program_id(0)
++        h = pl.program_id(1)
++        q_block = pl.program_id(2)
++        
++        # Calculate the starting position for this block
++        q_start = q_block * block_q
++        
++        # Ensure we don't go past the sequence length
++        q_end = min(q_start + block_q, S)
++        
++        # For each query position in this block
++        for q_idx in range(q_start, q_end):
++            # Initialize running sum for softmax (for numerical stability)
++            max_score = -jnp.inf
++            sum_exp = 0.0
++            
++            # Initialize output accumulator for this query position
++            output_acc = jnp.zeros((D,), dtype=jnp.float32)
++            
++            # Iterate over all key positions (causal: k <= q)
++            for k_idx in range(q_idx + 1):  # Causal mask: only attend to k <= q
++                # Compute attention score: Q[b,h,q] @ K[b,h,k] / sqrt(D)
++                q_vec = query_ref[b, h, q_idx, :]  # (D,)
++                k_vec = key_ref[b, h, k_idx, :]  # (D,)
++                
++                # Compute dot product and scale
++                score = jnp.dot(q_vec.astype(jnp.float32), k_vec.astype(jnp.float32)) / jnp.sqrt(D)
++                
++                # Update max for numerical stability
++                max_score = jnp.maximum(max_score, score)
++                
++                # Compute exp(score - max_score) for stability
++                exp_score = jnp.exp(score - max_score)
++                
++                # Update sum of exponentials
++                sum_exp = sum_exp + exp_score
++                
++                # Update output accumulator
++                v_vec = value_ref[b, h, k_idx, :].astype(jnp.float32)
++                output_acc = output_acc + exp_score * v_vec
++            
++            # Normalize by sum of exponentials
++            output_acc = output_acc / sum_exp
++            
++            # Write output
++            out_ref[b, h, q_idx, :] = output_acc.astype(query.dtype)
++    
++    # Calculate grid dimensions
++    num_q_blocks = (S + block_q - 1) // block_q
++    
++    # Create block specs for inputs and output
++    in_specs = (
++        pl.BlockSpec((B, H, S, D), lambda b, h, q_block, _: (b, h, q_block * block_q, 0)),
++        pl.BlockSpec((B, H, S, D), lambda b, h, q_block, _: (b, h, q_block * block_q, 0)),
++        pl.BlockSpec((B, H, S, D), lambda b, h, q_block, _: (b, h, q_block * block_q, 0)),
++    )
++    
++    out_specs = pl.BlockSpec((B, H, S, D), lambda b, h, q_block, _: (b, h, q_block * block_q, 0))
++    
++    # Launch the Pallas kernel
++    return pl.pallas_call(
++        flash_attention_kernel,
++        out_shape=jax.ShapeDtypeStruct(query.shape, query.dtype),
++        grid=(B, H, num_q_blocks),
++        in_specs=in_specs,
++        out_specs=out_specs,
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel", "parallel", "parallel")
++        ),
++    )(query, key, value)

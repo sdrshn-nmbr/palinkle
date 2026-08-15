@@ -1,0 +1,115 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..0b3b8bb 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,108 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as pltpu
++
++def workload(x, weight, bias):
++    """Conv2d + GELU + GlobalAvgPool as a Pallas kernel."""
++
++    # Input shapes:
++    # x: [128, 8, 256, 256] - NCHW format
++    # weight: [64, 8, 3, 3] - OIH format
++    # bias: [64]
++
++    # Output shape: [128, 64]
++
++    # We'll tile the output [batch, out_channels] = [128, 64]
++    # For TPU efficiency, use block sizes that are multiples of 8 for bf16
++
++    batch_size = 128
++    out_channels = 64
++
++    # Block size for tiling
++    block_batch = 128  # Process all batches in one block
++    block_channels = 64  # Process all channels in one block
++
++    def conv_gelu_pool_kernel(
++        x_ref,  # [128, 8, 256, 256] - NCHW
++        weight_ref,  # [64, 8, 3, 3] - OIH
++        bias_ref,  # [64]
++        out_ref,  # [128, 64]
++    ):
++        # Get program IDs
++        batch_idx = pl.program_id(0)
++        channel_idx = pl.program_id(1)
++
++        # For simplicity, process all in one block (grid is 1x1)
++        # Read the entire input slice for this batch
++        x_nchw = x_ref[batch_idx, :, :, :]  # [8, 256, 256]
++
++        # Transpose to NHWC: [8, 256, 256] -> [256, 256, 8]
++        x_nhwc = jnp.transpose(x_nchw, (1, 2, 0))
++
++        # Read weight for this output channel
++        w_oih = weight_ref[channel_idx, :, :, :]  # [8, 3, 3]
++
++        # Transpose to HWIO: [8, 3, 3] -> [3, 3, 8]
++        w_hwio = jnp.transpose(w_oih, (1, 2, 0))
++
++        # Read bias
++        b = bias_ref[channel_idx]
++
++        # Perform convolution using jnp.dot for efficiency
++        # Conv2D: input [H, W, C_in], weight [KH, KW, C_in, C_out]
++        # Output: [H_out, W_out, C_out]
++
++        # For each output position, compute dot product
++        h_out = 256 - 3 + 1  # 254 (VALID padding)
++        w_out = 256 - 3 + 1  # 254
++
++        # Reshape for efficient computation
++        # Input patches: [H_out, W_out, C_in * KH * KW]
++        # Weight: [C_in * KH * KW, C_out]
++
++        # Extract patches and compute convolution
++        # Using a simple loop approach for clarity
++        result = jnp.zeros((h_out, w_out), dtype=jnp.float32)
++
++        for i in range(h_out):
++            for j in range(w_out):
++                # Extract patch [KH, KW, C_in]
++                patch = x_nhwc[i:i+3, j:j+3, :]  # [3, 3, 8]
++                # Flatten and compute dot with weight
++                patch_flat = jnp.reshape(patch, (-1,))  # [72]
++                # Weight for this channel is [3, 3, 8] -> [72]
++                w_flat = jnp.reshape(w_hwio, (-1,))  # [72]
++                # Dot product
++                conv_val = jnp.dot(patch_flat, w_flat)
++                result = result.at[i, j].set(conv_val)
++
++        # Add bias
++        result = result + float(b)
++
++        # Apply GELU
++        result = jax.nn.gelu(result)
++
++        # Global average pool over H and W
++        pooled = jnp.mean(result)
++
++        # Write output
++        out_ref[batch_idx, channel_idx] = pooled
++
++    # Grid is 1x1 since we process everything in one block
++    grid = (1, 1)
++
++    return pl.pallas_call(
++        conv_gelu_pool_kernel,
++        out_shape=jax.ShapeDtypeStruct((batch_size, out_channels), jnp.bfloat16),
++        grid=grid,
++        in_specs=(
++            pl.BlockSpec((batch_size, 8, 256, 256), lambda batch_idx, channel_idx: (batch_idx, 0, 0, 0)),
++            pl.BlockSpec((out_channels, 8, 3, 3), lambda batch_idx, channel_idx: (channel_idx, 0, 0, 0)),
++            pl.BlockSpec((out_channels,), lambda batch_idx, channel_idx: (channel_idx,)),
++        ),
++        out_specs=pl.BlockSpec((batch_size, out_channels), lambda batch_idx, channel_idx: (batch_idx, channel_idx)),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel", "parallel")
++        ),
++    )(x, weight, bias)

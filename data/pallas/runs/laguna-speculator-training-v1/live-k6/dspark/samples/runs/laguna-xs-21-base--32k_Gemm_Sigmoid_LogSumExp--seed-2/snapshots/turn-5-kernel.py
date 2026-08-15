@@ -1,0 +1,56 @@
+import jax
+import jax.numpy as jnp
+import pallas as pl
+import triton.pallas as pltpu
+
+
+def kernel(x_ref, w1_ref, b1_ref, w2_ref, b2_ref, out_ref):
+    # Compute x @ w1.T + b1
+    # x_ref shape: [M, K1], w1_ref shape: [N1, K1]
+    # Result shape: [M, N1]
+    m = x_ref.shape[0]
+    n1 = w1_ref.shape[0]
+    k1 = x_ref.shape[1]
+    
+    # Matmul: x @ w1.T
+    # Accumulate in float32 for better precision
+    x_matmul = jnp.dot(x_ref, w1_ref.T.astype(jnp.float32)).astype(jnp.bfloat16)
+    
+    # Add bias b1
+    x_bias = x_matmul + b1_ref
+    
+    # Apply sigmoid
+    x_sigmoid = jax.nn.sigmoid(x_bias)
+    
+    # Matmul: sigmoid_result @ w2.T
+    n2 = w2_ref.shape[0]
+    x_matmul2 = jnp.dot(x_sigmoid, w2_ref.T.astype(jnp.float32)).astype(jnp.bfloat16)
+    
+    # Add bias b2
+    x_bias2 = x_matmul2 + b2_ref
+    
+    # LogSumExp along axis 1
+    result = jax.scipy.special.logsumexp(x_bias2, axis=1)
+    
+    out_ref[...] = result
+
+
+def workload(x, w1, b1, w2, b2):
+    block_size = 128
+    
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((x.shape[0],), x.dtype),
+        grid=(x.shape[0],),
+        in_specs=(
+            pl.BlockSpec((block_size, x.shape[1]), lambda i: (i, 0)),
+            pl.BlockSpec((w1.shape[0], w1.shape[1]), lambda: (0, 0)),
+            pl.BlockSpec((b1.shape[0],), lambda: (0,)),
+            pl.BlockSpec((w2.shape[0], w2.shape[1]), lambda: (0, 0)),
+            pl.BlockSpec((b2.shape[0],), lambda: (0,)),
+        ),
+        out_specs=pl.BlockSpec((block_size,), lambda i: (i,)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",)
+        ),
+    )(x, w1, b1, w2, b2)

@@ -1,0 +1,94 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..7152c98 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,87 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import pallas as pl
++import jax.pallas as plu
++import jax.pallas.lib as pll
++import jax.pallas.tpu as pltpu
++
++def workload(x, weight, bias, gn_weight, gn_bias):
++    batch_size = 8192
++    in_features = 4096
++    out_features = 4096
++    num_groups = 64
++    group_size = out_features // num_groups  # 64
++    
++    # Block sizes for TPU (multiples of 8 for bf16)
++    block_batch = 128
++    block_out = 128
++    
++    def kernel(ref_x, ref_weight, ref_bias, ref_gn_weight, ref_gn_bias, out_ref):
++        # Get program IDs
++        batch_idx = pl.program_id(0)
++        out_idx = pl.program_id(1)
++        
++        # Compute matmul tile
++        # x_tile: (block_batch, in_features)
++        # weight_tile: (in_features, block_out)
++        # result: (block_batch, block_out)
++        
++        # Load input tile
++        x_tile = ref_x[
++            batch_idx * block_batch:(batch_idx + 1) * block_batch, :
++        ]
++        weight_tile = ref_weight[
++            :, out_idx * block_out:(out_idx + 1) * block_out
++        ]
++        
++        # Matmul with float32 accumulation
++        result = jnp.dot(x_tile, weight_tile, precision=jax.lax.Precision.DEFAULT)
++        
++        # Swish activation: x * sigmoid(x)
++        result = result * jax.nn.sigmoid(result)
++        
++        # Add bias
++        result = result + ref_bias[out_idx * block_out:(out_idx + 1) * block_out]
++        
++        # GroupNorm
++        # Reshape to (block_batch, num_groups, group_size)
++        result_reshaped = result.reshape(block_batch, num_groups, group_size)
++        
++        # Compute mean and variance along last axis
++        mean = jnp.mean(result_reshaped, axis=-1, keepdims=True)
++        var = jnp.var(result_reshaped, axis=-1, keepdims=True)
++        
++        # Normalize
++        result_norm = (result_reshaped - mean) / jnp.sqrt(var + 1e-5)
++        
++        # Reshape back
++        result_norm = result_norm.reshape(block_batch, out_features)
++        
++        # Apply gamma and beta
++        result_norm = result_norm * ref_gn_weight[out_idx * block_out:(out_idx + 1) * block_out] + \
++                      ref_gn_bias[out_idx * block_out:(out_idx + 1) * block_out]
++        
++        # Write output
++        out_ref[
++            batch_idx * block_batch:(batch_idx + 1) * block_batch,
++            out_idx * block_out:(out_idx + 1) * block_out
++        ] = result_norm.astype(jnp.bfloat16)
++    
++    grid = (batch_size // block_batch, out_features // block_out)
++    
++    return pl.pallas_call(
++        kernel,
++        out_shape=jax.ShapeDtypeStruct((batch_size, out_features), jnp.bfloat16),
++        grid=grid,
++        in_specs=(
++            pl.BlockSpec((block_batch, in_features), lambda batch_idx, out_idx: (batch_idx * block_batch, slice(None))),
++            pl.BlockSpec((in_features, block_out), lambda batch_idx, out_idx: (slice(None), out_idx * block_out)),
++            pl.BlockSpec((block_out,), lambda batch_idx, out_idx: (out_idx * block_out,)),
++            pl.BlockSpec((block_out,), lambda batch_idx, out_idx: (out_idx * block_out,)),
++            pl.BlockSpec((block_out,), lambda batch_idx, out_idx: (out_idx * block_out,)),
++        ),
++        out_specs=pl.BlockSpec((block_batch, block_out), lambda batch_idx, out_idx: (batch_idx * block_batch, out_idx * block_out)),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel", "parallel")
++        ),
++    )(x, weight, bias, gn_weight, gn_bias)

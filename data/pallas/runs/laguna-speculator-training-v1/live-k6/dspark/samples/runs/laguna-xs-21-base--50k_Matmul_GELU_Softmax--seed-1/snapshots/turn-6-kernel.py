@@ -1,0 +1,48 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as plp
+from jax import lax
+from jax.pallas.lib import triton
+import jax.pallas as pl
+
+def workload(x, weight, bias):
+    """Matmul + GELU + Softmax kernel."""
+    batch_size, in_features = x.shape
+    out_features = weight.shape[1]
+    
+    # Block size for TPU - use multiples of 8 for bf16 and 128 for vectorization
+    block_size = 128
+    
+    def kernel(ref_x, ref_weight, ref_bias, ref_out):
+        # Compute matmul: x @ weight + bias
+        # Accumulate in float32 for better precision
+        def matmul_gelu_softmax():
+            # Matmul with float32 accumulation
+            result = jnp.dot(ref_x[...], ref_weight[...])
+            result = result + ref_bias[None, :]
+            
+            # GELU activation
+            result = jax.nn.gelu(result)
+            
+            # Softmax along axis 1
+            result = jax.nn.softmax(result, axis=1)
+            
+            return result
+        
+        ref_out[...] = matmul_gelu_softmax()
+    
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((batch_size, out_features), jnp.bfloat16),
+        grid=(batch_size // block_size, out_features // block_size),
+        in_specs=(
+            pl.BlockSpec((block_size, in_features), lambda i, j: (i * block_size, 0)),
+            pl.BlockSpec((in_features, out_features), lambda i, j: (0, j * block_size)),
+            pl.BlockSpec((out_features,), lambda i, j: (j * block_size,)),
+        ),
+        out_specs=pl.BlockSpec((block_size, block_size), lambda i, j: (i * block_size, j * block_size)),
+        compiler_params=plp.CompilerParams(
+            dimension_semantics=("parallel", "parallel")
+        ),
+    )(x, weight, bias)

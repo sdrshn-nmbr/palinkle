@@ -1,0 +1,86 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..f7ac3a9 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,79 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as plp
++import jax.interpre.pallas as pallas
++from jax.interpre.pallas import TPU
++import jax.lax as lax
++
++def workload(x, weight, bias):
++    """
++    GEMM + Scaling + Hardtanh + GELU
++    """
++    batch_size = x.shape[0]  # 4096
++    in_features = x.shape[1]  # 8192
++    out_features = weight.shape[1]  # 8192
++
++    # Block size for TPU - need multiples of 8 for bf16
++    block_size = 128
++
++    def gemm_kernel(ref_ref, out_ref):
++        # ref_ref[0] is x, ref_ref[1] is weight, ref_ref[2] is bias
++        x_ref = ref_ref[0]
++        weight_ref = ref_ref[1]
++        bias_ref = ref_ref[2]
++
++        # Get the indices
++        m = pl.program_id(0)  # batch dimension
++        n = pl.program_id(1)  # output feature dimension
++
++        # Compute GEMM: x[m, :] @ weight[:, n] + bias[n]
++        # Accumulate in float32 for better precision
++        acc = 0.0
++
++        # Tile the reduction dimension
++        k_block_size = 128
++        for k_start in range(0, in_features, k_block_size):
++            k_end = min(k_start + k_block_size, in_features)
++
++            # Load x tile
++            x_tile = x_ref[m, k_start:k_end]
++            # Load weight tile
++            w_tile = weight_ref[k_start:k_end, n]
++
++            # Compute dot product and accumulate
++            acc = acc + jnp.dot(x_tile.astype(jnp.float32), w_tile.astype(jnp.float32))
++
++        # Add bias
++        acc = acc + bias_ref[n].astype(jnp.float32)
++
++        # Scale by 0.5
++        acc = acc * 0.5
++
++        # Hardtanh: clip to [-2, 2]
++        acc = jnp.clip(acc, -2.0, 2.0)
++
++        # GELU: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
++        gelu_factor = 0.5 * jnp.sqrt(2.0 / jnp.pi) * (acc + 0.044715 * jnp.power(acc, 3))
++        acc = 0.5 * acc * (1.0 + jnp.tanh(gelu_factor))
++
++        # Store result
++        out_ref[m, n] = acc.astype(x_ref.dtype)
++
++    # Grid dimensions
++    grid = (batch_size // block_size, out_features // block_size)
++
++    return pl.pallas_call(
++        gemm_kernel,
++        out_shape=jax.ShapeDtypeStruct((batch_size, out_features), x.dtype),
++        grid=grid,
++        in_specs=(
++            pl.BlockSpec((batch_size, in_features), lambda m, n: (m, 0)),
++            pl.BlockSpec((in_features, out_features), lambda m, n: (0, n)),
++            pl.BlockSpec((out_features,), lambda m, n: (0,)),
++        ),
++        out_specs=pl.BlockSpec((batch_size, out_features), lambda m, n: (m, n)),
++        compiler_params=TPU.CompilerParams(
++            dimension_semantics=("parallel", "parallel")
++        ),
++    )(x, weight, bias)

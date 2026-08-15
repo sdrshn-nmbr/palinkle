@@ -1,0 +1,68 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as plp
+import jax.interpreters.pallas as pj
+from jax.interpreters import pallas as pl
+from jax.pallas import lib as pllib
+import jax.numpy as jnp
+from jax import lax
+
+def workload(x, scale):
+    """RMSNorm kernel for Llama-3.1-70B.
+    
+    Computes: x * rsqrt(mean(x^2, axis=1) + epsilon) * scale
+    
+    Args:
+        x: Input tensor of shape (batch=8, seq_len=4096, emb_dim=8192), dtype bfloat16
+        scale: Scale tensor of shape (emb_dim=8192,), dtype bfloat16
+    
+    Returns:
+        Output tensor of shape (batch=8, seq_len=4096, emb_dim=8192), dtype bfloat16
+    """
+    batch, seq_len, emb_dim = x.shape
+    epsilon = 1e-5
+    
+    # Block size for seq_len dimension (must be multiple of 8 for bf16 vectorization)
+    seq_block = 128
+    # Block size for emb_dim (must be multiple of 8 for bf16 vectorization)
+    emb_block = 128
+    
+    def rmsnorm_kernel(ref_x, ref_scale, ref_out):
+        # Get program IDs for batch and embedding dimension
+        batch_idx = pl.program_id(0)
+        emb_idx = pl.program_id(1)
+        
+        # Compute the mean of squares across seq_len for this (batch, emb) position
+        # Accumulate in float32 for numerical stability
+        sum_sq = 0.0
+        for seq_idx in pl.range(seq_len):
+            x_val = ref_x[batch_idx, seq_idx, emb_idx]
+            sum_sq += float(x_val) * float(x_val)
+        
+        mean_sq = sum_sq / seq_len
+        rms = jnp.sqrt(mean_sq + epsilon)
+        inv_rms = 1.0 / rms
+        
+        # Apply normalization and scaling to all seq positions
+        for seq_idx in pl.range(seq_len):
+            x_val = ref_x[batch_idx, seq_idx, emb_idx]
+            result = x_val * inv_rms * ref_scale[emb_idx]
+            ref_out[batch_idx, seq_idx, emb_idx] = result
+    
+    # Grid dimensions: (batch, emb_dim)
+    grid = (batch, emb_dim)
+    
+    return pl.pallas_call(
+        rmsnorm_kernel,
+        out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+        grid=grid,
+        in_specs=(
+            pl.BlockSpec((batch, seq_len, emb_dim), lambda b, e: (b, 0, e)),
+            pl.BlockSpec((emb_dim,), lambda b, e: (e,)),
+        ),
+        out_specs=pl.BlockSpec((batch, seq_len, emb_dim), lambda b, e: (b, 0, e)),
+        compiler_params=plp.CompilerParams(
+            dimension_semantics=("parallel", "parallel")
+        ),
+    )(x, scale)

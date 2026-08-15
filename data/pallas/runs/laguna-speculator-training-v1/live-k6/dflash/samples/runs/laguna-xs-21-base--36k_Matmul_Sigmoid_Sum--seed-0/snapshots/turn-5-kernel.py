@@ -1,0 +1,85 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as plp
+import jax.interpreters.tpu as pltpu
+
+def workload(x, weight, bias):
+    """Compute: sigmoid(x @ weight + bias).sum(axis=1, keepdims=True)"""
+    
+    # Tile sizes - need multiples of 8 for bf16 on TPU
+    block_m = 128  # rows of x
+    block_k = 128  # inner dimension
+    block_n = 128  # columns of weight/output
+    
+    # Grid dimensions
+    grid_m = x.shape[0] // block_m
+    grid_n = weight.shape[1] // block_n
+    grid_k = weight.shape[0] // block_k
+    
+    def kernel(matmul_ref, bias_ref, out_ref):
+        # matmul_ref: [block_m, block_n] - result of x @ weight + bias
+        # bias_ref: [block_n] - bias values
+        # out_ref: [block_m, 1] - final sum output
+        
+        # Initialize accumulator in float32 for better precision
+        acc = jnp.zeros((block_m, block_n), dtype=jnp.float32)
+        
+        # Accumulate over k dimension
+        for k in range(grid_k):
+            # Load tile from matmul_ref (which contains partial sums)
+            tile = matmul_ref[k]
+            acc = acc + tile.astype(jnp.float32)
+        
+        # Add bias
+        acc = acc + bias_ref[None, :].astype(jnp.float32)
+        
+        # Apply sigmoid
+        acc = jax.nn.sigmoid(acc)
+        
+        # Sum along axis 1 (columns), keepdims=True
+        result = jnp.sum(acc, axis=1, keepdims=True)
+        
+        # Write output
+        out_ref[...] = result.astype(x.dtype)
+    
+    # For simplicity, let's use a simpler approach with jnp.dot inside kernel
+    # The matmul + bias + sigmoid + sum can be done in one kernel
+    
+    def simple_kernel(x_ref, weight_ref, bias_ref, out_ref):
+        # x_ref: [block_m, block_k]
+        # weight_ref: [block_k, block_n]
+        # bias_ref: [block_n]
+        # out_ref: [block_m, 1]
+        
+        # Compute matmul in float32 for precision
+        partial = jnp.dot(x_ref, weight_ref, precision=jax.lax.Precision.DEFAULT)
+        
+        # Add bias
+        partial = partial + bias_ref[None, :]
+        
+        # Apply sigmoid
+        partial = jax.nn.sigmoid(partial)
+        
+        # Sum along axis 1
+        result = jnp.sum(partial, axis=1, keepdims=True)
+        
+        out_ref[...] = result.astype(x.dtype)
+    
+    # Grid: one block per row of output
+    grid = (x.shape[0] // block_m, x.shape[1] // block_k, weight.shape[1] // block_n)
+    
+    return pl.pallas_call(
+        simple_kernel,
+        out_shape=jax.ShapeDtypeStruct((x.shape[0], 1), x.dtype),
+        grid=grid,
+        in_specs=(
+            pl.BlockSpec((block_m, block_k), lambda i, j, k: (i * block_m, j * block_k)),
+            pl.BlockSpec((block_k, block_n), lambda i, j, k: (j * block_k, k * block_n)),
+            pl.BlockSpec((block_n,), lambda i, j, k: (k * block_n,)),
+        ),
+        out_specs=pl.BlockSpec((block_m, 1), lambda i, j, k: (i * block_m, 0)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel", "parallel")
+        ),
+    )(x, weight, bias)

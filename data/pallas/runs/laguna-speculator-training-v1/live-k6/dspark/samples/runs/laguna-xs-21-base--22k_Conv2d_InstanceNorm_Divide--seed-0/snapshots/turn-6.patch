@@ -1,0 +1,176 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..991c7af 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,169 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as plp
++import jax.interpreters.tpu as pltpu
++
++def workload(x, weight, conv_bias, in_weight, in_bias):
++    """
++    Conv2d + InstanceNorm + Divide kernel.
++    
++    Input x: [batch, in_channels, height, width] = [128, 64, 128, 128]
++    Weight: [out_channels, in_channels, kernel_h, kernel_w] = [128, 64, 3, 3]
++    conv_bias: [out_channels] = [128]
++    in_weight: [out_channels] = [128]
++    in_bias: [out_channels] = [128]
++    
++    Output: [batch, out_channels, height_out, width_out] = [128, 128, 126, 126]
++    """
++    batch_size = 128
++    out_channels = 128
++    height_out = 126
++    width_out = 126
++    
++    # Block sizes for TPU - multiples of 8 for bf16
++    block_batch = 8
++    block_out_ch = 8
++    block_h = 16
++    block_w = 16
++    
++    grid = (
++        batch_size // block_batch,
++        out_channels // block_out_ch,
++        height_out // block_h,
++        width_out // block_w,
++    )
++    
++    def conv_inst_norm_kernel(
++        x_ref,
++        weight_ref,
++        conv_bias_ref,
++        in_weight_ref,
++        in_bias_ref,
++        out_ref,
++        *,
++        batch_idx,
++        out_ch_idx,
++        h_idx,
++        w_idx,
++    ):
++        # Get block indices
++        batch_start = batch_idx * block_batch
++        out_ch_start = out_ch_idx * block_out_ch
++        h_start = h_idx * block_h
++        w_start = w_idx * block_w
++        
++        # Local buffers for the block
++        x_block = x_ref[batch_start:batch_start + block_batch,
++                        :,
++                        h_start:h_start + block_h,
++                        w_start:w_start + block_w]
++        
++        # For convolution, we need to handle the 3x3 kernel
++        # Each output pixel depends on a 3x3 region of input
++        # Output block: [block_batch, block_out_ch, block_h, block_w]
++        
++        # Initialize output accumulator in float32 for accumulation
++        out_block = jnp.zeros((block_batch, block_out_ch, block_h, block_w), dtype=jnp.float32)
++        
++        # Perform convolution
++        # Input is in NCHW, weight is in OIHW
++        # We need to convolve with 3x3 kernel, stride 1, padding VALID
++        
++        for kh in range(3):
++            for kw in range(3):
++                # Input region for this kernel position
++                # Input height/width: 128, output: 126
++                # For VALID padding with 3x3 kernel, output = input - kernel + 1
++                # So input region is [h:h+3, w:w+3] for output at [h, w]
++                
++                # Get input slice for this kernel position
++                h_in_start = h_start + kh
++                w_in_start = w_start + kw
++                
++                # Check bounds
++                h_in_end = min(h_in_start + 1, 128)
++                w_in_end = min(w_in_start + 1, 128)
++                
++                # Input slice: [batch, in_ch, h_in_start:h_in_end, w_in_start:w_in_end]
++                # But we need to iterate over all input channels
++                # x_block shape: [block_batch, 64, block_h, block_w]
++                
++                # Weight slice: [block_out_ch, in_ch, 1, 1] for this kernel position
++                # weight shape: [128, 64, 3, 3]
++                
++                # For each output channel and input channel
++                for oc in range(block_out_ch):
++                    for ic in range(64):
++                        # Get weight value
++                        w_val = weight_ref[out_ch_start + oc, ic, kh, kw]
++                        
++                        # Get input values for this position
++                        # Need to handle boundary conditions
++                        for bb in range(block_batch):
++                            for hh in range(block_h):
++                                for ww in range(block_w):
++                                    h_in = h_start + hh + kh
++                                    w_in = w_start + ww + kw
++                                    if h_in < 128 and w_in < 128:
++                                        x_val = x_ref[batch_start + bb, ic, h_in, w_in]
++                                        out_block = out_block.at[bb, oc, hh, ww].add(
++                                            x_val * w_val
++                                        )
++        
++        # Add convolution bias
++        for oc in range(block_out_ch):
++            bias_val = conv_bias_ref[out_ch_start + oc]
++            out_block = out_block.at[:, oc, :, :].add(bias_val)
++        
++        # Transpose from NHWC to NCHW for instance norm
++        # out_block is currently in NHWC format [batch, h, w, out_ch]
++        # We need NCHW [batch, out_ch, h, w]
++        out_block_nchw = jnp.transpose(out_block, (0, 3, 2, 1))
++        
++        # Instance normalization: compute mean and variance over spatial dimensions
++        # mean and var over axes (2, 3) with keepdims
++        mean = jnp.mean(out_block_nchw, axis=(2, 3), keepdims=True)
++        var = jnp.var(out_block_nchw, axis=(2, 3), keepdims=True)
++        
++        # Normalize: (x - mean) / sqrt(var + 1e-5)
++        eps = 1e-5
++        out_block_norm = (out_block_nchw - mean) / jnp.sqrt(var + eps)
++        
++        # Scale and shift: out = out * in_weight + in_bias
++        for oc in range(block_out_ch):
++            scale = in_weight_ref[out_ch_start + oc]
++            shift = in_bias_ref[out_ch_start + oc]
++            out_block_norm = out_block_norm.at[:, oc, :, :].set(
++                out_block_norm[:, oc, :, :] * scale + shift
++            )
++        
++        # Divide by 2.0
++        out_block_norm = out_block_norm / 2.0
++        
++        # Write output
++        out_ref[batch_start:batch_start + block_batch,
++                out_ch_start:out_ch_start + block_out_ch,
++                h_start:h_start + block_h,
++                w_start:w_start + block_w] = out_block_norm.astype(jnp.bfloat16)
++    
++    # Define grid spec
++    grid_spec = pl.GridSpec(grid, grid)
++    
++    # Call the kernel
++    return pl.pallas_call(
++        conv_inst_norm_kernel,
++        out_shape=jax.ShapeDtypeStruct((batch_size, out_channels, height_out, width_out), jnp.bfloat16),
++        grid=grid,
++        in_specs=(
++            pl.BlockSpec((batch_size, 64, 128, 128), lambda batch_idx, *args: (0, 0, 0, 0)),
++            pl.BlockSpec((out_channels, 64, 3, 3), lambda out_ch_idx, *args: (0, 0, 0, 0)),
++            pl.BlockSpec((out_channels,), lambda out_ch_idx, *args: (0,)),
++            pl.BlockSpec((out_channels,), lambda out_ch_idx, *args: (0,)),
++            pl.BlockSpec((out_channels,), lambda out_ch_idx, *args: (0,)),
++        ),
++        out_specs=pl.BlockSpec((batch_size, out_channels, height_out, width_out), lambda *args: (0, 0, 0, 0)),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel", "parallel", "parallel", "parallel")
++        ),
++    )(x, weight, conv_bias, in_weight, in_bias)

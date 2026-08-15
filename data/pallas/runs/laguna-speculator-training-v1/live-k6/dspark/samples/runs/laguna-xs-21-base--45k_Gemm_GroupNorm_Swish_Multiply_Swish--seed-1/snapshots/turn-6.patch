@@ -1,0 +1,80 @@
+diff --git a/__pycache__/kernel.cpython-312.pyc b/__pycache__/kernel.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..9ffa1f673257a339b69897c88c2d56d77372eb0b
+GIT binary patch
+literal 1511
+zcmb_c&u`mQ9Dn|i_}Ou`X6Y0tEiKc~>Q&k_38qPuNif*xw3fp-<&t@|Nu1h__w3L#
+za)b{Y76~cssX6Ajsgo!N{sc~3h%$-kZPSp(rJRb&VHyYcJ}0JG1)TWG_V@GszR&x-
+z_x(OS|B%fp2rT;k%j&NpLeE){7(W6Bw*YJ-0~wr+ibKyid{N+rSaedw^ca>#7(4PR
+z&mkC1#TnjK#+ZqM@D(a%HaJb(W6P~*98G(=ZR`GOnk7b-0x!UOu+Oo*gs7T~jCq55
+z9imp+;9HU*v~VbexCvFX<bchMtqN5hwGf5e&ZyduZ^CektsoucArz)V9LhT*wU#ob
+zi~oVG7^0DSkp7#W8RN%&e|1iHl&^+Lm}vrYY@Yh+92SMDA+cTWKyR2eGf+V`%>GLS
+zQc^3cG8CH7+fYoZ4vq~q5UNfj=+Ia5hd4pu;kuv{Yo?ecL;r``O{C%GyUHBcwU3vV
+z=N9I!ky_nbsSyY8&2`JKfM2fLf#um7Nh;<OcBmGbLud~{Z}$EK`%L4hs5dO1;x*Is
+z49oG$zg3>!{qDstmo<f^{EF_GRH(Wh6^vRyC1MU!qGReV6~53375zIT0FK_Eyz5fQ
+zx5`e<GPGlqYtT&Dbez(<X_YGhmE+*HrTYNgBr5@obH|<0wv!R%wjQijO1{-JsamTC
+zrO!=0sKXYh;?|u~nN<!r_CuE37-mg_WT9HZ&X1~%k_-LOZO}1%mSXKYw3n0T*K1_W
+z_w-fs{F+Hz(>~{IP|T8cO*aU%49W2Nf50a~`xu?bZx^---Q3nxbp27j5Z!o`n*@}b
+z=}q->3(@u8(@0i3Qd`>OHs2fI*`C(N3(*JrX_Py$EpN%)v%Tu>*}=s7(GpPA<DE<G
+zOPfo*4|gXYW-dk_JyEiqGwm~*TJO}o;GyzPbOmOfe6uI^Cr>{RzQOnLZhklTc4{!c
+z*v~IUH(*pg`4gV*<LPek-t+)pjMtKtyG!kCSL);0QT+9l&eitS&Pscwdtso?^zlqW
+z{IrkX_z%+088!Ok0Ln+2O4wbXG936hI0oocDt3fjVydw8@SjE4pMmn8O$E>PXn~Db
+zZeS9RnDF&SG^&m#>BLc5-2VHByaj4xmPz78r)Jb`^D<e0kll0t6nyptj^iF9<tZw}
+W&uh=n{Euk<DbgT35Z~sqvBqDtt!ShG
+
+literal 0
+HcmV?d00001
+
+diff --git a/kernel.py b/kernel.py
+index a877f2f..362bd0e 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,46 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as plp
++import jax.interpreters.pallas as pallas
++from jax.interpreters import pallas as pl
++import jax.numpy as jnp
++
++def workload(x, gemm_weight, gemm_bias, gn_weight, gn_bias, multiply_weight):
++    """
++    GEMM + GroupNorm + Swish + Multiply + Swish
++    """
++    batch_size = x.shape[0]
++    out_features = 8192
++    num_groups = 256
++    group_size = out_features // num_groups  # 32
++    
++    # GEMM: x @ gemm_weight + gemm_bias
++    x = jnp.dot(x, gemm_weight) + gemm_bias
++    
++    # Reshape for group norm: (batch_size, num_groups, group_size)
++    x_grouped = x.reshape(batch_size, num_groups, group_size)
++    
++    # GroupNorm: compute mean and variance along the last axis
++    mean = jnp.mean(x_grouped, axis=-1, keepdims=True)
++    var = jnp.var(x_grouped, axis=-1, keepdims=True)
++    
++    # Normalize
++    x_normalized = (x_grouped - mean) / jnp.sqrt(var + 1e-5)
++    
++    # Reshape back
++    x = x_normalized.reshape(batch_size, out_features)
++    
++    # Scale and shift
++    x = x * gn_weight + gn_bias
++    
++    # Swish: x * sigmoid(x)
++    x = x * jax.nn.sigmoid(x)
++    
++    # Multiply
++    x = x * multiply_weight
++    
++    # Swish again
++    x = x * jax.nn.sigmoid(x)
++    
++    return x

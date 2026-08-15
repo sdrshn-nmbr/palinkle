@@ -1,0 +1,39 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..57c4188 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,32 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas as plp
++import jax.interpreters.pallas as pallas
++from jax.interpreters import pallas as pl
++from jax.pallas import lib as pllib
++import jax.numpy as jnp
++
++def workload(query, key, value):
++    """Flash attention kernel for causal multi-head attention."""
++    B, H, S, D = query.shape
++    
++    # Scale factor
++    scale = 1.0 / jnp.sqrt(D)
++    
++    # Compute QK^T with scaling
++    attn = jnp.einsum("bhqd,bhkd->bhqk", query, key) * scale
++    
++    # Create causal mask (lower triangular)
++    mask = jnp.tril(jnp.ones((S, S), dtype=jnp.float32))
++    
++    # Apply mask (set upper triangle to large negative value)
++    attn = jnp.where(mask, attn, -1e9)
++    
++    # Softmax along last axis
++    attn = jax.nn.softmax(attn, axis=-1)
++    
++    # Compute output
++    output = jnp.einsum("bhqk,bhkd->bhqd", attn, value)
++    
++    return output

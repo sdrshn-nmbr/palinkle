@@ -145,6 +145,7 @@ def _canonicalize_capture(
 ) -> dict[str, dict[str, Any]]:
     records = _load_records(raw_root)
     static_records = _load_records(static_root)
+    raw_target_features = _first(records, "raw_target_features")
     combined = _first(records, "combined_target_feature")
     hidden = _first(records, "draft_backbone_hidden_state")
     base_logits = _first(records, "base_logits")
@@ -195,6 +196,9 @@ def _canonicalize_capture(
     if confidence.shape[0] != 15:
         raise RuntimeError(f"VLLM_CONFIDENCE_POSITIONS:{confidence.shape}")
     arrays = {
+        "raw_target_features": raw_target_features.reshape(
+            -1, raw_target_features.shape[-1]
+        ),
         "draft_input_ids": _first(records, "draft_input_ids").reshape(-1),
         "draft_positions": _first(records, "draft_positions").reshape(-1),
         "draft_input_embeddings": _first(records, "draft_input_embeddings").reshape(
@@ -242,9 +246,10 @@ def run_capture(
     *,
     output_root: Path,
     prompt: str,
-    target_feature_override: Path,
+    target_feature_override: Path | None,
     draft_model: str = DSPARK_ID,
     port: int = 8000,
+    target_features_only: bool = False,
 ) -> dict[str, Any]:
     output_root.mkdir(parents=True, exist_ok=False)
     raw_capture_root = output_root / "raw"
@@ -276,9 +281,14 @@ def run_capture(
     environment = {
         **os.environ,
         "OPJAX_DSPARK_CAPTURE_ROOT": str(raw_capture_root),
-        "OPJAX_DSPARK_TARGET_FEATURE_OVERRIDE": str(target_feature_override),
         "OPJAX_SPEC_RUN_ID": output_root.name,
     }
+    if target_feature_override is not None:
+        environment["OPJAX_DSPARK_TARGET_FEATURE_OVERRIDE"] = str(
+            target_feature_override
+        )
+    else:
+        environment.pop("OPJAX_DSPARK_TARGET_FEATURE_OVERRIDE", None)
     log_path = output_root / "server.log"
     with log_path.open("wb") as server_log:
         process = subprocess.Popen(
@@ -332,9 +342,20 @@ def run_capture(
                     os.killpg(process.pid, signal.SIGKILL)
                     process.wait(timeout=30)
     raw_session_root = raw_capture_root / "first-proposal"
-    boundaries = _canonicalize_capture(
-        raw_session_root, raw_capture_root / "static", output_root
-    )
+    if target_features_only:
+        records = _load_records(raw_session_root)
+        raw_target_features = _first(records, "raw_target_features")
+        boundaries = {
+            "raw_target_features": _save_array(
+                output_root,
+                "raw_target_features",
+                raw_target_features.reshape(-1, raw_target_features.shape[-1]),
+            )
+        }
+    else:
+        boundaries = _canonicalize_capture(
+            raw_session_root, raw_capture_root / "static", output_root
+        )
     trace_files = sorted(path for path in profile_root.rglob("*") if path.is_file())
     if not trace_files:
         raise RuntimeError("VLLM_PROFILE_ARTIFACT_MISSING")
@@ -361,6 +382,9 @@ def run_capture(
     manifest: dict[str, Any] = {
         "schema_version": 1,
         "implementation": "opjax_vllm_laguna_dspark_adapter",
+        "capture_scope": (
+            "target_features_only" if target_features_only else "full_proposal"
+        ),
         "provenance": {
             "revision": VLLM_OBSERVED_BUILD,
             "source_sha256": _adapter_source_sha256(),
@@ -371,10 +395,17 @@ def run_capture(
                 else _sha256(Path(draft_model) / "model.safetensors")
             ),
             "command": command,
-            "target_feature_override": {
-                "path": str(target_feature_override),
-                "sha256": _sha256(target_feature_override),
-            },
+            "target_feature_mode": (
+                "source_override" if target_feature_override is not None else "live_vllm"
+            ),
+            "target_feature_override": (
+                {
+                    "path": str(target_feature_override),
+                    "sha256": _sha256(target_feature_override),
+                }
+                if target_feature_override is not None
+                else None
+            ),
         },
         "prompt": prompt,
         "prompt_token_ids": prompt_token_ids,

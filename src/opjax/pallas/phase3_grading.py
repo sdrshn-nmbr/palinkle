@@ -9,6 +9,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
+import uuid
 
 from opjax.pallas.g42_harness import G42HarnessError, canonical_sha256, file_sha256
 from opjax.pallas.jaxbench_worker import (
@@ -21,6 +22,37 @@ from opjax.pallas.phase3_baseline import load_phase3_contract, validate_sample_m
 from opjax.pallas.phase31_worker import grade_on_gcloud
 
 EMPTY_PATCH_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+REQUIRED_RESPONSE_FILES = frozenset(
+    {"submission.json", "reward.json", "result.json"}
+)
+
+
+def missing_response_files(response_root: Path) -> list[str]:
+    if not response_root.is_dir():
+        return sorted(REQUIRED_RESPONSE_FILES)
+    observed = {path.name for path in response_root.iterdir() if path.is_file()}
+    return sorted(REQUIRED_RESPONSE_FILES - observed)
+
+
+def archive_incomplete_unit(
+    *, unit_root: Path, archive_root: Path, evidence: dict[str, Any]
+) -> Path:
+    if not unit_root.exists():
+        return unit_root
+    archive_root.mkdir(parents=True, exist_ok=True)
+    destination = archive_root / f"{unit_root.name}--{uuid.uuid4().hex}"
+    unit_root.rename(destination)
+    manifest = {
+        "schema_version": 1,
+        "kind": "opjax_phase3_incomplete_hardware_attempt",
+        **evidence,
+    }
+    manifest["manifest_sha256"] = canonical_sha256(manifest)
+    (destination / "archive-manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return destination
 
 
 def normalize_submission_patch(*, source: Path, destination: Path) -> dict[str, Any]:
@@ -305,14 +337,50 @@ def grade_sample_matrix(
         )
         response_root = unit_root / "artifacts"
         if response_root.exists():
-            return _hardware_record(
-                record=sample,
-                turn=turn,
-                raw_patch_path=raw_patch_path,
-                submission_patch_path=submission_patch_path,
-                transformation=transformation,
-                response_root=response_root,
-                request=request,
+            missing = missing_response_files(response_root)
+            if not missing:
+                return _hardware_record(
+                    record=sample,
+                    turn=turn,
+                    raw_patch_path=raw_patch_path,
+                    submission_patch_path=submission_patch_path,
+                    transformation=transformation,
+                    response_root=response_root,
+                    request=request,
+                )
+            archived = archive_incomplete_unit(
+                unit_root=unit_root,
+                archive_root=output_root / "incomplete-attempts",
+                evidence={
+                    "reason": "response_files_incomplete",
+                    "missing_response_files": missing,
+                    "request_sha256": canonical_sha256(request),
+                    "raw_patch_sha256": file_sha256(raw_patch_path),
+                    "submission_patch_sha256": file_sha256(submission_patch_path),
+                    "benchmark_release_sha256": release["release_sha256"],
+                },
+            )
+            print(
+                "PHASE3_HARDWARE_RESPONSE_INCOMPLETE "
+                f"unit={sample['run_id']} archived={archived}",
+                file=sys.stderr,
+            )
+        elif unit_root.exists():
+            archived = archive_incomplete_unit(
+                unit_root=unit_root,
+                archive_root=output_root / "incomplete-attempts",
+                evidence={
+                    "reason": "response_directory_absent",
+                    "request_sha256": canonical_sha256(request),
+                    "raw_patch_sha256": file_sha256(raw_patch_path),
+                    "submission_patch_sha256": file_sha256(submission_patch_path),
+                    "benchmark_release_sha256": release["release_sha256"],
+                },
+            )
+            print(
+                "PHASE3_HARDWARE_ATTEMPT_INCOMPLETE "
+                f"unit={sample['run_id']} archived={archived}",
+                file=sys.stderr,
             )
         unit_root.mkdir(parents=True, exist_ok=False)
         if phase31:

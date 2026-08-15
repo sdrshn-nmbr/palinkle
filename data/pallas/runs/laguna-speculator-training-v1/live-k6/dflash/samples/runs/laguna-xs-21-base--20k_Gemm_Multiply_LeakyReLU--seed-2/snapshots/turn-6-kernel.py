@@ -1,0 +1,61 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as plp
+import jax.interpreters.tpu as pltpu
+
+
+def workload(x, weight, bias):
+    """Gemm + Multiply + LeakyReLU kernel."""
+    
+    # Block sizes for TPU - multiples of 8 for bf16, 128 for vectorized dims
+    block_m = 128
+    block_n = 128
+    block_k = 8
+    
+    def kernel(ref_x, ref_weight, ref_bias, ref_out):
+        # Compute matmul with accumulation in float32
+        # x @ weight + bias
+        def matmul_body(_, acc):
+            # Load blocks
+            x_block = ref_x[block_m, block_k].load(jax.lax.scatter_add, axis_name='k')
+            w_block = ref_weight[block_k, block_n].load(jax.lax.scatter_add, axis_name='k')
+            # Accumulate
+            return acc + jnp.dot(x_block, w_block)
+        
+        # Initialize accumulator with bias
+        bias_block = ref_bias[block_n].load()
+        acc = jnp.broadcast_to(bias_block, (block_m, block_n)).astype(jnp.float32)
+        
+        # Perform matmul along K dimension
+        acc = jax.lax.fori_loop(0, x.shape[1] // block_k, matmul_body, acc)
+        
+        # Convert back to bfloat16
+        result = acc.astype(jnp.bfloat16)
+        
+        # Multiply by 2.0
+        result = result * 2.0
+        
+        # LeakyReLU: where(x >= 0, x, x * 0.1)
+        result = jnp.where(result >= 0, result, result * 0.1)
+        
+        ref_out[...] = result
+    
+    # Grid dimensions
+    grid_m = x.shape[0] // block_m
+    grid_n = x.shape[1] // block_n
+    
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((x.shape[0], x.shape[1]), x.dtype),
+        grid=(grid_m, grid_n),
+        in_specs=(
+            pl.BlockSpec((block_m, block_k), lambda i, j: (i * block_m, 0)),
+            pl.BlockSpec((block_k, block_n), lambda i, j: (0, j * block_n)),
+            pl.BlockSpec((block_n,), lambda i, j: (0,)),
+        ),
+        out_specs=pl.BlockSpec((block_m, block_n), lambda i, j: (i * block_m, j * block_n)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel")
+        ),
+    )(x, weight, bias)

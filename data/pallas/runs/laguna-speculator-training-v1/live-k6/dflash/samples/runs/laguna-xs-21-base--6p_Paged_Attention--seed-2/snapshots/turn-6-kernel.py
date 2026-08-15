@@ -1,0 +1,118 @@
+import jax
+import jax.numpy as jnp
+import pallas as pl
+import triton.pallas as pltpu
+
+# Configuration constants from instruction.md
+CONFIG = {
+    "head_dim": 128,
+    "max_seq_len": 4096,
+    "model": "Llama-3.1-70B",
+    "name": "llama3_70b_paged_attention",
+    "num_kv_heads": 8,
+    "num_query_heads": 64,
+    "num_seqs": 64,
+    "operator": "paged_attention",
+    "page_size": 16,
+    "pages_per_seq": 256
+}
+
+
+def workload(queries, k_pages, v_pages, kv_lens, page_indices, cu_q_lens):
+    """Paged attention kernel for Llama-3.1-70B inference decode.
+    
+    Args:
+        queries: [num_seqs, num_queries, head_dim] - bfloat16
+        k_pages: [num_pages, page_size, num_kv_heads, head_dim] - bfloat16
+        v_pages: [num_pages, page_size, num_kv_heads, head_dim] - bfloat16
+        kv_lens: [num_seqs] - int32
+        page_indices: [num_seqs, pages_per_seq] - int32
+        cu_q_lens: [num_seqs + 1] - int32
+    
+    Returns:
+        output: [num_seqs, num_queries, head_dim] - bfloat16
+    """
+    num_seqs = CONFIG["num_seqs"]
+    num_q_heads = CONFIG["num_query_heads"]
+    num_kv_heads = CONFIG["num_kv_heads"]
+    head_dim = CONFIG["head_dim"]
+    page_size = CONFIG["page_size"]
+    pages_per_seq = CONFIG["pages_per_seq"]
+    
+    num_q_per_kv = num_q_heads // num_kv_heads
+    max_seq_len = pages_per_seq * page_size
+    sm_scale = head_dim ** -0.5
+    
+    def attend_one_seq(seq_idx, q_ref, k_pages_ref, v_pages_ref, 
+                       kv_lens_ref, page_indices_ref, cu_q_lens_ref, out_ref):
+        """Attention for a single sequence."""
+        # Get query range for this sequence
+        q_start = cu_q_lens_ref[seq_idx]
+        q_end = cu_q_lens_ref[seq_idx + 1]
+        num_queries = q_end - q_start
+        
+        # Extract query slice
+        q = q_ref[q_start:q_end, :, :]  # [num_queries, num_q_heads, head_dim]
+        
+        # Get page indices for this sequence
+        seq_pages = page_indices_ref[seq_idx, :]  # [pages_per_seq]
+        
+        # Gather and reshape K and V from pages
+        k = k_pages_ref[seq_pages, :, :, :]  # [pages_per_seq, page_size, num_kv_heads, head_dim]
+        k = jnp.reshape(k, (max_seq_len, num_kv_heads, head_dim))  # [max_seq_len, num_kv_heads, head_dim]
+        
+        v = v_pages_ref[seq_pages, :, :, :]  # [pages_per_seq, page_size, num_kv_heads, head_dim]
+        v = jnp.reshape(v, (max_seq_len, num_kv_heads, head_dim))  # [max_seq_len, num_kv_heads, head_dim]
+        
+        # Repeat K and V for GQA (grouped query attention)
+        k = jnp.repeat(k, num_q_per_kv, axis=1)  # [max_seq_len, num_q_heads, head_dim]
+        v = jnp.repeat(v, num_q_per_kv, axis=1)  # [max_seq_len, num_q_heads, head_dim]
+        
+        # Compute attention scores
+        attn = jnp.einsum("qhd,khd->hqk", q, k) * sm_scale  # [num_q_heads, num_queries, max_seq_len]
+        
+        # Get kv_len for this sequence
+        kv_len = kv_lens_ref[seq_idx]
+        
+        # Create causal mask
+        mask = jnp.arange(max_seq_len) < kv_len  # [max_seq_len]
+        # Apply mask: set invalid positions to -inf
+        attn = jnp.where(mask, attn, -1e30)
+        
+        # Softmax along last axis
+        attn = jax.nn.softmax(attn, axis=-1)  # [num_q_heads, num_queries, max_seq_len]
+        
+        # Compute output
+        out = jnp.einsum("hqk,khd->qhd", attn, v)  # [num_queries, head_dim]
+        
+        # Write output
+        out_ref[:num_queries, :, :] = out
+    
+    # Grid is over sequences
+    grid = (num_seqs,)
+    
+    # Output shape
+    out_shape = jax.ShapeDtypeStruct((num_seqs, num_queries, head_dim), queries.dtype)
+    
+    def kernel(seq_idx, q_ref, k_pages_ref, v_pages_ref, 
+               kv_lens_ref, page_indices_ref, cu_q_lens_ref, out_ref):
+        attend_one_seq(seq_idx, q_ref, k_pages_ref, v_pages_ref,
+                       kv_lens_ref, page_indices_ref, cu_q_lens_ref, out_ref)
+    
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((num_seqs, CONFIG["num_query_heads"], head_dim), queries.dtype),
+        grid=grid,
+        in_specs=(
+            pl.BlockSpec((num_seqs, num_q_heads, head_dim), lambda i: (i, 0, 0)),  # queries
+            pl.BlockSpec((16384, 16, num_kv_heads, head_dim), lambda i: (0, 0, 0, 0)),  # k_pages
+            pl.BlockSpec((16384, 16, num_kv_heads, head_dim), lambda i: (0, 0, 0, 0)),  # v_pages
+            pl.BlockSpec((num_seqs,), lambda i: (i,)),  # kv_lens
+            pl.BlockSpec((num_seqs, pages_per_seq), lambda i: (i, 0)),  # page_indices
+            pl.BlockSpec((num_seqs + 1,), lambda i: (i,)),  # cu_q_lens
+        ),
+        out_specs=pl.BlockSpec((num_seqs, num_q_heads, head_dim), lambda i: (i, 0, 0)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",)
+        ),
+    )(queries, k_pages, v_pages, kv_lens, page_indices, cu_q_lens)

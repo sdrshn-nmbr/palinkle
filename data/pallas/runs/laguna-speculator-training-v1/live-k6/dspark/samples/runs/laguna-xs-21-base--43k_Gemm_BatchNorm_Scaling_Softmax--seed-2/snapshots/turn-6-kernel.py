@@ -1,0 +1,172 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as plp
+import jax.interpreters.pallas as pj
+import functools
+
+def workload(x, weight, bias, bn_scale, bn_bias, bn_mean, bn_var, scale):
+    """Gemm + BatchNorm + Scaling + Softmax kernel."""
+    
+    batch_size = x.shape[0]  # 4096
+    in_features = x.shape[1]  # 8192
+    out_features = weight.shape[1]  # 8192
+    
+    # Block size for TPU - use multiples of 8 for bf16
+    block_size = 128
+    
+    def kernel(ref_x, ref_weight, ref_bias, ref_bn_scale, ref_bn_bias, 
+               ref_bn_mean, ref_bn_var, ref_scale, out_ref):
+        """Pallas kernel implementing the fused operation."""
+        
+        m = pl.program_id(0)  # batch dimension
+        n = pl.program_id(1)  # output feature dimension
+        
+        # Compute partial sums for matmul
+        # x[m, :] @ weight[:, n] + bias[n]
+        
+        # Initialize accumulator in float32 for better precision
+        acc = pj.asarray(0.0, dtype=jnp.float32)
+        
+        # Tile over input features
+        for k in pl.tile_loop(in_features, block_size):
+            # Load x[m, k:k+block_size]
+            x_val = ref_x[m, k:k+block_size]
+            # Load weight[k:k+block_size, n]
+            w_val = ref_weight[k:k+block_size, n]
+            # Accumulate matmul
+            acc = acc + pj.asarray(x_val, dtype=jnp.float32) * pj.asarray(w_val, dtype=jnp.float32)
+        
+        # Add bias
+        b_val = ref_bias[n]
+        acc = acc + pj.asarray(b_val, dtype=jnp.float32)
+        
+        # Store intermediate result for batchnorm computation
+        # We need to compute softmax across all rows for each column
+        # This requires a two-pass approach: first compute all values, then softmax
+        
+        # For now, store the pre-softmax value
+        out_ref[m, n] = pj.asarray(acc, dtype=jnp.bfloat16)
+    
+    # First pass: compute matmul + bias
+    def matmul_kernel(ref_x, ref_weight, ref_bias, out_ref):
+        """Compute x @ weight + bias."""
+        m = pl.program_id(0)
+        n = pl.program_id(1)
+        
+        acc = pj.asarray(0.0, dtype=jnp.float32)
+        
+        for k in pl.tile_loop(in_features, block_size):
+            x_val = ref_x[m, k:k+block_size]
+            w_val = ref_weight[k:k+block_size, n]
+            acc = acc + pj.asarray(x_val, dtype=jnp.float32) * pj.asarray(w_val, dtype=jnp.float32)
+        
+        b_val = ref_bias[n]
+        acc = acc + pj.asarray(b_val, dtype=jnp.float32)
+        
+        out_ref[m, n] = pj.asarray(acc, dtype=jnp.bfloat16)
+    
+    # Intermediate output shape
+    intermediate_shape = jax.ShapeDtypeStruct((batch_size, out_features), jnp.bfloat16)
+    
+    # Compute matmul + bias
+    intermediate = pl.pallas_call(
+        matmul_kernel,
+        out_shape=intermediate_shape,
+        grid=(batch_size // block_size, out_features // block_size),
+        in_specs=(
+            pl.BlockSpec((batch_size, block_size), lambda m, n, k: (m, k)),
+            pl.BlockSpec((block_size, out_features), lambda m, n, k: (k, n)),
+            pl.BlockSpec((out_features,), lambda n: (n,)),
+        ),
+        out_specs=pl.BlockSpec((batch_size, out_features), lambda m, n: (m, n)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel")
+        ),
+    )(x, weight, bias)
+    
+    # Now we need to apply batchnorm, scaling, and softmax
+    # For softmax, we need to compute max and sum across axis 1
+    
+    # BatchNorm + Scaling kernel
+    def bn_scale_kernel(ref_intermediate, ref_bn_scale, ref_bn_bias, 
+                        ref_bn_mean, ref_bn_var, ref_scale, out_ref):
+        """Apply batch normalization and scaling."""
+        m = pl.program_id(0)
+        n = pl.program_id(1)
+        
+        bn_eps = 1e-5
+        
+        # Load values
+        x_val = ref_intermediate[m, n]
+        scale_val = ref_scale[0]
+        
+        # Batch normalization: (x - mean) / sqrt(var + eps)
+        x_normalized = (pj.asarray(x_val, dtype=jnp.float32) - pj.asarray(ref_bn_mean[n], dtype=jnp.float32)) / \
+                       pj.asarray(jnp.sqrt(pj.asarray(ref_bn_var[n], dtype=jnp.float32) + bn_eps), dtype=jnp.float32)
+        
+        # Scale and bias
+        x_scaled = pj.asarray(ref_bn_scale[n], dtype=jnp.float32) * x_normalized + pj.asarray(ref_bn_bias[n], dtype=jnp.float32)
+        
+        # Final scaling
+        x_final = pj.asarray(scale_val, dtype=jnp.float32) * x_scaled
+        
+        out_ref[m, n] = pj.asarray(x_final, dtype=jnp.bfloat16)
+    
+    # Apply batchnorm + scaling
+    bn_scaled = pl.pallas_call(
+        bn_scale_kernel,
+        out_shape=intermediate_shape,
+        grid=(batch_size // block_size, out_features // block_size),
+        in_specs=(
+            pl.BlockSpec((batch_size, out_features), lambda m, n: (m, n)),
+            pl.BlockSpec((out_features,), lambda n: (n,)),
+            pl.BlockSpec((out_features,), lambda n: (n,)),
+            pl.BlockSpec((out_features,), lambda n: (n,)),
+            pl.BlockSpec((out_features,), lambda n: (n,)),
+            pl.BlockSpec((1,), lambda: (0,)),
+        ),
+        out_specs=pl.BlockSpec((batch_size, out_features), lambda m, n: (m, n)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel")
+        ),
+    )(intermediate, bn_scale, bn_bias, bn_mean, bn_var, scale)
+    
+    # Softmax kernel - this is tricky because we need to reduce across axis 1
+    def softmax_kernel(ref_input, out_ref):
+        """Apply softmax along axis 1."""
+        m = pl.program_id(0)
+        
+        # Find max for numerical stability
+        max_val = pj.asarray(float('-inf'), dtype=jnp.float32)
+        for n in pl.iter_range(out_features):
+            val = pj.asarray(ref_input[m, n], dtype=jnp.float32)
+            max_val = pl.maximum(max_val, val)
+        
+        # Compute sum of exp(x - max)
+        sum_val = pj.asarray(0.0, dtype=jnp.float32)
+        for n in pl.iter_range(out_features):
+            val = pj.asarray(ref_input[m, n], dtype=jnp.float32)
+            sum_val = sum_val + pj.asarray(jnp.exp(val - max_val), dtype=jnp.float32)
+        
+        # Compute softmax
+        for n in pl.iter_range(out_features):
+            val = pj.asarray(ref_input[m, n], dtype=jnp.float32)
+            result = pj.asarray(jnp.exp(val - max_val), dtype=jnp.float32) / sum_val
+            out_ref[m, n] = pj.asarray(result, dtype=jnp.bfloat16)
+    
+    # Apply softmax
+    result = pl.pallas_call(
+        softmax_kernel,
+        out_shape=jax.ShapeDtypeStruct((batch_size, out_features), jnp.bfloat16),
+        grid=(batch_size // block_size,),
+        in_specs=(
+            pl.BlockSpec((batch_size, out_features), lambda m: (m, 0)),
+        ),
+        out_specs=pl.BlockSpec((batch_size, out_features), lambda m: (m, 0)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",)
+        ),
+    )(bn_scaled)
+    
+    return result

@@ -1,0 +1,69 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..c73372f 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,62 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas.lib as pllib
++import jax.pallas.tpu as pltpu
++
++def workload(x, weight, bias):
++    """
++    Compute: sigmoid(x @ weight + bias).sum(axis=1, keepdims=True)
++    
++    Args:
++        x: shape [4096, 8192], dtype bfloat16
++        weight: shape [8192, 8192], dtype bfloat16
++        bias: shape [8192], dtype bfloat16
++    
++    Returns:
++        shape [4096, 1], dtype bfloat16
++    """
++    block_size = 128
++    grid = (x.shape[0] // block_size,)
++    
++    def kernel(ref_x, ref_weight, ref_bias, ref_out):
++        # Get program ID for row
++        row_idx = pl.program_id(0)
++        
++        # Compute matmul + bias for this row
++        # x[row_idx, :] @ weight + bias
++        x_row = ref_x[row_idx, :]  # [8192]
++        
++        # Compute matmul: result = x_row @ weight
++        # Accumulate in float32 for better precision
++        result = jnp.zeros((weight.shape[1],), dtype=jnp.float32)
++        for k in range(0, x_row.shape[0], block_size):
++            x_block = x_row[k:k+block_size].astype(jnp.float32)
++            w_block = ref_weight[k:k+block_size, :].astype(jnp.float32)
++            result = result + jnp.dot(x_block, w_block)
++        
++        # Add bias
++        result = result + ref_bias.astype(jnp.float32)
++        
++        # Apply sigmoid
++        result = jax.nn.sigmoid(result)
++        
++        # Sum along the last axis
++        result = jnp.sum(result, axis=0, keepdims=True)
++        
++        ref_out[...] = result.astype(ref_out.dtype)
++    
++    return pl.pallas_call(
++        kernel,
++        out_shape=jax.ShapeDtypeStruct((x.shape[0], 1), x.dtype),
++        grid=grid,
++        in_specs=(
++            pl.BlockSpec((x.shape[0], x.shape[1]), lambda _: (0, 0)),
++            pl.BlockSpec((weight.shape[0], weight.shape[1]), lambda _: (0, 0)),
++            pl.BlockSpec((bias.shape[0],), lambda _: (0,)),
++        ),
++        out_specs=pl.BlockSpec((x.shape[0], 1), lambda i: (i, 0)),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel",)
++        ),
++    )(x, weight, bias)

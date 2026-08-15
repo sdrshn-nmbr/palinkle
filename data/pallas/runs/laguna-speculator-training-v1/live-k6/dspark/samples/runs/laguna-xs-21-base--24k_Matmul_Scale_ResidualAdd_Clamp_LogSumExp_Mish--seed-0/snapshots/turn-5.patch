@@ -1,0 +1,78 @@
+diff --git a/kernel.py b/kernel.py
+index a877f2f..e4a6663 100644
+--- a/kernel.py
++++ b/kernel.py
+@@ -1,2 +1,71 @@
+-def workload(*inputs):
+-    ...
++import jax
++import jax.numpy as jnp
++import jax.pallas as pl
++import jax.pallas.lib as pllib
++import jax.pallas.triton as pltr
++import jax.pallas.tpu as pltpu
++
++
++def workload(x, weight, bias):
++    """TPU Pallas kernel for Matmul + Scale + ResidualAdd + Clamp + LogSumExp + Mish."""
++    
++    # Output shape: [4096, 1]
++    out_shape = jax.ShapeDtypeStruct((4096, 1), x.dtype)
++    
++    # Block size for tiling
++    block = 128
++    
++    def kernel(ref_x, ref_weight, ref_bias, ref_out):
++        # Matmul: x @ weight + bias
++        # x is [4096, 8192], weight is [8192, 8192], bias is [8192]
++        # Output of matmul is [4096, 8192]
++        
++        # Accumulate in float32 for better precision
++        acc = jnp.zeros((8192,), jnp.float32)
++        
++        # Tile the matmul along the reduction dimension
++        for k in range(0, 8192, block):
++            x_block = ref_x[k:k+block, :].astype(jnp.float32)
++            weight_block = ref_weight[k:k+block, :].astype(jnp.float32)
++            acc = acc + jnp.sum(x_block * weight_block, axis=0)
++        
++        # Add bias
++        acc = acc + ref_bias.astype(jnp.float32)
++        
++        # Scale by 2.0
++        acc = acc * 2.0
++        
++        # ResidualAdd: add to itself (x + x)
++        acc = acc + acc
++        
++        # Clamp between -10.0 and 10.0
++        acc = jnp.clip(acc, -10.0, 10.0)
++        
++        # LogSumExp along axis 0 (since we're working with a single row)
++        # For a 1D array, logsumexp gives a scalar
++        lse = jnp.logsumexp(acc, axis=0, keepdims=False)
++        
++        # Mish: x * tanh(logaddexp(x, 0.0))
++        softplus = jnp.logaddexp(lse, 0.0)
++        mish = lse * jnp.tanh(softplus)
++        
++        # Write output
++        ref_out[...] = mish.astype(x.dtype)
++    
++    # Grid: one block per output row
++    grid = (4096,)
++    
++    return pl.pallas_call(
++        kernel,
++        out_shape=out_shape,
++        grid=grid,
++        in_specs=(
++            pl.BlockSpec((8192, 8192), lambda i: (0, 0)),  # x
++            pl.BlockSpec((8192, 8192), lambda i: (0, 0)),  # weight
++            pl.BlockSpec((8192,), lambda i: (0,)),         # bias
++        ),
++        out_specs=pl.BlockSpec((1,), lambda i: (i, 0)),
++        compiler_params=pltpu.CompilerParams(
++            dimension_semantics=("parallel",)
++        ),
++    )(x, weight, bias)

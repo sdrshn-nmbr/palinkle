@@ -1,0 +1,61 @@
+import jax
+import jax.numpy as jnp
+import jax.pallas as pl
+import jax.pallas as plp
+import jax.interpreters.tpu as pltpu
+
+def workload(x, weight, bias):
+    """Matmul + Mish + Mish kernel."""
+    block_m = 128
+    block_n = 128
+    block_k = 128
+    
+    def kernel(matmul_ref, out_ref):
+        # Matmul: x @ weight + bias
+        # Accumulate in float32 for better precision
+        acc = jnp.zeros((block_m, block_n), dtype=jnp.float32)
+        
+        # Iterate over K dimension
+        for k_start in range(0, x.shape[1], block_k):
+            k_end = min(k_start + block_k, x.shape[1])
+            
+            # Load blocks from x and weight
+            x_block = matmul_ref[k_start:k_end].astype(jnp.float32)
+            w_block = weight[:, k_start:k_end].astype(jnp.float32)
+            
+            # Compute partial matmul
+            acc += jnp.dot(x_block, w_block)
+        
+        # Add bias (broadcast along M dimension)
+        acc = acc + bias.astype(jnp.float32)
+        
+        # Convert back to bfloat16 for Mish computation
+        acc_bf16 = acc.astype(jnp.bfloat16)
+        
+        # Mish: x * tanh(softplus(x))
+        def mish(x):
+            return x * jnp.tanh(jnp.nn.softplus(x))
+        
+        # Apply Mish twice
+        result = mish(mish(acc_bf16))
+        
+        out_ref[...] = result
+    
+    # Grid dimensions
+    grid_m = (x.shape[0] + block_m - 1) // block_m
+    grid_n = (x.shape[1] + block_n - 1) // block_n
+    
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((x.shape[0], x.shape[1]), x.dtype),
+        grid=(grid_m, grid_n),
+        in_specs=(
+            pl.BlockSpec((block_m, block_k), lambda i, j: (i * block_m, j * block_k)),
+            pl.BlockSpec((block_k, block_n), lambda i, j: (0, j * block_n)),
+            pl.BlockSpec((block_n,), lambda i, j: (j * block_n,)),
+        ),
+        out_specs=pl.BlockSpec((block_m, block_n), lambda i, j: (i * block_m, j * block_n)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel")
+        ),
+    )(x, weight, bias)
