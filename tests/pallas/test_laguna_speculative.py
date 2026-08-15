@@ -81,6 +81,33 @@ def test_runtime_identity_rejects_wrong_checkpoint() -> None:
         )
 
 
+def test_runtime_identity_accepts_only_dspark_config_normalization() -> None:
+    selection = {
+        "arm": DSPARK,
+        "checkpoint": {
+            "sha256": "selected",
+            "files": {"config.json": "source", "model.safetensors": "weights"},
+        },
+        "sha256": "selection",
+    }
+    result = {"arm": DSPARK, "model_identity": selection}
+    runtime_checkpoint = {
+        "sha256": "served",
+        "path": "/tmp/opjax-dspark/snapshot",
+        "files": {"config.json": "normalized", "model.safetensors": "weights"},
+    }
+    bound = bind_trained_runtime_identity(
+        result=result,
+        runtime=_runtime(DSPARK, runtime_checkpoint),
+        runtime_file_sha256="file",
+        selection=selection,
+    )
+    assert (
+        bound["runtime_evidence"]["checkpoint_transform"]
+        == "normalized_dspark_serving_config"
+    )
+
+
 def test_model_manifest_pins_all_three_arms() -> None:
     manifest = validate_model_manifest()
     assert manifest["target"]["revision"] == (

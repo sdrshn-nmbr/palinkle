@@ -114,7 +114,6 @@ def _runtime_evidence(cell: str) -> tuple[dict[str, Any], str]:
         environment_name=MODAL_ENVIRONMENT,
         version=1,
     )
-    volume.reload()
     raw = b"".join(volume.read_file(_runtime_path(cell)))
     if not raw:
         raise ValueError(f"LAGUNA_RUNTIME_EVIDENCE_EMPTY:{cell}")

@@ -450,6 +450,7 @@ def bind_trained_runtime_identity(
         raise LagunaSpeculativeError("LAGUNA_RUNTIME_ARM_MISMATCH")
     checkpoint = runtime.get("draft_checkpoint")
     alignment = runtime.get("runtime_alignment")
+    checkpoint_transform = None
     if arm == PLAIN:
         if selection is not None or checkpoint is not None or alignment is not None:
             raise LagunaSpeculativeError("LAGUNA_PLAIN_RUNTIME_IDENTITY_INVALID")
@@ -458,7 +459,20 @@ def bind_trained_runtime_identity(
             raise LagunaSpeculativeError("LAGUNA_REPLAY_SELECTION_IDENTITY_MISMATCH")
         expected_checkpoint = selection.get("checkpoint")
         if checkpoint != expected_checkpoint:
-            raise LagunaSpeculativeError("LAGUNA_RUNTIME_CHECKPOINT_MISMATCH")
+            expected_files = (expected_checkpoint or {}).get("files") or {}
+            runtime_files = (checkpoint or {}).get("files") or {}
+            if not (
+                arm == DSPARK
+                and runtime_files.get("model.safetensors")
+                == expected_files.get("model.safetensors")
+                and runtime_files.get("config.json")
+                and runtime_files.get("config.json") != expected_files.get("config.json")
+                and str((checkpoint or {}).get("path", "")).startswith(
+                    "/tmp/opjax-dspark/"
+                )
+            ):
+                raise LagunaSpeculativeError("LAGUNA_RUNTIME_CHECKPOINT_MISMATCH")
+            checkpoint_transform = "normalized_dspark_serving_config"
         if arm == DFLASH:
             if not isinstance(alignment, dict) or alignment.get("state") not in {
                 "applied",
@@ -472,6 +486,7 @@ def bind_trained_runtime_identity(
         "runtime_sha256": runtime["sha256"],
         "runtime_file_sha256": runtime_file_sha256,
         "draft_checkpoint": checkpoint,
+        "checkpoint_transform": checkpoint_transform,
         "runtime_alignment": alignment,
         "execution_sources": runtime.get("execution_sources"),
         "image": runtime.get("image"),
