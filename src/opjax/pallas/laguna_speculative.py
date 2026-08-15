@@ -582,7 +582,8 @@ def bind_released_runtime_identity(
         raise LagunaSpeculativeError("LAGUNA_RELEASED_RUNTIME_ARM_MISMATCH")
     manifest = validate_model_manifest()
     expected_identity = {"released_manifest_sha256": manifest["manifest_sha256"]}
-    if result.get("model_identity") != expected_identity:
+    existing_identity = result.get("model_identity")
+    if existing_identity not in (None, expected_identity):
         raise LagunaSpeculativeError("LAGUNA_RELEASED_MODEL_IDENTITY_MISMATCH")
     checkpoint = runtime.get("draft_checkpoint")
     alignment = runtime.get("runtime_alignment")
@@ -617,6 +618,7 @@ def bind_released_runtime_identity(
         ):
             raise LagunaSpeculativeError("LAGUNA_RELEASED_DSPARK_RUNTIME_INVALID")
     bound = dict(result)
+    bound["model_identity"] = expected_identity
     bound["runtime_evidence"] = {
         "runtime_sha256": runtime["sha256"],
         "runtime_file_sha256": runtime_file_sha256,
@@ -627,6 +629,7 @@ def bind_released_runtime_identity(
         "execution_sources": runtime.get("execution_sources"),
         "image": runtime.get("image"),
         "vllm_observed_build": runtime.get("vllm_observed_build"),
+        "model_identity_recovered_from_runtime": existing_identity is None,
     }
     bound["result_sha256"] = canonical_sha256(
         {key: value for key, value in bound.items() if key != "result_sha256"}

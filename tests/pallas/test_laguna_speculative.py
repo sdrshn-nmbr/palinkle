@@ -207,6 +207,14 @@ def test_released_dflash_requires_unmodified_runtime() -> None:
         runtime_file_sha256="file",
     )
     assert bound["runtime_evidence"]["draft_source"] == source
+    assert bound["runtime_evidence"]["model_identity_recovered_from_runtime"] is False
+    recovered = bind_released_runtime_identity(
+        result={"arm": DFLASH},
+        runtime=runtime,
+        runtime_file_sha256="file",
+    )
+    assert recovered["model_identity"] == result["model_identity"]
+    assert recovered["runtime_evidence"]["model_identity_recovered_from_runtime"]
     runtime["runtime_alignment"] = {"state": "applied"}
     runtime["sha256"] = canonical_sha256(
         {key: value for key, value in runtime.items() if key != "sha256"}
