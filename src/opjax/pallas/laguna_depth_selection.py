@@ -44,6 +44,26 @@ def select_depth(summary_path: Path, arm: str) -> dict[str, Any]:
             row["depth"],
         ),
     )
+    adaptive = summary["cells"].get("dspark-adaptive") if arm == "dspark" else None
+    adaptive_decision = None
+    if adaptive is not None:
+        adaptive_decision = {
+            "cell": "dspark-adaptive",
+            "requests": int(adaptive["requests"]),
+            "wall_s": float(adaptive["wall_s"]),
+            "exact_plain_matches": int(adaptive["exact_plain_matches"]),
+            "result_sha256": adaptive["result_sha256"],
+            "admitted": (
+                int(adaptive["requests"]) == selected["requests"]
+                and float(adaptive["wall_s"]) < selected["wall_s"]
+                and int(adaptive["exact_plain_matches"])
+                >= selected["exact_plain_matches"]
+            ),
+            "policy": (
+                "admit only when fixed-request wall time improves without fewer "
+                "exact plain matches"
+            ),
+        }
     result = {
         "schema_version": 1,
         "arm": arm,
@@ -55,6 +75,7 @@ def select_depth(summary_path: Path, arm: str) -> dict[str, Any]:
         "selected_depth": selected["depth"],
         "selected": selected,
         "candidates": sorted(rows, key=lambda row: row["depth"]),
+        "adaptive": adaptive_decision,
     }
     result["sha256"] = canonical_sha256(result)
     return result

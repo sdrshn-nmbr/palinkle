@@ -32,6 +32,18 @@ def _summary(path: Path, split: str = "calibration") -> None:
                 "exact_plain_matches": 11,
                 "result_sha256": "twelve",
             },
+            "dspark-4": {
+                "requests": 18,
+                "wall_s": 10.0,
+                "exact_plain_matches": 12,
+                "result_sha256": "dspark-four",
+            },
+            "dspark-adaptive": {
+                "requests": 18,
+                "wall_s": 11.0,
+                "exact_plain_matches": 12,
+                "result_sha256": "dspark-adaptive",
+            },
         },
     }
     path.write_text(json.dumps(payload))
@@ -49,3 +61,11 @@ def test_rejects_heldout_selection(tmp_path: Path) -> None:
     _summary(path, split="heldout")
     with pytest.raises(ValueError, match="REQUIRES_CALIBRATION"):
         select_depth(path, "dflash")
+
+
+def test_rejects_slower_adaptive_schedule(tmp_path: Path) -> None:
+    path = tmp_path / "summary.json"
+    _summary(path)
+    result = select_depth(path, "dspark")
+    assert result["selected_depth"] == 4
+    assert result["adaptive"]["admitted"] is False
