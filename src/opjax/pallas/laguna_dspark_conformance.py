@@ -180,6 +180,57 @@ def build_dflash_conformance_report(
     return report
 
 
+def _validate_capture_manifest(*, root: Path, manifest: dict[str, Any]) -> None:
+    expected = canonical_sha256(
+        {key: value for key, value in manifest.items() if key != "manifest_sha256"}
+    )
+    if manifest.get("manifest_sha256") != expected:
+        raise ConformanceError(f"CAPTURE_MANIFEST_HASH_MISMATCH:{root.name}")
+    artifacts = list(manifest.get("boundaries", {}).values())
+    trace = manifest.get("trace")
+    if trace is not None:
+        artifacts.append(trace)
+    artifacts.extend(manifest.get("profiles") or [])
+    server_log = manifest.get("server_log")
+    if server_log is not None:
+        artifacts.append(server_log)
+    for item in artifacts:
+        path = root / item["path"]
+        if not path.is_file():
+            raise ConformanceError(f"CAPTURE_ARTIFACT_MISSING:{path}")
+        if file_sha256(path) != item["sha256"]:
+            raise ConformanceError(f"CAPTURE_ARTIFACT_HASH_MISMATCH:{path}")
+
+
+def validate_dflash_conformance_report(
+    report: dict[str, Any], *, root: Path
+) -> None:
+    expected = canonical_sha256(
+        {key: value for key, value in report.items() if key != "sha256"}
+    )
+    if report.get("sha256") != expected:
+        raise ConformanceError("DFLASH_REPORT_HASH_MISMATCH")
+    if report.get("kind") != "opjax_laguna_dflash_differential_conformance":
+        raise ConformanceError("DFLASH_REPORT_KIND_INVALID")
+    source = json.loads((root / "source" / "manifest.json").read_text())
+    adapter = json.loads((root / "adapter" / "manifest.json").read_text())
+    _validate_capture_manifest(root=root / "source", manifest=source)
+    _validate_capture_manifest(root=root / "adapter", manifest=adapter)
+    if source["manifest_sha256"] != report.get("source_manifest_sha256"):
+        raise ConformanceError("DFLASH_SOURCE_MANIFEST_MISMATCH")
+    if adapter["manifest_sha256"] != report.get("adapter_manifest_sha256"):
+        raise ConformanceError("DFLASH_ADAPTER_MANIFEST_MISMATCH")
+    if not adapter.get("profiles"):
+        raise ConformanceError("DFLASH_PROFILE_EVIDENCE_MISSING")
+    if report.get("boundaries") != list(DFLASH_BOUNDARIES):
+        raise ConformanceError("DFLASH_BOUNDARIES_INVALID")
+    if report.get("passed") is not True or not all(
+        comparison.get("passed") is True
+        for comparison in report.get("comparisons", {}).values()
+    ):
+        raise ConformanceError("DFLASH_CONFORMANCE_FAILED")
+
+
 def build_conformance_report(
     *,
     source_root: Path,

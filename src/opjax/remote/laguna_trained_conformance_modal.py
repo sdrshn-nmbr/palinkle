@@ -10,6 +10,7 @@ import modal
 from opjax.pallas.laguna_dspark_conformance import (
     build_conformance_report,
     build_dflash_conformance_report,
+    validate_dflash_conformance_report,
 )
 from opjax.pallas.laguna_speculative import TARGET_ID, TARGET_REVISION
 from opjax.remote.config import (
@@ -185,6 +186,7 @@ def compare(run_id: str, arm: str) -> dict[str, object]:
             adapter_root=adapter_root,
             adapter_capture=adapter,
         )
+        validate_dflash_conformance_report(report, root=root)
     else:
         report = build_conformance_report(
             source_root=source_root,

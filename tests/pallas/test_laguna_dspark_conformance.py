@@ -16,6 +16,7 @@ from opjax.pallas.laguna_dspark_conformance import (
     canonical_sha256,
     finalize_conformance,
     validate_conformance_report,
+    validate_dflash_conformance_report,
 )
 from opjax.remote.laguna_dspark_capture import (
     capture_is_configured,
@@ -127,6 +128,35 @@ def test_dflash_requires_exact_proposal_tokens(tmp_path: Path) -> None:
         adapter_capture=adapter,
     )
     assert report["passed"] is False
+
+
+def test_dflash_validator_binds_profiles_and_manifests(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    adapter_root = tmp_path / "adapter"
+    source = _capture(source_root)
+    adapter = _capture(adapter_root)
+    source["boundaries"] = {
+        name: source["boundaries"][name] for name in DFLASH_BOUNDARIES
+    }
+    adapter["boundaries"] = {
+        name: adapter["boundaries"][name] for name in DFLASH_BOUNDARIES
+    }
+    profile = adapter_root / "profile.json.gz"
+    profile.write_bytes(b"profile")
+    adapter["profiles"] = [_write_array_bytes(profile)]
+    for root, manifest in ((source_root, source), (adapter_root, adapter)):
+        manifest["manifest_sha256"] = canonical_sha256(manifest)
+        (root / "manifest.json").write_text(json.dumps(manifest))
+    report = build_dflash_conformance_report(
+        source_root=source_root,
+        source_capture=source,
+        adapter_root=adapter_root,
+        adapter_capture=adapter,
+    )
+    validate_dflash_conformance_report(report, root=tmp_path)
+    profile.write_bytes(b"drift")
+    with pytest.raises(ConformanceError, match="CAPTURE_ARTIFACT_HASH_MISMATCH"):
+        validate_dflash_conformance_report(report, root=tmp_path)
 
 
 def test_token_mismatch_fails_closed(tmp_path: Path) -> None:
