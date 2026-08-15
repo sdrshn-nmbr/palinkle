@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from opjax.pallas.laguna_speculative import DFLASH
 from opjax.remote.laguna_vllm_entrypoint import (
+    _apply_runtime_alignment,
     _checkpoint_identity,
     _find_vllm_utils_path,
     _patch_dflash_source_alignment,
@@ -85,6 +87,17 @@ def test_dflash_runtime_alignment_patch_fails_on_unknown_source(
         assert "LAGUNA_DFLASH_ALIGNMENT_SOURCE_MISMATCH" in str(exc)
     else:
         raise AssertionError("unknown vLLM source must fail closed")
+
+
+def test_released_dflash_does_not_receive_trained_alignment() -> None:
+    arguments = [
+        "--speculative-config",
+        json.dumps({"method": "dflash", "model": "poolside/released"}),
+    ]
+    assert _apply_runtime_alignment(DFLASH, arguments) == {
+        "state": "not_required_released_checkpoint",
+        "model": "poolside/released",
+    }
 
 
 def test_vllm_source_discovery_uses_launcher_interpreter(tmp_path: Path) -> None:

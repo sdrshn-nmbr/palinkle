@@ -208,9 +208,18 @@ def _find_vllm_utils_path(launcher: Path) -> Path:
     return candidates[0]
 
 
-def _apply_runtime_alignment(arm: str) -> dict[str, Any] | None:
+def _apply_runtime_alignment(
+    arm: str, arguments: list[str]
+) -> dict[str, Any] | None:
     if arm != DFLASH:
         return None
+    config = json.loads(arguments[arguments.index("--speculative-config") + 1])
+    draft_model = Path(str(config["model"]))
+    if not draft_model.is_dir():
+        return {
+            "state": "not_required_released_checkpoint",
+            "model": str(config["model"]),
+        }
     executable = shutil.which("vllm")
     if executable is None:
         raise RuntimeError("LAGUNA_VLLM_LAUNCHER_NOT_FOUND")
@@ -270,7 +279,7 @@ def _write_runtime_fingerprint(
 
 def main() -> None:
     arguments, arm = _rewrite_speculative_config(sys.argv[1:])
-    runtime_alignment = _apply_runtime_alignment(arm)
+    runtime_alignment = _apply_runtime_alignment(arm, arguments)
     artifact_root = Path(os.environ.get("OPJAX_SPEC_ARTIFACT_ROOT", "/tmp/opjax-spec"))
     run_id = os.environ.get("OPJAX_SPEC_RUN_ID") or uuid.uuid4().hex
     artifact_dir = artifact_root / arm / run_id
