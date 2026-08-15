@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import importlib.util
 import os
 import platform
 import subprocess
@@ -18,6 +19,7 @@ from huggingface_hub import snapshot_download
 import modal
 
 from opjax.pallas.laguna_speculative import (
+    DFLASH,
     DSPARK_ID,
     DSPARK_REVISION,
     VLLM_IMAGE,
@@ -25,6 +27,17 @@ from opjax.pallas.laguna_speculative import (
     canonical_sha256,
     normalize_dspark_config,
 )
+
+DFLASH_SAMPLE_SOURCE = """    # --- Token indices to sample (mask tokens, skip the bonus token) ---
+    is_sample = is_query & (query_off > 0)
+    sample_out_idx = req_idx * num_speculative_tokens + (query_off - 1)
+"""
+DFLASH_SAMPLE_REPLACEMENT = """    # --- Token indices aligned with DeepSpec training ---
+    # The known bonus token predicts draft position zero. Sample it through the
+    # penultimate mask and leave the final mask as lookahead-only context.
+    is_sample = is_query & (query_off < num_speculative_tokens)
+    sample_out_idx = req_idx * num_speculative_tokens + query_off
+"""
 
 
 def _prepare_dspark_snapshot(
@@ -141,8 +154,47 @@ def _checkpoint_identity(arguments: list[str]) -> dict[str, Any] | None:
     }
 
 
+def _patch_dflash_source_alignment(path: Path) -> dict[str, Any]:
+    before = path.read_text(encoding="utf-8")
+    before_sha256 = hashlib.sha256(before.encode()).hexdigest()
+    if DFLASH_SAMPLE_SOURCE in before:
+        after = before.replace(
+            DFLASH_SAMPLE_SOURCE,
+            DFLASH_SAMPLE_REPLACEMENT,
+            1,
+        )
+        path.write_text(after, encoding="utf-8")
+        state = "applied"
+    elif DFLASH_SAMPLE_REPLACEMENT in before:
+        after = before
+        state = "already_applied"
+    else:
+        raise RuntimeError(
+            f"LAGUNA_DFLASH_ALIGNMENT_SOURCE_MISMATCH:{path}:{before_sha256}"
+        )
+    return {
+        "path": str(path),
+        "state": state,
+        "before_sha256": before_sha256,
+        "after_sha256": hashlib.sha256(after.encode()).hexdigest(),
+    }
+
+
+def _apply_runtime_alignment(arm: str) -> dict[str, Any] | None:
+    if arm != DFLASH:
+        return None
+    spec = importlib.util.find_spec("vllm.v1.spec_decode.utils")
+    if spec is None or spec.origin is None:
+        raise RuntimeError("LAGUNA_DFLASH_ALIGNMENT_SOURCE_NOT_FOUND")
+    return _patch_dflash_source_alignment(Path(spec.origin))
+
+
 def _write_runtime_fingerprint(
-    *, artifact_dir: Path, arm: str, arguments: list[str]
+    *,
+    artifact_dir: Path,
+    arm: str,
+    arguments: list[str],
+    runtime_alignment: dict[str, Any] | None,
 ) -> None:
     artifact_dir.mkdir(parents=True, exist_ok=True)
     version_result = subprocess.run(
@@ -173,6 +225,7 @@ def _write_runtime_fingerprint(
         "argv": sys.argv,
         "resolved_arguments": arguments,
         "draft_checkpoint": _checkpoint_identity(arguments),
+        "runtime_alignment": runtime_alignment,
         "execution_sources": {
             str(path.relative_to(Path(__file__).parents[2])): hashlib.sha256(
                 path.read_bytes()
@@ -189,10 +242,16 @@ def _write_runtime_fingerprint(
 
 def main() -> None:
     arguments, arm = _rewrite_speculative_config(sys.argv[1:])
+    runtime_alignment = _apply_runtime_alignment(arm)
     artifact_root = Path(os.environ.get("OPJAX_SPEC_ARTIFACT_ROOT", "/tmp/opjax-spec"))
     run_id = os.environ.get("OPJAX_SPEC_RUN_ID") or uuid.uuid4().hex
     artifact_dir = artifact_root / arm / run_id
-    _write_runtime_fingerprint(artifact_dir=artifact_dir, arm=arm, arguments=arguments)
+    _write_runtime_fingerprint(
+        artifact_dir=artifact_dir,
+        arm=arm,
+        arguments=arguments,
+        runtime_alignment=runtime_alignment,
+    )
     _start_gpu_telemetry(artifact_dir=artifact_dir)
     _start_artifact_commits()
     os.execvp("vllm", ["vllm", "serve", *arguments])

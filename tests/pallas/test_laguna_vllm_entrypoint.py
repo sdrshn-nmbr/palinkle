@@ -5,7 +5,10 @@ from pathlib import Path
 
 from opjax.remote.laguna_vllm_entrypoint import (
     _checkpoint_identity,
+    _patch_dflash_source_alignment,
     _prepare_dspark_snapshot,
+    DFLASH_SAMPLE_REPLACEMENT,
+    DFLASH_SAMPLE_SOURCE,
 )
 
 
@@ -54,3 +57,30 @@ def test_checkpoint_identity_binds_config_and_weights(tmp_path: Path) -> None:
     second = _checkpoint_identity(arguments)
     assert second is not None
     assert first["sha256"] != second["sha256"]
+
+
+def test_dflash_runtime_alignment_patch_is_exact_and_idempotent(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "utils.py"
+    source.write_text(f"prefix\n{DFLASH_SAMPLE_SOURCE}suffix\n")
+    first = _patch_dflash_source_alignment(source)
+    assert first["state"] == "applied"
+    assert DFLASH_SAMPLE_SOURCE not in source.read_text()
+    assert DFLASH_SAMPLE_REPLACEMENT in source.read_text()
+    second = _patch_dflash_source_alignment(source)
+    assert second["state"] == "already_applied"
+    assert second["after_sha256"] == first["after_sha256"]
+
+
+def test_dflash_runtime_alignment_patch_fails_on_unknown_source(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "utils.py"
+    source.write_text("unknown source")
+    try:
+        _patch_dflash_source_alignment(source)
+    except RuntimeError as exc:
+        assert "LAGUNA_DFLASH_ALIGNMENT_SOURCE_MISMATCH" in str(exc)
+    else:
+        raise AssertionError("unknown vLLM source must fail closed")

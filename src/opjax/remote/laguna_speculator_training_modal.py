@@ -6,7 +6,10 @@ from pathlib import Path
 import subprocess
 import time
 
+from huggingface_hub import snapshot_download
 import modal
+from safetensors import safe_open
+import torch
 
 from opjax.remote.config import (
     HF_CACHE_DIR,
@@ -98,6 +101,8 @@ OPTIONS = {
     "secrets": [secret],
     "timeout": 86_400,
 }
+TARGET_ID = "poolside/Laguna-XS-2.1"
+TARGET_REVISION = "e9df9a59996d790b94b70f3fef343fe1d9e34bdf"
 
 
 def _sha256(path: Path) -> str:
@@ -124,6 +129,61 @@ def _checkpoint_identity(path: Path) -> dict[str, object]:
             json.dumps(files, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest(),
     }
+
+
+@app.function(image=image, volumes=VOLUMES, secrets=[secret], timeout=3600, memory=8192)
+def audit_dflash_head(step: int) -> dict[str, object]:
+    checkpoint = ROOT / "checkpoints" / "dflash" / f"step_{step}"
+    index_root = Path(
+        snapshot_download(
+            TARGET_ID,
+            revision=TARGET_REVISION,
+            allow_patterns=["model.safetensors.index.json"],
+        )
+    )
+    index = json.loads(
+        (index_root / "model.safetensors.index.json").read_text(encoding="utf-8")
+    )
+    shard_name = index["weight_map"]["lm_head.weight"]
+    target_root = Path(
+        snapshot_download(
+            TARGET_ID,
+            revision=TARGET_REVISION,
+            allow_patterns=["model.safetensors.index.json", shard_name],
+        )
+    )
+    with safe_open(
+        target_root / shard_name, framework="pt", device="cpu"
+    ) as target_handle:
+        target = target_handle.get_tensor("lm_head.weight")
+    with safe_open(
+        checkpoint / "model.safetensors", framework="pt", device="cpu"
+    ) as checkpoint_handle:
+        candidate = checkpoint_handle.get_tensor("lm_head.weight")
+    if target.shape != candidate.shape or target.dtype != candidate.dtype:
+        raise RuntimeError(
+            f"LAGUNA_DFLASH_HEAD_SHAPE_INVALID:{target.shape}:{candidate.shape}:"
+            f"{target.dtype}:{candidate.dtype}"
+        )
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "step": step,
+        "target_revision": TARGET_REVISION,
+        "target_shard": shard_name,
+        "target_shard_sha256": _sha256(target_root / shard_name),
+        "checkpoint_sha256": _sha256(checkpoint / "model.safetensors"),
+        "shape": list(target.shape),
+        "dtype": str(target.dtype),
+        "exact_equal": bool(torch.equal(target, candidate)),
+        "max_abs_error": float((target.float() - candidate.float()).abs().max()),
+    }
+    output = ROOT / "runs" / "audit" / "dflash" / f"step_{step}"
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "head-parity.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    training.commit()
+    return payload
 
 
 def _execution_hashes() -> dict[str, str]:

@@ -477,6 +477,25 @@ def _request(
                 flush=True,
             )
             time.sleep(attempt)
+        except (TimeoutError, urllib.error.URLError) as exc:
+            errors.append(
+                {
+                    "attempt": attempt,
+                    "status": "transport",
+                    "detail": str(exc)[:1000],
+                }
+            )
+            if attempt == 3:
+                raise LagunaSpeculativeError(
+                    f"LAGUNA_BENCHMARK_TRANSPORT_ERROR:{record['prompt_id']}:{exc}"
+                ) from exc
+            print(
+                "LAGUNA_BENCHMARK_TRANSIENT_RETRY "
+                f"prompt={record['prompt_id']} attempt={attempt} transport={exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(attempt)
     elapsed = time.perf_counter() - started
     usage = payload.get("usage") or {}
     choice = (payload.get("choices") or [{}])[0]
