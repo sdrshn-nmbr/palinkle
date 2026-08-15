@@ -14,6 +14,7 @@ from opjax.pallas.laguna_speculative import (
     LagunaSpeculativeError,
     PLAIN,
     build_replay_corpus,
+    bind_trained_runtime_identity,
     canonical_sha256,
     canonical_response_signature,
     normalize_dspark_config,
@@ -23,6 +24,61 @@ from opjax.pallas.laguna_speculative import (
     server_command,
     validate_model_manifest,
 )
+
+
+def _runtime(arm: str, checkpoint: dict[str, object] | None) -> dict[str, object]:
+    runtime: dict[str, object] = {
+        "schema_version": 1,
+        "arm": arm,
+        "draft_checkpoint": checkpoint,
+        "runtime_alignment": (
+            {"state": "applied", "after_sha256": "patched"}
+            if arm == DFLASH
+            else None
+        ),
+        "execution_sources": {"entrypoint.py": "source"},
+        "image": "image",
+        "vllm_observed_build": "build",
+    }
+    runtime["sha256"] = canonical_sha256(runtime)
+    return runtime
+
+
+def test_runtime_identity_binds_actual_selected_checkpoint() -> None:
+    checkpoint = {"sha256": "checkpoint", "files": {"model": "weights"}}
+    selection = {"arm": DFLASH, "checkpoint": checkpoint, "sha256": "selection"}
+    result = {
+        "arm": DFLASH,
+        "model_identity": selection,
+        "result_sha256": "old",
+    }
+    bound = bind_trained_runtime_identity(
+        result=result,
+        runtime=_runtime(DFLASH, checkpoint),
+        runtime_file_sha256="file",
+        selection=selection,
+    )
+    assert bound["runtime_evidence"]["draft_checkpoint"] == checkpoint
+    assert bound["runtime_evidence"]["runtime_alignment"]["state"] == "applied"
+    assert bound["result_sha256"] == canonical_sha256(
+        {key: value for key, value in bound.items() if key != "result_sha256"}
+    )
+
+
+def test_runtime_identity_rejects_wrong_checkpoint() -> None:
+    selection = {
+        "arm": DSPARK,
+        "checkpoint": {"sha256": "selected"},
+        "sha256": "selection",
+    }
+    result = {"arm": DSPARK, "model_identity": selection}
+    with pytest.raises(LagunaSpeculativeError, match="RUNTIME_CHECKPOINT_MISMATCH"):
+        bind_trained_runtime_identity(
+            result=result,
+            runtime=_runtime(DSPARK, {"sha256": "served"}),
+            runtime_file_sha256="file",
+            selection=selection,
+        )
 
 
 def test_model_manifest_pins_all_three_arms() -> None:

@@ -433,6 +433,56 @@ def canonical_response_signature(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def bind_trained_runtime_identity(
+    *,
+    result: dict[str, Any],
+    runtime: dict[str, Any],
+    runtime_file_sha256: str,
+    selection: dict[str, Any] | None,
+) -> dict[str, Any]:
+    expected_runtime_sha256 = canonical_sha256(
+        {key: value for key, value in runtime.items() if key != "sha256"}
+    )
+    if runtime.get("sha256") != expected_runtime_sha256:
+        raise LagunaSpeculativeError("LAGUNA_RUNTIME_FINGERPRINT_HASH_MISMATCH")
+    arm = result.get("arm")
+    if runtime.get("arm") != arm:
+        raise LagunaSpeculativeError("LAGUNA_RUNTIME_ARM_MISMATCH")
+    checkpoint = runtime.get("draft_checkpoint")
+    alignment = runtime.get("runtime_alignment")
+    if arm == PLAIN:
+        if selection is not None or checkpoint is not None or alignment is not None:
+            raise LagunaSpeculativeError("LAGUNA_PLAIN_RUNTIME_IDENTITY_INVALID")
+    else:
+        if selection is None or result.get("model_identity") != selection:
+            raise LagunaSpeculativeError("LAGUNA_REPLAY_SELECTION_IDENTITY_MISMATCH")
+        expected_checkpoint = selection.get("checkpoint")
+        if checkpoint != expected_checkpoint:
+            raise LagunaSpeculativeError("LAGUNA_RUNTIME_CHECKPOINT_MISMATCH")
+        if arm == DFLASH:
+            if not isinstance(alignment, dict) or alignment.get("state") not in {
+                "applied",
+                "already_applied",
+            }:
+                raise LagunaSpeculativeError("LAGUNA_DFLASH_ALIGNMENT_NOT_APPLIED")
+        elif alignment is not None:
+            raise LagunaSpeculativeError("LAGUNA_DSPARK_ALIGNMENT_UNEXPECTED")
+    bound = dict(result)
+    bound["runtime_evidence"] = {
+        "runtime_sha256": runtime["sha256"],
+        "runtime_file_sha256": runtime_file_sha256,
+        "draft_checkpoint": checkpoint,
+        "runtime_alignment": alignment,
+        "execution_sources": runtime.get("execution_sources"),
+        "image": runtime.get("image"),
+        "vllm_observed_build": runtime.get("vllm_observed_build"),
+    }
+    bound["result_sha256"] = canonical_sha256(
+        {key: value for key, value in bound.items() if key != "result_sha256"}
+    )
+    return bound
+
+
 def _request(
     *,
     base_url: str,

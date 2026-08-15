@@ -9,12 +9,15 @@ import statistics
 from typing import Any
 import urllib.request
 
+import modal
+
 from opjax.pallas.laguna_dspark_conformance import canonical_sha256
 from opjax.pallas.laguna_dspark_profile import prometheus_values
 from opjax.pallas.laguna_speculative import (
     DFLASH,
     DSPARK,
     PLAIN,
+    bind_trained_runtime_identity,
     run_replay_benchmark,
     warm_replay_endpoint,
 )
@@ -42,6 +45,8 @@ ENDPOINTS = {
         "https://conway--opjax-laguna-speculative-v1-trained-dspark-adaptive.modal.run",
     ),
 }
+ARTIFACT_VOLUME = "opjax-laguna-speculative-artifacts-v1"
+MODAL_ENVIRONMENT = "main"
 
 
 def _write(path: Path, payload: dict[str, Any]) -> None:
@@ -94,6 +99,44 @@ def _selection(root: Path, arm: str) -> dict[str, Any]:
     return payload
 
 
+def _runtime_path(cell: str) -> str:
+    if cell == "plain":
+        return "plain/20260814-rope-corrected-released-plain/runtime.json"
+    arm, depth = cell.split("-", maxsplit=1)
+    if cell == "dspark-adaptive":
+        return "dspark/20260814-rope-corrected-trained-dspark-adaptive-15/runtime.json"
+    return f"{arm}/20260814-rope-corrected-trained-{arm}-fixed-{depth}/runtime.json"
+
+
+def _runtime_evidence(cell: str) -> tuple[dict[str, Any], str]:
+    volume = modal.Volume.from_name(
+        ARTIFACT_VOLUME,
+        environment_name=MODAL_ENVIRONMENT,
+        version=1,
+    )
+    volume.reload()
+    raw = b"".join(volume.read_file(_runtime_path(cell)))
+    if not raw:
+        raise ValueError(f"LAGUNA_RUNTIME_EVIDENCE_EMPTY:{cell}")
+    return json.loads(raw), hashlib.sha256(raw).hexdigest()
+
+
+def _bind_runtime(
+    *,
+    cell: str,
+    result: dict[str, Any],
+    selections: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    runtime, runtime_file_sha256 = _runtime_evidence(cell)
+    selection = selections.get(result["arm"])
+    return bind_trained_runtime_identity(
+        result=result,
+        runtime=runtime,
+        runtime_file_sha256=runtime_file_sha256,
+        selection=selection,
+    )
+
+
 def _cell_summary(result: dict[str, Any], plain: dict[str, Any]) -> dict[str, Any]:
     plain_rows = {row["prompt_id"]: row for row in plain["records"]}
     matches = [
@@ -127,7 +170,37 @@ def _cell_summary(result: dict[str, Any], plain: dict[str, Any]) -> dict[str, An
             "accepted_tokens_per_round": accepted / rounds if rounds else None,
         },
         "result_sha256": result["result_sha256"],
+        "runtime_evidence": result["runtime_evidence"],
     }
+
+
+def _summary(
+    *,
+    split: str,
+    corpus: dict[str, Any],
+    selections: dict[str, dict[str, Any]],
+    results: dict[str, dict[str, Any]],
+    output_root: Path,
+) -> dict[str, Any]:
+    plain = results["plain"]
+    summary = {
+        "schema_version": 1,
+        "kind": "opjax_laguna_trained_replay_summary",
+        "split": split,
+        "corpus_sha256": corpus["release_sha256"],
+        "selection_sha256": {
+            arm: value["sha256"] for arm, value in selections.items()
+        },
+        "cells": {
+            cell: _cell_summary(result, plain) for cell, result in results.items()
+        },
+        "files": {
+            cell: hashlib.sha256((output_root / f"{cell}.json").read_bytes()).hexdigest()
+            for cell in results
+        },
+    }
+    summary["sha256"] = canonical_sha256(summary)
+    return summary
 
 
 def main() -> None:
@@ -146,6 +219,7 @@ def main() -> None:
     )
     parser.add_argument("--selection-root", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--finalize-existing", action="store_true")
     args = parser.parse_args()
     selected_cells = [item for item in args.cells.split(",") if item]
     if "plain" not in selected_cells or set(selected_cells) - set(ENDPOINTS):
@@ -157,6 +231,28 @@ def main() -> None:
         task_ids=manifest["task_ids"][args.split],
     )
     selections = {arm: _selection(args.selection_root, arm) for arm in (DFLASH, DSPARK)}
+
+    if args.finalize_existing:
+        results = {}
+        for cell in selected_cells:
+            path = args.output_root / f"{cell}.json"
+            result = _bind_runtime(
+                cell=cell,
+                result=json.loads(path.read_text()),
+                selections=selections,
+            )
+            _write(path, result)
+            results[cell] = result
+        summary = _summary(
+            split=args.split,
+            corpus=corpus,
+            selections=selections,
+            results=results,
+            output_root=args.output_root,
+        )
+        _write(args.output_root / "summary.json", summary)
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        return
 
     def execute(cell: str) -> tuple[str, dict[str, Any]]:
         arm, endpoint = ENDPOINTS[cell]
@@ -187,8 +283,10 @@ def main() -> None:
         result["cell"] = cell
         result["endpoint"] = endpoint
         result["prometheus_delta"] = _delta(before, after)
-        result["result_sha256"] = canonical_sha256(
-            {key: value for key, value in result.items() if key != "result_sha256"}
+        result = _bind_runtime(
+            cell=cell,
+            result=result,
+            selections=selections,
         )
         _write(args.output_root / f"{cell}.json", result)
         return cell, result
@@ -197,24 +295,13 @@ def main() -> None:
         max_workers=len(selected_cells)
     ) as executor:
         results = dict(executor.map(execute, selected_cells))
-    plain = results["plain"]
-    summary = {
-        "schema_version": 1,
-        "kind": "opjax_laguna_trained_replay_summary",
-        "split": args.split,
-        "corpus_sha256": corpus["release_sha256"],
-        "selection_sha256": {arm: value["sha256"] for arm, value in selections.items()},
-        "cells": {
-            cell: _cell_summary(result, plain) for cell, result in results.items()
-        },
-        "files": {
-            cell: hashlib.sha256(
-                (args.output_root / f"{cell}.json").read_bytes()
-            ).hexdigest()
-            for cell in results
-        },
-    }
-    summary["sha256"] = canonical_sha256(summary)
+    summary = _summary(
+        split=args.split,
+        corpus=corpus,
+        selections=selections,
+        results=results,
+        output_root=args.output_root,
+    )
     _write(args.output_root / "summary.json", summary)
     print(json.dumps(summary, indent=2, sort_keys=True))
 
