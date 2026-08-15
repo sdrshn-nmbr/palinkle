@@ -250,7 +250,7 @@ def server_command(
                 ),
                 **(
                     {
-                        "DFlashDraftModel": (
+                        "DFlashLagunaForCausalLM": (
                             "opjax.remote.laguna_dflash_capture_model:"
                             "CapturedLagunaDFlashForCausalLM"
                         )

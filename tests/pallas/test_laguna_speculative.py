@@ -56,6 +56,13 @@ def test_server_commands_share_runtime_and_target() -> None:
     assert '"num_speculative_tokens":15' in commands[DSPARK][-1]
 
 
+def test_dflash_capture_overrides_the_laguna_runtime_class() -> None:
+    command = server_command(DFLASH, port=8000, capture_dflash=True)
+    override = command[command.index("--model-class-overrides") + 1]
+    assert "DFlashLagunaForCausalLM" in override
+    assert "CapturedLagunaDFlashForCausalLM" in override
+
+
 def test_dspark_fixed_proposal_depth_is_explicit() -> None:
     command = server_command(
         DSPARK,

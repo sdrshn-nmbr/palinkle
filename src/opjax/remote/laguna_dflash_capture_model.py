@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import torch
-from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
+from vllm.model_executor.models.laguna_dflash import DFlashLagunaForCausalLM
 
 from opjax.remote.laguna_dspark_capture import (
     capture_tensor,
@@ -9,7 +9,7 @@ from opjax.remote.laguna_dspark_capture import (
 )
 
 
-class CapturedLagunaDFlashForCausalLM(DFlashQwen3ForCausalLM):
+class CapturedLagunaDFlashForCausalLM(DFlashLagunaForCausalLM):
     def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         override = load_target_feature_override()
         if override is not None:
