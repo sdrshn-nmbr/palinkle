@@ -5,6 +5,7 @@ import concurrent.futures
 import hashlib
 import json
 from pathlib import Path
+import random
 import statistics
 from typing import Any
 import urllib.request
@@ -148,10 +149,17 @@ def _cell_summary(result: dict[str, Any], plain: dict[str, Any]) -> dict[str, An
     drafted = counters.get("vllm:spec_decode_num_draft_tokens_total", 0.0)
     accepted = counters.get("vllm:spec_decode_num_accepted_tokens_total", 0.0)
     rounds = counters.get("vllm:spec_decode_num_drafts_total", 0.0)
+    ratio = _cluster_bootstrap_ratio(
+        plain_rows=plain_rows,
+        result_rows={row["prompt_id"]: row for row in result["records"]},
+        prompt_ids=[row["prompt_id"] for row in matches],
+    )
     return {
         "requests": len(result["records"]),
         "wall_s": result["wall_s"],
         "output_tps": result["output_tps"],
+        "completion_tokens": result["completion_tokens"],
+        "fixed_request_wall_speedup": plain["wall_s"] / result["wall_s"],
         "exact_plain_matches": len(matches),
         "exact_match_fraction": len(matches) / len(result["records"]),
         "median_plain_over_cell_latency_on_matches": (
@@ -162,6 +170,7 @@ def _cell_summary(result: dict[str, Any], plain: dict[str, Any]) -> dict[str, An
             if matches
             else None
         ),
+        "clustered_plain_over_cell_latency_on_matches": ratio,
         "speculation": {
             "drafted_tokens": drafted,
             "accepted_tokens": accepted,
@@ -170,6 +179,40 @@ def _cell_summary(result: dict[str, Any], plain: dict[str, Any]) -> dict[str, An
         },
         "result_sha256": result["result_sha256"],
         "runtime_evidence": result["runtime_evidence"],
+    }
+
+
+def _cluster_bootstrap_ratio(
+    *,
+    plain_rows: dict[str, dict[str, Any]],
+    result_rows: dict[str, dict[str, Any]],
+    prompt_ids: list[str],
+    samples: int = 10_000,
+) -> dict[str, float | int] | None:
+    grouped: dict[str, list[str]] = {}
+    for prompt_id in prompt_ids:
+        grouped.setdefault(plain_rows[prompt_id]["trajectory"], []).append(prompt_id)
+    trajectories = sorted(grouped)
+    if not trajectories:
+        return None
+
+    def ratio(selected: list[str]) -> float:
+        ids = [prompt_id for name in selected for prompt_id in grouped[name]]
+        return sum(plain_rows[prompt_id]["elapsed_s"] for prompt_id in ids) / sum(
+            result_rows[prompt_id]["elapsed_s"] for prompt_id in ids
+        )
+
+    rng = random.Random(0)
+    draws = sorted(
+        ratio([rng.choice(trajectories) for _ in trajectories]) for _ in range(samples)
+    )
+    return {
+        "ratio": ratio(trajectories),
+        "ci95_low": draws[round((samples - 1) * 0.025)],
+        "ci95_high": draws[round((samples - 1) * 0.975)],
+        "trajectory_clusters": len(trajectories),
+        "prompts": len(prompt_ids),
+        "bootstrap_samples": samples,
     }
 
 
@@ -197,9 +240,43 @@ def _summary(
             cell: hashlib.sha256((output_root / f"{cell}.json").read_bytes()).hexdigest()
             for cell in results
         },
+        "paired_models": _paired_models(results),
     }
     summary["sha256"] = canonical_sha256(summary)
     return summary
+
+
+def _paired_models(
+    results: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    dflash_cells = [cell for cell in results if cell.startswith("dflash-")]
+    dspark_cells = [cell for cell in results if cell.startswith("dspark-")]
+    if len(dflash_cells) != 1 or len(dspark_cells) != 1 or "plain" not in results:
+        return None
+    dflash = results[dflash_cells[0]]
+    dspark = results[dspark_cells[0]]
+    plain_rows = {row["prompt_id"]: row for row in results["plain"]["records"]}
+    dflash_rows = {row["prompt_id"]: row for row in dflash["records"]}
+    dspark_rows = {row["prompt_id"]: row for row in dspark["records"]}
+    common = [
+        prompt_id
+        for prompt_id, plain in plain_rows.items()
+        if dflash_rows[prompt_id]["completion_token_ids"]
+        == plain["completion_token_ids"]
+        and dspark_rows[prompt_id]["completion_token_ids"]
+        == plain["completion_token_ids"]
+    ]
+    return {
+        "policy": "compare only prompts whose token IDs equal plain in both arms",
+        "prompts": len(common),
+        "dflash_cell": dflash_cells[0],
+        "dspark_cell": dspark_cells[0],
+        "dflash_over_dspark_latency": _cluster_bootstrap_ratio(
+            plain_rows=dflash_rows,
+            result_rows=dspark_rows,
+            prompt_ids=common,
+        ),
+    }
 
 
 def main() -> None:
