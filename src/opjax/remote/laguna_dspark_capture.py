@@ -32,6 +32,83 @@ def capture_step(value: torch.Tensor, step: int) -> torch.Tensor:
     raise RuntimeError(f"LAGUNA_CAPTURE_STEP_RANK:{tuple(value.shape)}")
 
 
+def logical_context_kv(
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    *,
+    sequence_length: int,
+    query_length: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if kv_cache.ndim != 4 or block_table.ndim != 1:
+        raise RuntimeError(
+            f"LAGUNA_CAPTURE_KV_LAYOUT:{tuple(kv_cache.shape)}:"
+            f"{tuple(block_table.shape)}"
+        )
+    context_length = sequence_length - query_length
+    if context_length < 0:
+        raise RuntimeError(
+            f"LAGUNA_CAPTURE_CONTEXT_LENGTH:{sequence_length}:{query_length}"
+        )
+    block_size = kv_cache.shape[2]
+    block_count = (context_length + block_size - 1) // block_size
+    physical_blocks = block_table[:block_count].to(dtype=torch.long)
+    if physical_blocks.numel() != block_count or bool((physical_blocks < 0).any()):
+        raise RuntimeError("LAGUNA_CAPTURE_BLOCK_TABLE_INVALID")
+    packed = (
+        kv_cache.index_select(0, physical_blocks)
+        .permute(0, 2, 1, 3)
+        .reshape(-1, kv_cache.shape[1], kv_cache.shape[3])[:context_length]
+    )
+    if packed.shape[-1] % 2:
+        raise RuntimeError(f"LAGUNA_CAPTURE_KV_WIDTH:{packed.shape[-1]}")
+    return packed.chunk(2, dim=-1)
+
+
+def validate_single_request_attention_layout(
+    query_start_loc: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    block_table: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    *,
+    query_length: int,
+    block_size: int,
+) -> int:
+    starts = query_start_loc.reshape(-1)
+    lengths = sequence_lengths.reshape(-1)
+    if starts.numel() != 2 or lengths.numel() != 1 or block_table.ndim != 2:
+        raise RuntimeError("LAGUNA_CAPTURE_ATTENTION_METADATA_BATCH_INVALID")
+    observed_query_length = int((starts[1] - starts[0]).item())
+    if (
+        int(starts[0].item()) != 0
+        or int(starts[1].item()) != query_length
+        or observed_query_length != query_length
+        or slot_mapping.numel() != query_length
+    ):
+        raise RuntimeError(
+            "LAGUNA_CAPTURE_QUERY_LAYOUT_INVALID:"
+            f"{observed_query_length}:{query_length}:{slot_mapping.numel()}"
+        )
+    sequence_length = int(lengths[0].item())
+    context_length = sequence_length - query_length
+    if context_length < 0:
+        raise RuntimeError(
+            f"LAGUNA_CAPTURE_CONTEXT_LENGTH:{sequence_length}:{query_length}"
+        )
+    logical_slots = torch.arange(
+        context_length,
+        sequence_length,
+        device=block_table.device,
+        dtype=torch.long,
+    )
+    logical_blocks = torch.div(logical_slots, block_size, rounding_mode="floor")
+    offsets = logical_slots.remainder(block_size)
+    physical_blocks = block_table[0].index_select(0, logical_blocks)
+    expected_slots = physical_blocks * block_size + offsets
+    if not torch.equal(slot_mapping.reshape(-1).to(torch.long), expected_slots):
+        raise RuntimeError("LAGUNA_CAPTURE_SLOT_MAPPING_INVALID")
+    return context_length
+
+
 def _control() -> tuple[Path, dict[str, Any]] | None:
     root_value = os.environ.get("OPJAX_DSPARK_CAPTURE_ROOT")
     if not root_value:
@@ -118,6 +195,19 @@ def capture_static_tensor(name: str, value: torch.Tensor) -> None:
         value=value,
         round_id=None,
     )
+
+
+def capture_static_metadata(name: str, value: dict[str, Any]) -> None:
+    root_value = os.environ.get("OPJAX_DSPARK_CAPTURE_ROOT")
+    if not root_value:
+        return
+    static_root = Path(root_value) / "static"
+    static_root.mkdir(parents=True, exist_ok=True)
+    path = static_root / f"{name}.json"
+    temporary = path.with_suffix(".tmp")
+    payload = json.dumps(value, indent=2, sort_keys=True) + "\n"
+    temporary.write_text(payload, encoding="utf-8")
+    os.replace(temporary, path)
 
 
 def begin_capture_round() -> int | None:

@@ -369,6 +369,54 @@ def capture_adapter_context(
 
 
 @app.function(image=vllm_image, gpu="H200", **OPTIONS)
+def capture_adapter_backend_probe(
+    source_run_id: str,
+    probe_run_id: str,
+    context_id: str,
+    attention_backend: str,
+    expected_processed_starts: list[int],
+    enable_prefix_caching: bool = True,
+) -> dict[str, object]:
+    """Run one injected forced-prefix context against frozen source evidence."""
+    from opjax.remote.laguna_vllm_conformance import run_token_rounds_capture
+
+    source_root = ARTIFACT_ROOT / source_run_id / "source"
+    output_root = (
+        ARTIFACT_ROOT
+        / probe_run_id
+        / attention_backend.lower()
+        / context_id
+    )
+    telemetry_path = (
+        ARTIFACT_ROOT
+        / probe_run_id
+        / f"{attention_backend.lower()}-{context_id}-gpu.csv"
+    )
+    telemetry_path.parent.mkdir(parents=True, exist_ok=True)
+    existing = _prepare_capture_output(output_root, telemetry_path=telemetry_path)
+    if existing is not None:
+        return existing
+    telemetry, output = _telemetry(telemetry_path)
+    try:
+        result = run_token_rounds_capture(
+            output_root=output_root,
+            context_id=context_id,
+            source_root=source_root,
+            lane="injected",
+            draft_model=str(ROOT / "selected" / "dspark"),
+            expected_processed_starts=expected_processed_starts,
+            attention_backend=attention_backend,
+            enable_prefix_caching=enable_prefix_caching,
+        )
+    finally:
+        telemetry.terminate()
+        telemetry.wait(timeout=30)
+        output.close()
+        artifacts.commit()
+    return result
+
+
+@app.function(image=vllm_image, gpu="H200", **OPTIONS)
 def capture_sequential_native_context(
     run_id: str, context_id: str, prompt_token_ids: list[int]
 ) -> dict[str, object]:

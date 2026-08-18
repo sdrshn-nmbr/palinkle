@@ -437,17 +437,24 @@ def test_vllm_capture_reconstructs_the_exact_markov_chain(tmp_path: Path) -> Non
         "layer0_qkv_projection",
         "layer0_q_norm",
         "layer0_k_norm",
-        "layer0_gate_projection",
-        "layer0_attention_output",
-        "layer0_gated_attention",
+            "layer0_gate_projection",
+            "layer0_attention_output",
+            "layer0_raw_attention_output",
+            "layer0_gated_attention",
         "layer0_post_attention_norm",
         "layer0_mlp_output",
         "layer0_query_q_after_rope",
         "layer0_query_k_after_rope",
         "layer0_query_v",
-        "layer0_context_k_before_rope",
-        "layer0_context_v",
-    ):
+            "layer0_context_k_before_rope",
+            "layer0_context_v",
+            "layer0_metadata_query_start_loc",
+            "layer0_metadata_seq_lens",
+            "layer0_metadata_block_table",
+            "layer0_metadata_slot_mapping",
+            "layer0_logical_context_k",
+            "layer0_logical_context_v",
+        ):
         record(name, 0, np.zeros((15, 4), dtype=np.float32))
     base = np.zeros((15, 32), dtype=np.float32)
     record("base_logits", 0, base)

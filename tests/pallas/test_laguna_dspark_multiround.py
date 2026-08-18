@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 
 from opjax.pallas.laguna_dspark_conformance import BOUNDARY_ORDER, ConformanceError
 from opjax.pallas.laguna_dspark_multiround import (
@@ -17,20 +18,172 @@ from opjax.pallas.laguna_dspark_multiround import (
     TARGET_REVISION,
     VLLM_REVISION,
     VLLM_SOURCE_SHA256,
+    build_attention_cache_parity_report,
     build_contexts,
     build_final_report,
     build_multiround_report,
     build_sequential_report,
     mutation_controls_pass,
+    _explicit_window_attention,
     _compare_downstream,
     _compare_extended,
     _stable_report_values,
     validate_multiround_report,
     validate_final_report,
+    validate_attention_cache_parity_report,
 )
 from opjax.pallas.laguna_speculative import canonical_sha256
-from opjax.remote.laguna_vllm_conformance import _bf16_add
+from opjax.remote.laguna_vllm_conformance import (
+    _append_attention_backend,
+    _bf16_add,
+    _load_attention_runtime_metadata,
+)
 from opjax.remote.laguna_multiround_conformance_modal import _prepare_capture_output
+from opjax.remote.laguna_dspark_capture import (
+    logical_context_kv,
+    validate_single_request_attention_layout,
+)
+
+
+def test_attention_backend_probe_is_explicit_and_fail_closed() -> None:
+    command = [
+        "vllm",
+        "serve",
+        "--speculative-config",
+        '{"method":"dspark","model":"draft"}',
+    ]
+    _append_attention_backend(command, "FLEX_ATTENTION")
+    assert json.loads(command[-1]) == {
+        "attention_backend": "FLEX_ATTENTION",
+        "method": "dspark",
+        "model": "draft",
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="VLLM_MULTIRound_ATTENTION_BACKEND_INVALID:TORCH_SDPA",
+    ):
+        _append_attention_backend([], "TORCH_SDPA")
+
+
+def test_attention_backend_probe_validates_resolved_runtime(tmp_path: Path) -> None:
+    static = tmp_path / "static"
+    static.mkdir()
+    metadata = {
+        "layers": [
+            {
+                "layer": index,
+                "backend_name": "FLEX_ATTENTION",
+                "backend_class": "backend.FlexAttentionBackend",
+                "implementation_class": "backend.FlexAttentionImpl",
+                "wrapper_sliding_window": None,
+                "implementation_sliding_window": [511, 0],
+                "outer_sliding_window": 512,
+            }
+            for index in range(5)
+        ]
+    }
+    (static / "attention-runtime.json").write_text(
+        json.dumps(metadata), encoding="utf-8"
+    )
+
+    observed = _load_attention_runtime_metadata(
+        tmp_path, requested_backend="FLEX_ATTENTION"
+    )
+    assert observed["layers"] == metadata["layers"]
+    assert observed["path"] == "static/attention-runtime.json"
+
+    with pytest.raises(
+        RuntimeError, match="VLLM_ATTENTION_BACKEND_RESOLUTION_MISMATCH"
+    ):
+        _load_attention_runtime_metadata(tmp_path, requested_backend="FLASH_ATTN")
+
+
+def test_logical_context_kv_follows_block_table_order() -> None:
+    backing = torch.zeros((3, 2, 2, 4), dtype=torch.float32)
+    cache = backing.permute(0, 2, 1, 3)
+    assert not cache.is_contiguous()
+    for block in range(3):
+        for offset in range(2):
+            token = block * 2 + offset
+            for head in range(2):
+                cache[block, head, offset] = torch.tensor(
+                    [token + head, token + 0.25, token + 10, token + 10.25]
+                )
+    keys, values = logical_context_kv(
+        cache,
+        torch.tensor([2, 0, 1]),
+        sequence_length=7,
+        query_length=2,
+    )
+    assert keys[:, 0, 0].tolist() == [4, 5, 0, 1, 2]
+    assert values[:, 0, 0].tolist() == [14, 15, 10, 11, 12]
+
+
+def test_single_request_attention_layout_binds_query_slots() -> None:
+    context_length = validate_single_request_attention_layout(
+        torch.tensor([0, 3], dtype=torch.int32),
+        torch.tensor([6], dtype=torch.int32),
+        torch.tensor([[2, 0, 1]], dtype=torch.int32),
+        torch.tensor([1, 2, 3], dtype=torch.int64),
+        query_length=3,
+        block_size=2,
+    )
+    assert context_length == 3
+
+    with pytest.raises(RuntimeError, match="LAGUNA_CAPTURE_SLOT_MAPPING_INVALID"):
+        validate_single_request_attention_layout(
+            torch.tensor([0, 3], dtype=torch.int32),
+            torch.tensor([6], dtype=torch.int32),
+            torch.tensor([[2, 0, 1]], dtype=torch.int32),
+            torch.tensor([0, 2, 3], dtype=torch.int64),
+            query_length=3,
+            block_size=2,
+        )
+
+
+def test_explicit_attention_reference_enforces_causal_sliding_window() -> None:
+    query = np.array([[[1.0, 0.0]], [[1.0, 0.0]]], dtype=np.float32)
+    context_key = np.array(
+        [[[8.0, 0.0]], [[0.0, 0.0]], [[0.0, 0.0]]], dtype=np.float32
+    )
+    context_value = np.array(
+        [[[100.0, 0.0]], [[2.0, 0.0]], [[3.0, 0.0]]], dtype=np.float32
+    )
+    query_key = np.zeros((2, 1, 2), dtype=np.float32)
+    query_value = np.array([[[4.0, 0.0]], [[5.0, 0.0]]], dtype=np.float32)
+
+    windowed, ranges = _explicit_window_attention(
+        query=query,
+        context_key=context_key,
+        context_value=context_value,
+        query_key=query_key,
+        query_value=query_value,
+        window_tokens=2,
+    )
+    full, _ = _explicit_window_attention(
+        query=query,
+        context_key=context_key,
+        context_value=context_value,
+        query_key=query_key,
+        query_value=query_value,
+        window_tokens=None,
+    )
+
+    assert ranges == [(2, 4), (3, 5)]
+    assert not np.allclose(windowed, full)
+
+
+def test_explicit_attention_reference_rejects_incompatible_gqa_layout() -> None:
+    with pytest.raises(ConformanceError, match="ATTENTION_REFERENCE_LAYOUT_INVALID"):
+        _explicit_window_attention(
+            query=np.zeros((1, 3, 2), dtype=np.float32),
+            context_key=np.zeros((1, 2, 2), dtype=np.float32),
+            context_value=np.zeros((1, 2, 2), dtype=np.float32),
+            query_key=np.zeros((1, 2, 2), dtype=np.float32),
+            query_value=np.zeros((1, 2, 2), dtype=np.float32),
+            window_tokens=2,
+        )
 
 
 def test_report_floats_are_stable_across_last_bit_reduction_drift() -> None:
@@ -326,6 +479,225 @@ def _manifest(
     manifest["manifest_sha256"] = canonical_sha256(manifest)
     (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     return manifest
+
+
+def _write_manifest(root: Path, manifest: dict[str, object]) -> None:
+    manifest["manifest_sha256"] = canonical_sha256(
+        {key: value for key, value in manifest.items() if key != "manifest_sha256"}
+    )
+    (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def _attention_cache_fixture(
+    root: Path, *, source_discontinuity: bool = True
+) -> tuple[Path, Path, Path]:
+    source_cells = root / "source"
+    cached_cells = root / "cached"
+    fresh_cells = root / "fresh"
+    lengths = (511, 512, 513)
+    cached_starts = (0, 480, 496)
+    for round_index, length in enumerate(lengths):
+        cell_id = f"tokens-511--round-{round_index}"
+        tokens = list(range(length))
+        source_root = source_cells / cell_id
+        source = _manifest(source_root, tokens, 1000 + round_index)
+        source_feature_value = (
+            float(round_index > 0 and source_discontinuity)
+        )
+        source["boundaries"]["combined_target_feature"] = _artifact(
+            source_root,
+            "combined_target_feature",
+            np.full((length, 4), source_feature_value, dtype=np.float32),
+        )
+        context_key = np.zeros((length, 8, 128), dtype=np.float32)
+        context_value = np.zeros((length, 8, 128), dtype=np.float32)
+        context_value[0, :, 0] = 100
+        source["boundaries"]["layer0_context_k_after_rope"] = _artifact(
+            source_root, "layer0_context_k_after_rope", context_key[None]
+        )
+        source["boundaries"]["layer0_context_v"] = _artifact(
+            source_root, "layer0_context_v", context_value[None]
+        )
+        _write_manifest(source_root, source)
+
+        for lane, lane_root, processed_start in (
+            ("cached", cached_cells / cell_id, cached_starts[round_index]),
+            ("fresh", fresh_cells / cell_id, 0),
+        ):
+            adapter = _manifest(
+                lane_root,
+                tokens,
+                1000 + round_index,
+                lane="injected",
+                source_manifest_sha256=source["manifest_sha256"],
+            )
+            adapter["processed_token_start"] = processed_start
+            adapter["expected_processed_token_start"] = processed_start
+            adapter["provenance"]["prefix_caching"] = lane == "cached"
+            adapter["provenance"]["attention_runtime"] = {
+                "layers": [
+                    {
+                        "layer": layer_index,
+                        "backend_name": "FLASH_ATTN",
+                        "wrapper_sliding_window": None,
+                        "implementation_sliding_window": [511, 0],
+                        "outer_sliding_window": 512,
+                    }
+                    for layer_index in range(5)
+                ]
+            }
+            query = np.zeros((15, 64, 128), dtype=np.float32)
+            query_key = np.zeros((15, 8, 128), dtype=np.float32)
+            query_value = np.zeros((15, 8, 128), dtype=np.float32)
+            observed, _ = _explicit_window_attention(
+                query=query,
+                context_key=context_key,
+                context_value=context_value,
+                query_key=query_key,
+                query_value=query_value,
+                window_tokens=512,
+            )
+            values = {
+                "layer0_query_q_after_rope_0": query.reshape(15, -1),
+                "layer0_query_k_after_rope_0": query_key.reshape(15, -1),
+                "layer0_query_v_0": query_value.reshape(15, -1),
+                "layer0_logical_context_k_0": context_key,
+                "layer0_logical_context_v_0": context_value,
+                "layer0_raw_attention_output_0": observed.reshape(15, -1),
+            }
+            for name, value in values.items():
+                adapter["boundaries"][name] = _artifact(lane_root, name, value)
+            _write_manifest(lane_root, adapter)
+    return source_cells, cached_cells, fresh_cells
+
+
+def test_attention_cache_report_recomputes_runtime_semantics(tmp_path: Path) -> None:
+    source, cached, fresh = _attention_cache_fixture(tmp_path)
+    report = build_attention_cache_parity_report(
+        source_cells_root=source,
+        cached_cells_root=cached,
+        fresh_cells_root=fresh,
+    )
+    validate_attention_cache_parity_report(
+        report,
+        source_cells_root=source,
+        cached_cells_root=cached,
+        fresh_cells_root=fresh,
+    )
+    assert report["result"] == {
+        "attention_cache_semantics_passed": True,
+        "fresh_prefix_parity_passed": True,
+        "deep_spec_source_is_stateful": False,
+        "transition_blocks_statefully_verified": False,
+        "source_state_mismatch_observed": True,
+        "runtime_fix_required": False,
+        "diagnosis": "source_oracle_state_mismatch",
+    }
+    report["result"]["runtime_fix_required"] = True
+    report["report_sha256"] = canonical_sha256(
+        {key: value for key, value in report.items() if key != "report_sha256"}
+    )
+    with pytest.raises(
+        ConformanceError, match="ATTENTION_CACHE_REPORT_RECOMPUTATION_MISMATCH"
+    ):
+        validate_attention_cache_parity_report(
+            report,
+            source_cells_root=source,
+            cached_cells_root=cached,
+            fresh_cells_root=fresh,
+        )
+
+
+def test_attention_cache_report_detects_prefix_and_output_corruption(
+    tmp_path: Path,
+) -> None:
+    source, cached, fresh = _attention_cache_fixture(tmp_path)
+    cached_root = cached / "tokens-511--round-1"
+    cached_manifest = json.loads((cached_root / "manifest.json").read_text())
+    key = np.load(cached_root / "layer0_logical_context_k_0.npy")
+    key[0, 0, 0] = 1
+    cached_manifest["boundaries"]["layer0_logical_context_k_0"] = _artifact(
+        cached_root, "layer0_logical_context_k_0", key
+    )
+    _write_manifest(cached_root, cached_manifest)
+    report = build_attention_cache_parity_report(
+        source_cells_root=source,
+        cached_cells_root=cached,
+        fresh_cells_root=fresh,
+    )
+    assert report["result"]["attention_cache_semantics_passed"] is False
+
+    fresh_root = fresh / "tokens-511--round-1"
+    fresh_manifest = json.loads((fresh_root / "manifest.json").read_text())
+    proposals = np.load(fresh_root / "proposal_token_ids.npy")
+    proposals[0] += 1
+    fresh_manifest["boundaries"]["proposal_token_ids"] = _artifact(
+        fresh_root, "proposal_token_ids", proposals
+    )
+    _write_manifest(fresh_root, fresh_manifest)
+    report = build_attention_cache_parity_report(
+        source_cells_root=source,
+        cached_cells_root=cached,
+        fresh_cells_root=fresh,
+    )
+    assert report["result"]["fresh_prefix_parity_passed"] is False
+
+    cached_root = cached / "tokens-511--round-0"
+    cached_manifest = json.loads((cached_root / "manifest.json").read_text())
+    output = np.load(cached_root / "layer0_raw_attention_output_0.npy")
+    output += 10
+    cached_manifest["boundaries"]["layer0_raw_attention_output_0"] = _artifact(
+        cached_root, "layer0_raw_attention_output_0", output
+    )
+    _write_manifest(cached_root, cached_manifest)
+    report = build_attention_cache_parity_report(
+        source_cells_root=source,
+        cached_cells_root=cached,
+        fresh_cells_root=fresh,
+    )
+    assert report["cached_runtime"][0]["attention_reference"][
+        "windowed_passed"
+    ] is False
+
+
+def test_attention_cache_report_does_not_invent_source_state_mismatch(
+    tmp_path: Path,
+) -> None:
+    source, cached, fresh = _attention_cache_fixture(
+        tmp_path, source_discontinuity=False
+    )
+    report = build_attention_cache_parity_report(
+        source_cells_root=source,
+        cached_cells_root=cached,
+        fresh_cells_root=fresh,
+    )
+    assert report["result"]["source_state_mismatch_observed"] is False
+    assert report["result"]["diagnosis"] == "attention_cache_parity_cleared"
+
+
+@pytest.mark.parametrize("mutation", ["lane", "prefix_caching", "backend"])
+def test_attention_cache_report_rejects_wrong_runtime_contract(
+    tmp_path: Path, mutation: str
+) -> None:
+    source, cached, fresh = _attention_cache_fixture(tmp_path)
+    root = cached / "tokens-511--round-0"
+    manifest = json.loads((root / "manifest.json").read_text())
+    if mutation == "lane":
+        manifest["provenance"]["lane"] = "native"
+    elif mutation == "prefix_caching":
+        manifest["provenance"]["prefix_caching"] = False
+    else:
+        manifest["provenance"]["attention_runtime"]["layers"][0][
+            "backend_name"
+        ] = "FLEX_ATTENTION"
+    _write_manifest(root, manifest)
+
+    with pytest.raises(ConformanceError, match="ATTENTION_CACHE_(LANE|RUNTIME)"):
+        build_attention_cache_parity_report(
+            source_cells_root=source,
+            cached_cells_root=cached,
+            fresh_cells_root=fresh,
+        )
 
 
 def _sequential_matrix(root: Path) -> None:

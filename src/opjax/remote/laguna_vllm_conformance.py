@@ -28,6 +28,11 @@ from opjax.pallas.laguna_speculative import (
 )
 
 
+_CONFORMANCE_ATTENTION_BACKENDS = frozenset(
+    {"FLASH_ATTN", "FLEX_ATTENTION", "TRITON_ATTN"}
+)
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -96,6 +101,57 @@ def _disable_adaptive_verification(command: list[str]) -> None:
         raise RuntimeError("VLLM_CONFORMANCE_REQUIRES_DSPARK")
     config["enable_adaptive_verification"] = False
     command[index] = json.dumps(config, sort_keys=True, separators=(",", ":"))
+
+
+def _append_attention_backend(
+    command: list[str], attention_backend: str | None
+) -> None:
+    if attention_backend is None:
+        return
+    if attention_backend not in _CONFORMANCE_ATTENTION_BACKENDS:
+        raise ValueError(
+            "VLLM_MULTIRound_ATTENTION_BACKEND_INVALID:"
+            f"{attention_backend}"
+        )
+    index = command.index("--speculative-config") + 1
+    config = json.loads(command[index])
+    if config.get("method") != "dspark":
+        raise RuntimeError("VLLM_CONFORMANCE_REQUIRES_DSPARK")
+    config["attention_backend"] = attention_backend
+    command[index] = json.dumps(config, sort_keys=True, separators=(",", ":"))
+
+
+def _load_attention_runtime_metadata(
+    raw_capture_root: Path, *, requested_backend: str | None
+) -> dict[str, Any]:
+    path = raw_capture_root / "static" / "attention-runtime.json"
+    if not path.is_file():
+        raise RuntimeError("VLLM_ATTENTION_RUNTIME_METADATA_MISSING")
+    metadata = json.loads(path.read_text(encoding="utf-8"))
+    layers = metadata.get("layers")
+    if not isinstance(layers, list) or len(layers) != 5:
+        raise RuntimeError("VLLM_ATTENTION_RUNTIME_LAYER_COUNT_INVALID")
+    for index, layer in enumerate(layers):
+        if not isinstance(layer, dict) or layer.get("layer") != index:
+            raise RuntimeError("VLLM_ATTENTION_RUNTIME_LAYER_INVALID")
+        if requested_backend is not None and layer.get("backend_name") != requested_backend:
+            raise RuntimeError(
+                "VLLM_ATTENTION_BACKEND_RESOLUTION_MISMATCH:"
+                f"requested={requested_backend}:observed={layer.get('backend_name')}"
+            )
+        if layer.get("wrapper_sliding_window") is not None:
+            raise RuntimeError("VLLM_ATTENTION_WRAPPER_WINDOW_ALLOCATION_INVALID")
+        if layer.get("outer_sliding_window") != 512:
+            raise RuntimeError("VLLM_ATTENTION_OUTER_WINDOW_INVALID")
+        implementation_window = layer.get("implementation_sliding_window")
+        if implementation_window not in (512, [511, 0], [512, 0]):
+            raise RuntimeError(
+                "VLLM_ATTENTION_IMPLEMENTATION_WINDOW_INVALID:"
+                f"{implementation_window}"
+            )
+    metadata["path"] = str(path.relative_to(raw_capture_root))
+    metadata["sha256"] = _sha256(path)
+    return metadata
 
 
 def _load_records(root: Path) -> dict[str, list[tuple[dict[str, Any], np.ndarray]]]:
@@ -325,7 +381,7 @@ def _canonicalize_capture(
             for layer_id in range(5)
         },
         **{
-            f"{name}_0": _at(records, name, capture_index, require_one=False)
+            f"{name}_0": _at(records, name, capture_index)
             for name in (
                 "layer0_input_norm",
                 "layer0_qkv_projection",
@@ -333,6 +389,7 @@ def _canonicalize_capture(
                 "layer0_k_norm",
                 "layer0_gate_projection",
                 "layer0_attention_output",
+                "layer0_raw_attention_output",
                 "layer0_gated_attention",
                 "layer0_post_attention_norm",
                 "layer0_mlp_output",
@@ -341,6 +398,12 @@ def _canonicalize_capture(
                 "layer0_query_v",
                 "layer0_context_k_before_rope",
                 "layer0_context_v",
+                "layer0_metadata_query_start_loc",
+                "layer0_metadata_seq_lens",
+                "layer0_metadata_block_table",
+                "layer0_metadata_slot_mapping",
+                "layer0_logical_context_k",
+                "layer0_logical_context_v",
             )
         },
         "combined_target_feature": combined.reshape(-1, combined.shape[-1]),
@@ -554,6 +617,8 @@ def run_token_rounds_capture(
     lane: str,
     draft_model: str,
     expected_processed_starts: list[int] | None = None,
+    attention_backend: str | None = None,
+    enable_prefix_caching: bool = True,
     port: int = 8000,
 ) -> dict[str, Any]:
     """Capture three forced-prefix rounds in one prefix-caching vLLM process."""
@@ -573,10 +638,10 @@ def run_token_rounds_capture(
     command = server_command(DSPARK, port=port, draft_model=draft_model)
     _replace_argument(command, "--max-num-seqs", "1")
     _disable_adaptive_verification(command)
+    _append_attention_backend(command, attention_backend)
     command.extend(
         [
             "--enforce-eager",
-            "--enable-prefix-caching",
             "--block-size",
             "16",
             "--profiler-config",
@@ -594,6 +659,10 @@ def run_token_rounds_capture(
             ),
         ]
     )
+    if enable_prefix_caching:
+        command.append("--enable-prefix-caching")
+    else:
+        command.append("--no-enable-prefix-caching")
     environment = {
         **os.environ,
         "OPJAX_DSPARK_CAPTURE_ROOT": str(raw_capture_root),
@@ -614,6 +683,9 @@ def run_token_rounds_capture(
         )
         try:
             _wait_ready(port, process, log_path=log_path)
+            attention_runtime = _load_attention_runtime_metadata(
+                raw_capture_root, requested_backend=attention_backend
+            )
             metrics_before = _request(
                 f"http://127.0.0.1:{port}/metrics", timeout=30
             ).decode()
@@ -679,6 +751,8 @@ def run_token_rounds_capture(
                         "target_revision": TARGET_REVISION,
                         "draft_revision": _sha256(Path(draft_model) / "model.safetensors"),
                         "command": command,
+                        "attention_runtime": attention_runtime,
+                        "prefix_caching": enable_prefix_caching,
                         "lane": lane,
                         "source_manifest_sha256": source["manifest_sha256"],
                     },
@@ -743,6 +817,8 @@ def run_token_rounds_capture(
         "context_id": context_id,
         "lane": lane,
         "command": command,
+        "attention_runtime": attention_runtime,
+        "prefix_caching": enable_prefix_caching,
         "cells": [manifest["manifest_sha256"] for manifest in cell_manifests],
         "processed_token_starts": [
             manifest["processed_token_start"] for manifest in cell_manifests

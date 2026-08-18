@@ -6,6 +6,7 @@ import copy
 import gzip
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,9 @@ DEEPSPEC_REVISION = "787db11ea347ac3944233e5aa9c7f1bd8a9b5ced"
 DEEPSPEC_SOURCE_SHA256 = "edbf639c83e9b0e5d5446736fb60fb5849446e3a2e210ac704b6a7b6d45b96d9"
 VLLM_REVISION = "0.27.2rc1.dev18+g3d204dfda"
 VLLM_SOURCE_SHA256 = "4468a4a7ea446ed7210f339946cc70a53fef52f5b80809a2cfcb4e6a4abbb444"
+VLLM_ATTENTION_INSTRUMENTATION_SHA256 = (
+    "5195c55a43d0023ea1f94fdc464942564507599bbaf34c40d48e89bc1421a395"
+)
 TARGET_REVISION = "e9df9a59996d790b94b70f3fef343fe1d9e34bdf"
 DRAFT_REVISION = "016807a9f3e0181962ad32c096458ec022ac0f143529211c412bbf09dee2b78c"
 _TRACE_VALIDATION_CACHE: dict[tuple[str, str], int] = {}
@@ -62,6 +66,8 @@ EXTENDED_ADAPTER_NAMES = {
 EXACT_EXTENDED_BOUNDARIES = {"draft_input_ids", "draft_positions"}
 MAX_STRICT_BF16_ULP = 2
 REPORT_FLOAT_DIGITS = 12
+ATTENTION_REFERENCE_MAX_RELATIVE_L2 = 0.003
+FRESH_CACHE_MAX_RELATIVE_L2 = 0.006
 
 
 def _stable_report_values(value: Any) -> Any:
@@ -132,13 +138,16 @@ def _load_manifest(path: Path) -> dict[str, Any]:
     ):
         raise ConformanceError(f"MULTIROUND_PROVENANCE_MISSING:{path}")
     revision = provenance["revision"]
-    expected_source = {
-        DEEPSPEC_REVISION: DEEPSPEC_SOURCE_SHA256,
-        VLLM_REVISION: VLLM_SOURCE_SHA256,
+    expected_sources = {
+        DEEPSPEC_REVISION: {DEEPSPEC_SOURCE_SHA256},
+        VLLM_REVISION: {
+            VLLM_SOURCE_SHA256,
+            VLLM_ATTENTION_INSTRUMENTATION_SHA256,
+        },
     }.get(revision)
     if (
-        expected_source is None
-        or provenance["source_sha256"] != expected_source
+        expected_sources is None
+        or provenance["source_sha256"] not in expected_sources
         or provenance["target_revision"] != TARGET_REVISION
         or provenance["draft_revision"] != DRAFT_REVISION
     ):
@@ -1111,3 +1120,417 @@ def mutation_controls_pass(
         else:
             controls[name] = False
     return controls
+
+
+def _relative_l2(reference: np.ndarray, candidate: np.ndarray) -> float:
+    left = np.asarray(reference, dtype=np.float64)
+    right = np.asarray(candidate, dtype=np.float64)
+    if left.shape != right.shape:
+        raise ConformanceError(
+            f"ATTENTION_CACHE_SHAPE_MISMATCH:{left.shape}:{right.shape}"
+        )
+    denominator = float(np.linalg.norm(left))
+    numerator = float(np.linalg.norm(left - right))
+    return numerator / denominator if denominator else numerator
+
+
+def _explicit_window_attention(
+    *,
+    query: np.ndarray,
+    context_key: np.ndarray,
+    context_value: np.ndarray,
+    query_key: np.ndarray,
+    query_value: np.ndarray,
+    window_tokens: int | None,
+) -> tuple[np.ndarray, list[tuple[int, int]]]:
+    query = np.asarray(query, dtype=np.float32)
+    context_key = np.asarray(context_key, dtype=np.float32)
+    context_value = np.asarray(context_value, dtype=np.float32)
+    query_key = np.asarray(query_key, dtype=np.float32)
+    query_value = np.asarray(query_value, dtype=np.float32)
+    if (
+        query.ndim != 3
+        or context_key.ndim != 3
+        or context_value.shape != context_key.shape
+        or query_key.ndim != 3
+        or query_value.shape != query_key.shape
+        or query.shape[0] != query_key.shape[0]
+        or query.shape[2] != query_key.shape[2]
+        or query.shape[1] % query_key.shape[1]
+    ):
+        raise ConformanceError("ATTENTION_REFERENCE_LAYOUT_INVALID")
+    repeats = query.shape[1] // query_key.shape[1]
+    keys = np.concatenate((context_key, query_key), axis=0)
+    values = np.concatenate((context_value, query_value), axis=0)
+    keys = np.repeat(keys, repeats, axis=1)
+    values = np.repeat(values, repeats, axis=1)
+    context_length = context_key.shape[0]
+    scale = 1.0 / math.sqrt(query.shape[2])
+    output = np.empty_like(query, dtype=np.float32)
+    key_ranges: list[tuple[int, int]] = []
+    for query_index in range(query.shape[0]):
+        end = context_length + query_index + 1
+        start = 0 if window_tokens is None else max(0, end - window_tokens)
+        key_ranges.append((start, end))
+        scores = np.einsum(
+            "hd,khd->hk",
+            query[query_index],
+            keys[start:end],
+            optimize=True,
+        ) * scale
+        scores -= scores.max(axis=-1, keepdims=True)
+        probabilities = np.exp(scores)
+        probabilities /= probabilities.sum(axis=-1, keepdims=True)
+        output[query_index] = np.einsum(
+            "hk,khd->hd",
+            probabilities,
+            values[start:end],
+            optimize=True,
+        )
+    return output, key_ranges
+
+
+def _attention_reference_metrics(
+    root: Path, manifest: dict[str, Any]
+) -> dict[str, Any]:
+    boundaries = manifest["boundaries"]
+
+    def load(name: str) -> np.ndarray:
+        return _load_array(root, boundaries[name])
+
+    query = load("layer0_query_q_after_rope_0").reshape(15, 64, 128)
+    query_key = load("layer0_query_k_after_rope_0").reshape(15, 8, 128)
+    query_value = load("layer0_query_v_0").reshape(15, 8, 128)
+    context_key = load("layer0_logical_context_k_0")
+    context_value = load("layer0_logical_context_v_0")
+    observed = load("layer0_raw_attention_output_0").reshape(15, 64, 128)
+    windowed, ranges = _explicit_window_attention(
+        query=query,
+        context_key=context_key,
+        context_value=context_value,
+        query_key=query_key,
+        query_value=query_value,
+        window_tokens=512,
+    )
+    full, _ = _explicit_window_attention(
+        query=query,
+        context_key=context_key,
+        context_value=context_value,
+        query_key=query_key,
+        query_value=query_value,
+        window_tokens=None,
+    )
+    windowed_error = _relative_l2(windowed, observed)
+    full_error = _relative_l2(full, observed)
+    window_is_discriminated = context_key.shape[0] + query.shape[0] > 512
+    return {
+        "window_tokens": 512,
+        "allowed_key_ranges": [list(value) for value in ranges],
+        "windowed_relative_l2": windowed_error,
+        "full_causal_relative_l2": full_error,
+        "windowed_passed": windowed_error <= ATTENTION_REFERENCE_MAX_RELATIVE_L2,
+        "window_semantics_discriminated": (
+            not window_is_discriminated or full_error > 5 * windowed_error
+        ),
+    }
+
+
+def _source_cache(
+    root: Path, manifest: dict[str, Any], name: str
+) -> np.ndarray:
+    value = _load_array(root, manifest["boundaries"][name])
+    if value.ndim != 4 or value.shape[0] != 1:
+        raise ConformanceError(f"ATTENTION_SOURCE_CACHE_LAYOUT:{name}:{value.shape}")
+    return value[0]
+
+
+def _adapter_cache(
+    root: Path, manifest: dict[str, Any], name: str
+) -> np.ndarray:
+    value = _load_array(root, manifest["boundaries"][name])
+    if value.ndim != 3:
+        raise ConformanceError(f"ATTENTION_ADAPTER_CACHE_LAYOUT:{name}:{value.shape}")
+    return value
+
+
+def _validate_attention_runtime_contract(
+    manifest: dict[str, Any], *, prefix_caching: bool, cell_id: str
+) -> None:
+    provenance = manifest["provenance"]
+    if (
+        provenance.get("lane") != "injected"
+        or provenance.get("prefix_caching") is not prefix_caching
+    ):
+        raise ConformanceError(
+            f"ATTENTION_CACHE_LANE_INVALID:{cell_id}:{prefix_caching}"
+        )
+    runtime = provenance.get("attention_runtime")
+    layers = runtime.get("layers") if isinstance(runtime, dict) else None
+    if not isinstance(layers, list) or len(layers) != 5:
+        raise ConformanceError(f"ATTENTION_CACHE_RUNTIME_INVALID:{cell_id}")
+    for layer_index, layer in enumerate(layers):
+        if (
+            not isinstance(layer, dict)
+            or layer.get("layer") != layer_index
+            or layer.get("backend_name") != "FLASH_ATTN"
+            or layer.get("wrapper_sliding_window") is not None
+            or layer.get("outer_sliding_window") != 512
+            or layer.get("implementation_sliding_window") not in (
+                512,
+                [511, 0],
+                [512, 0],
+            )
+        ):
+            raise ConformanceError(
+                f"ATTENTION_CACHE_RUNTIME_LAYER_INVALID:{cell_id}:{layer_index}"
+            )
+
+
+def build_attention_cache_parity_report(
+    *,
+    source_cells_root: Path,
+    cached_cells_root: Path,
+    fresh_cells_root: Path,
+    context_id: str = "tokens-511",
+) -> dict[str, Any]:
+    source: list[tuple[Path, dict[str, Any]]] = []
+    cached: list[tuple[Path, dict[str, Any]]] = []
+    fresh: list[tuple[Path, dict[str, Any]]] = []
+    for round_index in range(ROUNDS):
+        cell_id = f"{context_id}--round-{round_index}"
+        source_root = source_cells_root / cell_id
+        cached_root = cached_cells_root / cell_id
+        fresh_root = fresh_cells_root / cell_id
+        source_manifest = _load_manifest(source_root / "manifest.json")
+        cached_manifest = _load_manifest(cached_root / "manifest.json")
+        fresh_manifest = _load_manifest(fresh_root / "manifest.json")
+        _validate_attention_runtime_contract(
+            cached_manifest, prefix_caching=True, cell_id=cell_id
+        )
+        _validate_attention_runtime_contract(
+            fresh_manifest, prefix_caching=False, cell_id=cell_id
+        )
+        source_hash = source_manifest["manifest_sha256"]
+        for lane, manifest in (("cached", cached_manifest), ("fresh", fresh_manifest)):
+            if manifest["provenance"].get("source_manifest_sha256") != source_hash:
+                raise ConformanceError(
+                    f"ATTENTION_CACHE_SOURCE_BINDING_INVALID:{lane}:{cell_id}"
+                )
+        source.append((source_root, source_manifest))
+        cached.append((cached_root, cached_manifest))
+        fresh.append((fresh_root, fresh_manifest))
+
+    cached_starts = [int(item[1]["processed_token_start"]) for item in cached]
+    fresh_starts = [int(item[1]["processed_token_start"]) for item in fresh]
+    if cached_starts != [0, 480, 496]:
+        raise ConformanceError(f"ATTENTION_CACHED_STARTS_INVALID:{cached_starts}")
+    if fresh_starts != [0, 0, 0]:
+        raise ConformanceError(f"ATTENTION_FRESH_STARTS_INVALID:{fresh_starts}")
+
+    source_discontinuities: list[dict[str, Any]] = []
+    for round_index in range(1, ROUNDS):
+        previous_root, previous = source[round_index - 1]
+        current_root, current = source[round_index]
+        previous_feature = _load_array(
+            previous_root, previous["boundaries"]["combined_target_feature"]
+        )
+        current_feature = _load_array(
+            current_root, current["boundaries"]["combined_target_feature"]
+        )
+        shared = min(previous_feature.shape[0], current_feature.shape[0])
+        left = previous_feature[:shared]
+        right = current_feature[:shared]
+        source_discontinuities.append(
+            {
+                "from_round": round_index - 1,
+                "to_round": round_index,
+                "shared_tokens": shared,
+                "relative_l2": _relative_l2(left, right),
+                "exact_token_rows": int(np.all(left == right, axis=-1).sum()),
+            }
+        )
+
+    cached_cells: list[dict[str, Any]] = []
+    fresh_cells: list[dict[str, Any]] = []
+    prior_cached: tuple[np.ndarray, np.ndarray] | None = None
+    for round_index in range(ROUNDS):
+        source_root, source_manifest = source[round_index]
+        cached_root, cached_manifest = cached[round_index]
+        fresh_root, fresh_manifest = fresh[round_index]
+        source_key = _source_cache(
+            source_root, source_manifest, "layer0_context_k_after_rope"
+        )
+        source_value = _source_cache(
+            source_root, source_manifest, "layer0_context_v"
+        )
+        cached_key = _adapter_cache(
+            cached_root, cached_manifest, "layer0_logical_context_k_0"
+        )
+        cached_value = _adapter_cache(
+            cached_root, cached_manifest, "layer0_logical_context_v_0"
+        )
+        fresh_key = _adapter_cache(
+            fresh_root, fresh_manifest, "layer0_logical_context_k_0"
+        )
+        fresh_value = _adapter_cache(
+            fresh_root, fresh_manifest, "layer0_logical_context_v_0"
+        )
+        start = cached_starts[round_index]
+        stable_prefix_end = (
+            0 if round_index == 0 else cached_starts[1]
+        )
+        reuse_passed = True
+        if prior_cached is not None:
+            reuse_passed = bool(
+                np.array_equal(
+                    cached_key[:stable_prefix_end],
+                    prior_cached[0][:stable_prefix_end],
+                )
+                and np.array_equal(
+                    cached_value[:stable_prefix_end],
+                    prior_cached[1][:stable_prefix_end],
+                )
+            )
+        cached_cells.append(
+            {
+                "round": round_index,
+                "processed_token_start": start,
+                "stable_reused_prefix_end": stable_prefix_end,
+                "transition_block": [stable_prefix_end, start],
+                "transition_block_statefully_verified": False,
+                "reused_prefix_exact": reuse_passed,
+                "recomputed_suffix_key_relative_l2": _relative_l2(
+                    source_key[start:], cached_key[start:]
+                ),
+                "recomputed_suffix_value_relative_l2": _relative_l2(
+                    source_value[start:], cached_value[start:]
+                ),
+                "attention_reference": _attention_reference_metrics(
+                    cached_root, cached_manifest
+                ),
+                "cuda_kernel_events": cached_manifest[
+                    "_validated_cuda_kernel_events"
+                ],
+            }
+        )
+        source_proposals = _load_array(
+            source_root, source_manifest["boundaries"]["proposal_token_ids"]
+        ).reshape(-1)
+        cached_proposals = _load_array(
+            cached_root, cached_manifest["boundaries"]["proposal_token_ids"]
+        ).reshape(-1)
+        cached_cells[-1]["proposal_token_ids_exact_against_fresh_source"] = bool(
+            np.array_equal(source_proposals, cached_proposals)
+        )
+        cached_cells[-1]["proposal_mismatch_indices_against_fresh_source"] = (
+            np.flatnonzero(source_proposals != cached_proposals).tolist()
+            if source_proposals.shape == cached_proposals.shape
+            else list(range(max(source_proposals.size, cached_proposals.size)))
+        )
+        fresh_proposals = _load_array(
+            fresh_root, fresh_manifest["boundaries"]["proposal_token_ids"]
+        ).reshape(-1)
+        fresh_cells.append(
+            {
+                "round": round_index,
+                "processed_token_start": fresh_starts[round_index],
+                "proposal_token_ids_exact": bool(
+                    np.array_equal(source_proposals, fresh_proposals)
+                ),
+                "key_relative_l2": _relative_l2(source_key, fresh_key),
+                "value_relative_l2": _relative_l2(source_value, fresh_value),
+                "attention_reference": _attention_reference_metrics(
+                    fresh_root, fresh_manifest
+                ),
+                "cuda_kernel_events": fresh_manifest[
+                    "_validated_cuda_kernel_events"
+                ],
+            }
+        )
+        prior_cached = (cached_key, cached_value)
+
+    cached_passed = all(
+        cell["reused_prefix_exact"]
+        and cell["recomputed_suffix_key_relative_l2"]
+        <= FRESH_CACHE_MAX_RELATIVE_L2
+        and cell["recomputed_suffix_value_relative_l2"]
+        <= FRESH_CACHE_MAX_RELATIVE_L2
+        and cell["attention_reference"]["windowed_passed"]
+        and cell["attention_reference"]["window_semantics_discriminated"]
+        for cell in cached_cells
+    )
+    fresh_passed = all(
+        cell["proposal_token_ids_exact"]
+        and cell["key_relative_l2"] <= FRESH_CACHE_MAX_RELATIVE_L2
+        and cell["value_relative_l2"] <= FRESH_CACHE_MAX_RELATIVE_L2
+        and cell["attention_reference"]["windowed_passed"]
+        and cell["attention_reference"]["window_semantics_discriminated"]
+        for cell in fresh_cells
+    )
+    source_state_mismatch_observed = any(
+        item["relative_l2"] > FRESH_CACHE_MAX_RELATIVE_L2
+        for item in source_discontinuities
+    )
+    report: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "laguna_dspark_attention_cache_parity",
+        "context_id": context_id,
+        "runtime_contract": {
+            "lane": "injected",
+            "attention_backend": "FLASH_ATTN",
+            "sliding_window_tokens": 512,
+            "cached_prefix_caching": True,
+            "fresh_prefix_caching": False,
+        },
+        "thresholds": {
+            "scope": "empirically_calibrated_diagnostic_tolerances",
+            "attention_reference_max_relative_l2": (
+                ATTENTION_REFERENCE_MAX_RELATIVE_L2
+            ),
+            "fresh_cache_max_relative_l2": FRESH_CACHE_MAX_RELATIVE_L2,
+        },
+        "source_feature_discontinuities": source_discontinuities,
+        "cached_runtime": cached_cells,
+        "fresh_runtime": fresh_cells,
+        "result": {
+            "attention_cache_semantics_passed": cached_passed,
+            "fresh_prefix_parity_passed": fresh_passed,
+            "deep_spec_source_is_stateful": False,
+            "transition_blocks_statefully_verified": False,
+            "source_state_mismatch_observed": source_state_mismatch_observed,
+            "runtime_fix_required": not (cached_passed and fresh_passed),
+            "diagnosis": (
+                "source_oracle_state_mismatch"
+                if cached_passed and fresh_passed and source_state_mismatch_observed
+                else (
+                    "attention_cache_parity_cleared"
+                    if cached_passed and fresh_passed
+                    else "attention_cache_parity_unresolved"
+                )
+            ),
+        },
+    }
+    report = _stable_report_values(report)
+    report["report_sha256"] = canonical_sha256(report)
+    return report
+
+
+def validate_attention_cache_parity_report(
+    report: dict[str, Any],
+    *,
+    source_cells_root: Path,
+    cached_cells_root: Path,
+    fresh_cells_root: Path,
+) -> None:
+    expected = report.get("report_sha256")
+    unsigned = {key: value for key, value in report.items() if key != "report_sha256"}
+    if expected != canonical_sha256(unsigned):
+        raise ConformanceError("ATTENTION_CACHE_REPORT_HASH_MISMATCH")
+    recomputed = build_attention_cache_parity_report(
+        source_cells_root=source_cells_root,
+        cached_cells_root=cached_cells_root,
+        fresh_cells_root=fresh_cells_root,
+        context_id=report["context_id"],
+    )
+    if recomputed != report:
+        raise ConformanceError("ATTENTION_CACHE_REPORT_RECOMPUTATION_MISMATCH")

@@ -7,6 +7,7 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 from vllm.config import VllmConfig
+from vllm.model_executor.layers.attention.attention import get_attention_context
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.laguna_dflash import DFlashLagunaModel
@@ -22,9 +23,12 @@ from opjax.remote.laguna_dspark_capture import (
     capture_step,
     capture_is_active,
     capture_is_configured,
+    capture_static_metadata,
     capture_static_tensor,
     capture_tensor,
+    logical_context_kv,
     load_target_feature_override,
+    validate_single_request_attention_layout,
 )
 
 
@@ -56,6 +60,35 @@ class LagunaDSparkModel(DFlashLagunaModel):
             )
         if self._capture_enabled:
             self._register_capture_hooks()
+            capture_static_metadata(
+                "attention-runtime",
+                {
+                    "layers": [
+                        self._attention_runtime_metadata(layer_id, layer)
+                        for layer_id, layer in enumerate(self.layers)
+                    ]
+                },
+            )
+
+    @staticmethod
+    def _attention_runtime_metadata(layer_id: int, layer: nn.Module) -> dict[str, object]:
+        attention = layer.self_attn.attn
+        implementation = attention.impl
+        backend = attention.get_attn_backend()
+        return {
+            "layer": layer_id,
+            "backend_name": backend.get_name(),
+            "backend_class": f"{backend.__module__}.{backend.__qualname__}",
+            "implementation_class": (
+                f"{type(implementation).__module__}."
+                f"{type(implementation).__qualname__}"
+            ),
+            "wrapper_sliding_window": attention.sliding_window,
+            "implementation_sliding_window": getattr(
+                implementation, "sliding_window", None
+            ),
+            "outer_sliding_window": layer.self_attn.sliding_window,
+        }
 
     def _register_capture_hooks(self) -> None:
         for layer_id, layer in enumerate(self.layers):
@@ -74,6 +107,9 @@ class LagunaDSparkModel(DFlashLagunaModel):
             module.register_forward_hook(self._capture_operation(name))
         layer.self_attn.attn.register_forward_pre_hook(
             self._capture_attention_inputs
+        )
+        layer.self_attn.attn.register_forward_hook(
+            self._capture_operation("layer0_raw_attention_output")
         )
         layer.self_attn.o_proj.register_forward_pre_hook(
             self._capture_gated_attention
@@ -103,12 +139,46 @@ class LagunaDSparkModel(DFlashLagunaModel):
         return capture
 
     @staticmethod
-    def _capture_attention_inputs(_module, inputs) -> None:
+    def _capture_attention_inputs(module, inputs) -> None:
         if len(inputs) < 3:
             raise RuntimeError("LAGUNA_DSPARK_ATTENTION_INPUTS_INVALID")
         capture_tensor("layer0_query_q_after_rope", inputs[0])
         capture_tensor("layer0_query_k_after_rope", inputs[1])
         capture_tensor("layer0_query_v", inputs[2])
+        if not capture_is_active():
+            return
+        metadata, _attention, kv_cache, slot_mapping = get_attention_context(
+            module.layer_name
+        )
+        for name in ("query_start_loc", "seq_lens", "block_table", "slot_mapping"):
+            value = slot_mapping if name == "slot_mapping" else getattr(metadata, name)
+            if value is None:
+                raise RuntimeError(f"LAGUNA_DSPARK_ATTENTION_METADATA_MISSING:{name}")
+            capture_tensor(f"layer0_metadata_{name}", value)
+        sequence_lengths = metadata.seq_lens.reshape(-1)
+        block_tables = metadata.block_table
+        query_length = int(inputs[0].shape[0])
+        validate_single_request_attention_layout(
+            metadata.query_start_loc,
+            sequence_lengths,
+            block_tables,
+            slot_mapping,
+            query_length=query_length,
+            block_size=int(kv_cache.shape[2]),
+        )
+        if kv_cache.shape[-1] != 2 * module.head_size:
+            raise RuntimeError(
+                "LAGUNA_DSPARK_ATTENTION_CACHE_WIDTH:"
+                f"{kv_cache.shape[-1]}:{module.head_size}"
+            )
+        context_k, context_v = logical_context_kv(
+            kv_cache,
+            block_tables[0],
+            sequence_length=int(sequence_lengths[0].item()),
+            query_length=query_length,
+        )
+        capture_tensor("layer0_logical_context_k", context_k)
+        capture_tensor("layer0_logical_context_v", context_v)
 
     @staticmethod
     def _capture_gated_attention(_module, inputs) -> None:
