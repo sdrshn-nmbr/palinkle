@@ -20,6 +20,12 @@ from opjax.pallas.laguna_speculative import (
     canonical_response_signature,
     normalize_dspark_config,
     partition_replay_records,
+    replay_endpoint_headers,
+    runtime_custom_all_reduce_disabled,
+    runtime_gpu_memory_utilization,
+    runtime_kv_cache_memory_bytes,
+    runtime_tensor_parallel_size,
+    runtime_tokenizer_path,
     _request,
     select_parity_panel,
     server_command,
@@ -27,6 +33,13 @@ from opjax.pallas.laguna_speculative import (
     validate_bound_replay_result,
     validate_live_serving_evidence,
 )
+
+
+def test_loopback_replay_does_not_resolve_modal_credentials() -> None:
+    def fail() -> dict[str, str]:
+        raise AssertionError("modal credential lookup must not run")
+
+    assert replay_endpoint_headers("http://127.0.0.1:8000", fail) == {}
 
 
 def _runtime(arm: str, checkpoint: dict[str, object] | None) -> dict[str, object]:
@@ -127,6 +140,41 @@ def test_runtime_identity_accepts_only_dspark_config_normalization() -> None:
         bound["runtime_evidence"]["checkpoint_transform"]
         == "normalized_dspark_serving_config"
     )
+
+
+def test_runtime_identity_accepts_hash_identical_relocated_checkpoint() -> None:
+    selected = {
+        "sha256": "selected",
+        "path": "/modal/checkpoint",
+        "files": {"config.json": "config", "model.safetensors": "weights"},
+    }
+    served = {**selected, "path": "/gcp/checkpoint"}
+    selection = {"arm": DFLASH, "checkpoint": selected, "sha256": "selection"}
+    bound = bind_trained_runtime_identity(
+        result={"arm": DFLASH, "model_identity": selection},
+        runtime=_runtime(DFLASH, served),
+        runtime_file_sha256="file",
+        selection=selection,
+    )
+    assert bound["runtime_evidence"]["checkpoint_transform"] == (
+        "relocated_checkpoint"
+    )
+    assert validate_bound_replay_result(result=bound, selection=selection)
+
+    for mutation in (
+        {"sha256": "different"},
+        {"files": {"config.json": "different", "model.safetensors": "weights"}},
+        {"path": selected["path"]},
+    ):
+        invalid = json.loads(json.dumps(bound))
+        invalid["runtime_evidence"]["draft_checkpoint"].update(mutation)
+        invalid["result_sha256"] = canonical_sha256(
+            {key: value for key, value in invalid.items() if key != "result_sha256"}
+        )
+        with pytest.raises(
+            LagunaSpeculativeError, match="BOUND_REPLAY_CHECKPOINT_MISMATCH"
+        ):
+            validate_bound_replay_result(result=invalid, selection=selection)
 
 
 def test_live_evidence_requires_hash_bound_replay() -> None:
@@ -263,11 +311,124 @@ def test_server_commands_share_runtime_and_target() -> None:
     assert '"num_speculative_tokens":15' in commands[DSPARK][-1]
 
 
+def test_server_command_binds_tensor_parallel_size() -> None:
+    command = server_command(
+        PLAIN,
+        port=8000,
+        tensor_parallel_size=2,
+        gpu_memory_utilization=0.84,
+        kv_cache_memory_bytes=1610612736,
+    )
+    index = command.index("--tensor-parallel-size")
+    assert command[index + 1] == "2"
+    memory_index = command.index("--gpu-memory-utilization")
+    assert command[memory_index + 1] == "0.84"
+    kv_index = command.index("--kv-cache-memory-bytes")
+    assert command[kv_index + 1] == "1610612736"
+
+
+def test_server_command_rejects_invalid_gpu_memory_utilization() -> None:
+    for value in (0.0, 1.0, -0.1, 1.1):
+        with pytest.raises(
+            LagunaSpeculativeError,
+            match="GPU_MEMORY_UTILIZATION_INVALID",
+        ):
+            server_command(PLAIN, port=8000, gpu_memory_utilization=value)
+
+
+def test_server_command_rejects_invalid_kv_cache_memory() -> None:
+    for value in (0, -1):
+        with pytest.raises(
+            LagunaSpeculativeError,
+            match="KV_CACHE_MEMORY_BYTES_INVALID",
+        ):
+            server_command(PLAIN, port=8000, kv_cache_memory_bytes=value)
+
+
+def test_runtime_tensor_parallel_size_fails_closed() -> None:
+    assert runtime_tensor_parallel_size(
+        {"resolved_arguments": ["--tensor-parallel-size", "2"]}
+    ) == 2
+    for arguments in (
+        [],
+        ["--tensor-parallel-size", "1", "--tensor-parallel-size", "2"],
+        ["--tensor-parallel-size"],
+    ):
+        with pytest.raises(LagunaSpeculativeError, match="TENSOR_PARALLEL_ARG"):
+            runtime_tensor_parallel_size({"resolved_arguments": arguments})
+
+
+def test_runtime_gpu_memory_utilization_fails_closed() -> None:
+    assert runtime_gpu_memory_utilization(
+        {"resolved_arguments": ["--gpu-memory-utilization", "0.84"]}
+    ) == 0.84
+    for arguments in (
+        [],
+        ["--gpu-memory-utilization", "0.82", "--gpu-memory-utilization", "0.84"],
+        ["--gpu-memory-utilization"],
+        ["--gpu-memory-utilization", "nan"],
+        ["--gpu-memory-utilization", "1.0"],
+    ):
+        with pytest.raises(LagunaSpeculativeError, match="GPU_MEMORY_ARG"):
+            runtime_gpu_memory_utilization({"resolved_arguments": arguments})
+
+
+def test_runtime_kv_cache_memory_bytes_fails_closed() -> None:
+    assert runtime_kv_cache_memory_bytes(
+        {"resolved_arguments": ["--kv-cache-memory-bytes", "1610612736"]}
+    ) == 1610612736
+    for arguments in (
+        [],
+        ["--kv-cache-memory-bytes", "1", "--kv-cache-memory-bytes", "2"],
+        ["--kv-cache-memory-bytes"],
+        ["--kv-cache-memory-bytes", "0"],
+        ["--kv-cache-memory-bytes", "nan"],
+    ):
+        with pytest.raises(LagunaSpeculativeError, match="KV_CACHE_MEMORY_ARG"):
+            runtime_kv_cache_memory_bytes({"resolved_arguments": arguments})
+
+
+def test_runtime_tokenizer_path_fails_closed() -> None:
+    assert runtime_tokenizer_path(
+        {"resolved_arguments": ["--tokenizer", "/hf/tokenizer"]}
+    ) == "/hf/tokenizer"
+    for arguments in (
+        [],
+        ["--tokenizer"],
+        ["--tokenizer", "a", "--tokenizer", "b"],
+    ):
+        with pytest.raises(LagunaSpeculativeError, match="TOKENIZER_ARG"):
+            runtime_tokenizer_path({"resolved_arguments": arguments})
+
+
+def test_runtime_custom_all_reduce_disabled_fails_closed() -> None:
+    assert runtime_custom_all_reduce_disabled(
+        {"resolved_arguments": ["--disable-custom-all-reduce"]}
+    )
+    assert not runtime_custom_all_reduce_disabled({"resolved_arguments": []})
+    with pytest.raises(LagunaSpeculativeError, match="ALL_REDUCE_ARG"):
+        runtime_custom_all_reduce_disabled(
+            {
+                "resolved_arguments": [
+                    "--disable-custom-all-reduce",
+                    "--disable-custom-all-reduce",
+                ]
+            }
+        )
+
+
 def test_dflash_capture_overrides_the_laguna_runtime_class() -> None:
     command = server_command(DFLASH, port=8000, capture_dflash=True)
     override = command[command.index("--model-class-overrides") + 1]
     assert "DFlashLagunaForCausalLM" in override
     assert "CapturedLagunaDFlashForCausalLM" in override
+
+
+def test_target_capture_overrides_the_target_runtime_class() -> None:
+    command = server_command(DFLASH, port=8000, capture_target=True)
+    override = command[command.index("--model-class-overrides") + 1]
+    assert "LagunaForCausalLM" in override
+    assert "CapturedLagunaForCausalLM" in override
 
 
 def test_dspark_fixed_proposal_depth_is_explicit() -> None:
@@ -280,6 +441,13 @@ def test_dspark_fixed_proposal_depth_is_explicit() -> None:
     config = json.loads(command[command.index("--speculative-config") + 1])
     assert config["num_speculative_tokens"] == 8
     assert config["enable_adaptive_verification"] is False
+
+
+def test_dflash_fixed_proposal_depth_has_no_adaptive_option() -> None:
+    command = server_command(DFLASH, port=8000, proposal_tokens=4)
+    config = json.loads(command[command.index("--speculative-config") + 1])
+    assert config["num_speculative_tokens"] == 4
+    assert "enable_adaptive_verification" not in config
 
 
 @pytest.mark.parametrize("arm", [DFLASH, DSPARK])

@@ -16,6 +16,7 @@ import torch
 _LOCK = threading.Lock()
 _COUNTERS: dict[tuple[str, str], int] = {}
 _ACTIVE_ROUNDS: dict[str, int] = {}
+_TARGET_ROUNDS: dict[str, int] = {}
 
 
 def capture_step(value: torch.Tensor, step: int) -> torch.Tensor:
@@ -219,6 +220,74 @@ def begin_capture_round() -> int | None:
         round_id = _ACTIVE_ROUNDS.get(session, -1) + 1
         _ACTIVE_ROUNDS[session] = round_id
     return round_id
+
+
+def begin_target_capture_round() -> int | None:
+    active = _target_control()
+    if active is None:
+        return None
+    session = active[1]["session"]
+    with _LOCK:
+        round_id = _TARGET_ROUNDS.get(session, -1) + 1
+        _TARGET_ROUNDS[session] = round_id
+    return round_id
+
+
+def _target_control() -> tuple[Path, dict[str, Any]] | None:
+    root_value = os.environ.get("OPJAX_LAGUNA_TARGET_CAPTURE_ROOT")
+    if not root_value:
+        return None
+    root = Path(root_value)
+    control = root / "active.json"
+    if not control.is_file():
+        return None
+    value = json.loads(control.read_text(encoding="utf-8"))
+    session = value.get("session")
+    if not isinstance(session, str) or not session:
+        raise RuntimeError("LAGUNA_TARGET_CAPTURE_SESSION_INVALID")
+    return root, value
+
+
+def capture_target_tensor(name: str, value: torch.Tensor) -> None:
+    active = _target_control()
+    if active is None:
+        return
+    root, control = active
+    session = control["session"]
+    with _LOCK:
+        round_id = _TARGET_ROUNDS.get(session)
+    if round_id is None:
+        raise RuntimeError(f"LAGUNA_TARGET_CAPTURE_ROUND_NOT_STARTED:{session}:{name}")
+    with _LOCK:
+        key = (f"target:{session}", name)
+        index = _COUNTERS.get(key, 0)
+        _COUNTERS[key] = index + 1
+        session_root = root / session
+        session_root.mkdir(parents=True, exist_ok=True)
+        path = session_root / f"{name}-{index:03d}.npy"
+        temporary = path.with_suffix(".tmp")
+        tensor = value.detach().contiguous().cpu()
+        if tensor.dtype == torch.bfloat16:
+            array = tensor.view(torch.uint16).numpy()
+        else:
+            array = tensor.numpy()
+        with temporary.open("wb") as handle:
+            np.save(handle, array, allow_pickle=False)
+        os.replace(temporary, path)
+        record = {
+            "name": name,
+            "index": index,
+            "path": path.name,
+            "shape": list(array.shape),
+            "dtype": str(array.dtype),
+            "source_dtype": str(value.dtype),
+            "round": round_id,
+            "sha256": _sha256(path),
+        }
+        with (session_root / "target-ledger.jsonl").open(
+            "a", encoding="utf-8"
+        ) as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
 
 
 def load_target_feature_override() -> torch.Tensor | None:

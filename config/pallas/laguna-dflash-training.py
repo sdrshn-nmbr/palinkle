@@ -1,8 +1,12 @@
+import os
+
 from deepspec.trainer import LagunaDSparkTrainer
 
 
+namespace = os.environ.get("OPJAX_LAGUNA_TRAINING_NAMESPACE", "legacy")
+experiment_root = f"/mnt/training/experiments/{namespace}"
 project_name = "opjax"
-exp_name = "laguna_dflash_matched_v1"
+exp_name = f"laguna_dflash_{namespace}"
 seed = 42
 
 model = {
@@ -13,7 +17,7 @@ model = {
     "target_device_map": None,
     "target_max_memory": None,
     "target_offload_folder": None,
-    "initial_dflash_checkpoint": "/mnt/training/initialized/dflash",
+    "initial_dflash_checkpoint": f"{experiment_root}/initialized/dflash",
     "block_size": 16,
     "proposal_length": 15,
     "num_draft_layers": 5,
@@ -53,12 +57,12 @@ train = {
 logging = {
     "logging_steps": 1,
     "checkpointing_steps": 13,
-    "checkpoint_dir": "/mnt/training/checkpoints/dflash",
-    "tensorboard_dir": "/mnt/training/tensorboard/dflash",
+    "checkpoint_dir": f"{experiment_root}/checkpoints/dflash",
+    "tensorboard_dir": f"{experiment_root}/tensorboard/dflash",
 }
 
 data = {
-    "target_cache_path": "/mnt/training/cache/train",
+    "target_cache_path": f"{experiment_root}/cache/train",
     "chat_template": "laguna_thinking",
     "max_length": 18432,
     "num_workers": 2,

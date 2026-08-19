@@ -5,6 +5,8 @@ from __future__ import annotations
 import concurrent.futures
 import hashlib
 import json
+import math
+import re
 import statistics
 import sys
 import time
@@ -12,6 +14,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+from collections.abc import Callable
 
 
 class LagunaSpeculativeError(ValueError):
@@ -21,6 +24,108 @@ class LagunaSpeculativeError(ValueError):
 def canonical_sha256(value: Any) -> str:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def replay_endpoint_headers(
+    endpoint: str, modal_headers_factory: Callable[[], dict[str, str]]
+) -> dict[str, str]:
+    if endpoint.rstrip("/") in {"http://127.0.0.1:8000", "http://localhost:8000"}:
+        return {}
+    return modal_headers_factory()
+
+
+def ordered_replay_prompt_ids(records: object) -> list[str]:
+    if not isinstance(records, list):
+        raise LagunaSpeculativeError("LAGUNA_REPLAY_PROMPT_RECORDS_INVALID")
+    prompt_ids = [
+        record.get("prompt_id") if isinstance(record, dict) else None
+        for record in records
+    ]
+    if any(not isinstance(prompt_id, str) or not prompt_id for prompt_id in prompt_ids):
+        raise LagunaSpeculativeError("LAGUNA_REPLAY_PROMPT_ID_INVALID")
+    if len(prompt_ids) != len(set(prompt_ids)):
+        raise LagunaSpeculativeError("LAGUNA_REPLAY_PROMPT_ID_DUPLICATE")
+    return prompt_ids
+
+
+def runtime_tensor_parallel_size(runtime: dict[str, Any]) -> int:
+    arguments = runtime.get("resolved_arguments")
+    if not isinstance(arguments, list) or arguments.count("--tensor-parallel-size") != 1:
+        raise LagunaSpeculativeError("LAGUNA_RUNTIME_TENSOR_PARALLEL_ARG_INVALID")
+    index = arguments.index("--tensor-parallel-size")
+    if index + 1 >= len(arguments):
+        raise LagunaSpeculativeError("LAGUNA_RUNTIME_TENSOR_PARALLEL_ARG_INVALID")
+    try:
+        value = int(arguments[index + 1])
+    except (TypeError, ValueError) as error:
+        raise LagunaSpeculativeError(
+            "LAGUNA_RUNTIME_TENSOR_PARALLEL_ARG_INVALID"
+        ) from error
+    if value < 1:
+        raise LagunaSpeculativeError("LAGUNA_RUNTIME_TENSOR_PARALLEL_ARG_INVALID")
+    return value
+
+
+def runtime_gpu_memory_utilization(runtime: dict[str, Any]) -> float:
+    arguments = runtime.get("resolved_arguments")
+    if (
+        not isinstance(arguments, list)
+        or arguments.count("--gpu-memory-utilization") != 1
+    ):
+        raise LagunaSpeculativeError("LAGUNA_RUNTIME_GPU_MEMORY_ARG_INVALID")
+    index = arguments.index("--gpu-memory-utilization")
+    if index + 1 >= len(arguments):
+        raise LagunaSpeculativeError("LAGUNA_RUNTIME_GPU_MEMORY_ARG_INVALID")
+    try:
+        value = float(arguments[index + 1])
+    except (TypeError, ValueError) as error:
+        raise LagunaSpeculativeError(
+            "LAGUNA_RUNTIME_GPU_MEMORY_ARG_INVALID"
+        ) from error
+    if not math.isfinite(value) or not 0.0 < value < 1.0:
+        raise LagunaSpeculativeError("LAGUNA_RUNTIME_GPU_MEMORY_ARG_INVALID")
+    return value
+
+
+def runtime_kv_cache_memory_bytes(runtime: dict[str, Any]) -> int:
+    arguments = runtime.get("resolved_arguments")
+    if not isinstance(arguments, list) or arguments.count("--kv-cache-memory-bytes") != 1:
+        raise LagunaSpeculativeError("LAGUNA_RUNTIME_KV_CACHE_MEMORY_ARG_INVALID")
+    index = arguments.index("--kv-cache-memory-bytes")
+    if index + 1 >= len(arguments):
+        raise LagunaSpeculativeError("LAGUNA_RUNTIME_KV_CACHE_MEMORY_ARG_INVALID")
+    try:
+        value = int(arguments[index + 1])
+    except (TypeError, ValueError) as error:
+        raise LagunaSpeculativeError(
+            "LAGUNA_RUNTIME_KV_CACHE_MEMORY_ARG_INVALID"
+        ) from error
+    if value < 1:
+        raise LagunaSpeculativeError("LAGUNA_RUNTIME_KV_CACHE_MEMORY_ARG_INVALID")
+    return value
+
+
+def runtime_tokenizer_path(runtime: dict[str, Any]) -> str:
+    arguments = runtime.get("resolved_arguments")
+    if not isinstance(arguments, list) or arguments.count("--tokenizer") != 1:
+        raise LagunaSpeculativeError("LAGUNA_RUNTIME_TOKENIZER_ARG_INVALID")
+    index = arguments.index("--tokenizer")
+    if index + 1 >= len(arguments) or not isinstance(arguments[index + 1], str):
+        raise LagunaSpeculativeError("LAGUNA_RUNTIME_TOKENIZER_ARG_INVALID")
+    value = arguments[index + 1]
+    if not value:
+        raise LagunaSpeculativeError("LAGUNA_RUNTIME_TOKENIZER_ARG_INVALID")
+    return value
+
+
+def runtime_custom_all_reduce_disabled(runtime: dict[str, Any]) -> bool:
+    arguments = runtime.get("resolved_arguments")
+    if not isinstance(arguments, list):
+        raise LagunaSpeculativeError("LAGUNA_RUNTIME_ALL_REDUCE_ARG_INVALID")
+    count = arguments.count("--disable-custom-all-reduce")
+    if count > 1:
+        raise LagunaSpeculativeError("LAGUNA_RUNTIME_ALL_REDUCE_ARG_INVALID")
+    return count == 1
 
 
 BASH_TOOL = {
@@ -204,7 +309,19 @@ def server_command(
     draft_model: str | None = None,
     draft_revision: str | None = None,
     capture_dflash: bool = False,
+    capture_target: bool = False,
+    tensor_parallel_size: int = 1,
+    gpu_memory_utilization: float = 0.82,
+    kv_cache_memory_bytes: int | None = None,
+    tokenizer: str | None = None,
+    disable_custom_all_reduce: bool = False,
 ) -> list[str]:
+    if tensor_parallel_size < 1:
+        raise LagunaSpeculativeError("LAGUNA_TENSOR_PARALLEL_SIZE_INVALID")
+    if not 0.0 < gpu_memory_utilization < 1.0:
+        raise LagunaSpeculativeError("LAGUNA_GPU_MEMORY_UTILIZATION_INVALID")
+    if kv_cache_memory_bytes is not None and kv_cache_memory_bytes < 1:
+        raise LagunaSpeculativeError("LAGUNA_KV_CACHE_MEMORY_BYTES_INVALID")
     speculative = _speculative_config(
         arm,
         proposal_tokens=proposal_tokens,
@@ -221,16 +338,23 @@ def server_command(
         TARGET_REVISION,
         "--served-model-name",
         TARGET_ID,
+        *(["--tokenizer", tokenizer] if tokenizer is not None else []),
         "--host",
         "0.0.0.0",
         "--port",
         str(port),
         "--tensor-parallel-size",
-        "1",
+        str(tensor_parallel_size),
+        *(["--disable-custom-all-reduce"] if disable_custom_all_reduce else []),
         "--dtype",
         "bfloat16",
         "--gpu-memory-utilization",
-        "0.82",
+        str(gpu_memory_utilization),
+        *(
+            ["--kv-cache-memory-bytes", str(kv_cache_memory_bytes)]
+            if kv_cache_memory_bytes is not None
+            else []
+        ),
         "--max-model-len",
         "32768",
         "--max-num-seqs",
@@ -256,6 +380,16 @@ def server_command(
                         )
                     }
                     if capture_dflash
+                    else {}
+                ),
+                **(
+                    {
+                        "LagunaForCausalLM": (
+                            "opjax.remote.laguna_target_capture_model:"
+                            "CapturedLagunaForCausalLM"
+                        )
+                    }
+                    if capture_target
                     else {}
                 ),
             },
@@ -461,7 +595,13 @@ def bind_trained_runtime_identity(
         if checkpoint != expected_checkpoint:
             expected_files = (expected_checkpoint or {}).get("files") or {}
             runtime_files = (checkpoint or {}).get("files") or {}
-            if not (
+            if (
+                runtime_files == expected_files
+                and (checkpoint or {}).get("sha256")
+                == (expected_checkpoint or {}).get("sha256")
+            ):
+                checkpoint_transform = "relocated_checkpoint"
+            elif not (
                 arm == DSPARK
                 and runtime_files.get("model.safetensors")
                 == expected_files.get("model.safetensors")
@@ -472,7 +612,8 @@ def bind_trained_runtime_identity(
                 )
             ):
                 raise LagunaSpeculativeError("LAGUNA_RUNTIME_CHECKPOINT_MISMATCH")
-            checkpoint_transform = "normalized_dspark_serving_config"
+            else:
+                checkpoint_transform = "normalized_dspark_serving_config"
         if arm == DFLASH:
             if not isinstance(alignment, dict) or alignment.get("state") not in {
                 "applied",
@@ -491,6 +632,10 @@ def bind_trained_runtime_identity(
         "execution_sources": runtime.get("execution_sources"),
         "resolved_arguments": runtime.get("resolved_arguments"),
         "image": runtime.get("image"),
+        "gpu": runtime.get("gpu"),
+        "attempt_id": runtime.get("attempt_id"),
+        "declared_gpu": runtime.get("declared_gpu"),
+        "deployment": runtime.get("deployment"),
         "vllm_observed_build": runtime.get("vllm_observed_build"),
     }
     bound["result_sha256"] = canonical_sha256(
@@ -515,16 +660,111 @@ def validate_bound_replay_result(
         raise LagunaSpeculativeError("LAGUNA_BOUND_REPLAY_RUNTIME_MISSING")
     checkpoint = evidence.get("draft_checkpoint") or {}
     expected_checkpoint = selection.get("checkpoint") or {}
+    checkpoint_transform = evidence.get("checkpoint_transform")
+    if checkpoint == expected_checkpoint and checkpoint_transform is not None:
+        raise LagunaSpeculativeError("LAGUNA_BOUND_REPLAY_CHECKPOINT_MISMATCH")
     if checkpoint != expected_checkpoint:
-        if not (
+        relocated_checkpoint = (
+            checkpoint_transform == "relocated_checkpoint"
+            and checkpoint.get("sha256") == expected_checkpoint.get("sha256")
+            and checkpoint.get("files") == expected_checkpoint.get("files")
+            and checkpoint.get("path") != expected_checkpoint.get("path")
+        )
+        normalized_dspark = (
             arm == DSPARK
-            and evidence.get("checkpoint_transform")
-            == "normalized_dspark_serving_config"
+            and checkpoint_transform == "normalized_dspark_serving_config"
             and (checkpoint.get("files") or {}).get("model.safetensors")
             == (expected_checkpoint.get("files") or {}).get("model.safetensors")
-        ):
+        )
+        if not (relocated_checkpoint or normalized_dspark):
             raise LagunaSpeculativeError("LAGUNA_BOUND_REPLAY_CHECKPOINT_MISMATCH")
     return evidence
+
+
+def validate_trained_replay_cells(
+    selected_cells: list[str],
+    *,
+    known_cells: set[str],
+    endpoint: str | None,
+    defer_summary: bool,
+) -> None:
+    if "dspark-adaptive" in selected_cells:
+        raise LagunaSpeculativeError("LAGUNA_TRAINED_REPLAY_ADAPTIVE_EXCLUDED")
+    single_deferred_cell = (
+        endpoint is not None and defer_summary and len(selected_cells) == 1
+    )
+    if (
+        ("plain" not in selected_cells and not single_deferred_cell)
+        or set(selected_cells) - known_cells
+    ):
+        raise LagunaSpeculativeError("LAGUNA_TRAINED_REPLAY_CELLS_INVALID")
+    if endpoint and len(selected_cells) != 1:
+        raise LagunaSpeculativeError(
+            "LAGUNA_TRAINED_REPLAY_ENDPOINT_REQUIRES_ONE_CELL"
+        )
+
+
+def validate_replay_attempt_receipt(path: Path | None) -> dict[str, Any] | None:
+    if path is None:
+        return None
+    raw = path.read_bytes()
+    receipt = json.loads(raw)
+    expected = canonical_sha256(
+        {key: value for key, value in receipt.items() if key != "sha256"}
+    )
+    if receipt.get("sha256") != expected:
+        raise LagunaSpeculativeError("LAGUNA_REPLAY_ATTEMPT_RECEIPT_HASH_MISMATCH")
+    deployment = receipt.get("deployment") or {}
+    launcher = receipt.get("container_launcher") or {}
+    tokenizer = receipt.get("tokenizer") or {}
+    tokenizer_files = tokenizer.get("files") or {}
+    tokenizer_files_valid = set(tokenizer_files) == {
+        "chat_template.jinja",
+        "special_tokens_map.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    } and all(
+        isinstance(record, dict)
+        and isinstance(record.get("bytes"), int)
+        and record["bytes"] > 0
+        and isinstance(record.get("sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", record["sha256"]) is not None
+        for record in tokenizer_files.values()
+    )
+    if (
+        receipt.get("schema_version") != 1
+        or receipt.get("kind") != "opjax_laguna_gce_replay_attempt"
+        or not receipt.get("attempt_id")
+        or not receipt.get("declared_gpu")
+        or not isinstance(receipt.get("gpu_count"), int)
+        or receipt["gpu_count"] < 1
+        or not isinstance(receipt.get("tensor_parallel_size"), int)
+        or receipt["tensor_parallel_size"] < 1
+        or not isinstance(receipt.get("gpu_memory_utilization"), (int, float))
+        or not math.isfinite(receipt["gpu_memory_utilization"])
+        or not 0.0 < receipt["gpu_memory_utilization"] < 1.0
+        or not isinstance(receipt.get("kv_cache_memory_bytes"), int)
+        or receipt["kv_cache_memory_bytes"] < 1
+        or receipt.get("disable_custom_all_reduce") is not True
+        or not receipt.get("image")
+        or not tokenizer.get("container_path")
+        or tokenizer.get("revision") != TARGET_REVISION
+        or not tokenizer_files_valid
+        or deployment.get("provider") != "gcp_compute_engine"
+        or any(
+            not deployment.get(key)
+            for key in ("id", "zone", "instance_id")
+        )
+        or not launcher.get("interpreter")
+        or not launcher.get("vllm_launcher")
+        or not receipt.get("measurement_sources")
+    ):
+        raise LagunaSpeculativeError("LAGUNA_REPLAY_ATTEMPT_RECEIPT_INVALID")
+    return {
+        "sha256": expected,
+        "file_sha256": hashlib.sha256(raw).hexdigest(),
+        "payload": receipt,
+    }
 
 
 def validate_live_serving_evidence(
@@ -545,7 +785,21 @@ def validate_live_serving_evidence(
     if depth_selection.get("arm") != arm or result.get("cell") != cell:
         raise LagunaSpeculativeError("LAGUNA_LIVE_CELL_MISMATCH")
     endpoint = result.get("endpoint")
-    if not isinstance(endpoint, str) or not endpoint.startswith("https://"):
+    attempt = result.get("attempt_receipt") or {}
+    attempt_payload = attempt.get("payload") or {}
+    deployment = evidence.get("deployment") or {}
+    gce_loopback = (
+        endpoint in {"http://127.0.0.1:8000", "http://localhost:8000"}
+        and attempt_payload.get("deployment", {}).get("provider")
+        == "gcp_compute_engine"
+        and deployment.get("OPJAX_DEPLOYMENT_PROVIDER")
+        == "gcp_compute_engine"
+        and deployment.get("OPJAX_DEPLOYMENT_INSTANCE_ID")
+        == attempt_payload.get("deployment", {}).get("instance_id")
+    )
+    if not isinstance(endpoint, str) or not (
+        endpoint.startswith("https://") or gce_loopback
+    ):
         raise LagunaSpeculativeError("LAGUNA_LIVE_ENDPOINT_INVALID")
     arguments = evidence.get("resolved_arguments")
     if not isinstance(arguments, list) or "--speculative-config" not in arguments:

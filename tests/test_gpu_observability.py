@@ -11,6 +11,7 @@ from opjax.remote.gpu_observability import (
     GpuStage,
     NsysProfile,
     cuda_capture,
+    gpu_runtime_identity,
     model_stage,
     nvtx_range,
     publish_hf,
@@ -20,6 +21,47 @@ from opjax.remote.gpu_observability import (
     warm_then_capture,
     write_artifact_manifest,
 )
+
+
+def test_gpu_runtime_identity_is_observed_and_hash_bound() -> None:
+    def run(command: tuple[str, ...], **_: object):
+        assert command[0] == "nvidia-smi"
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="NVIDIA H200, GPU-abc, 570.10, 143771, 9.0\n",
+            stderr="",
+        )
+
+    identity = gpu_runtime_identity(run=run)
+    assert identity["devices"] == [
+        {
+            "name": "NVIDIA H200",
+            "uuid": "GPU-abc",
+            "driver_version": "570.10",
+            "memory_total_mib": 143771,
+            "compute_capability": "9.0",
+        }
+    ]
+    assert identity["sha256"] == canonical_sha256(
+        {key: value for key, value in identity.items() if key != "sha256"}
+    )
+
+
+def test_gpu_runtime_identity_supports_bound_multi_gpu_topology() -> None:
+    def run(command: tuple[str, ...], **_: object):
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=(
+                "NVIDIA A100, GPU-a, 580.1, 40960, 8.0\n"
+                "NVIDIA A100, GPU-b, 580.1, 40960, 8.0\n"
+            ),
+            stderr="",
+        )
+
+    identity = gpu_runtime_identity(run=run, expected_count=2)
+    assert [device["uuid"] for device in identity["devices"]] == ["GPU-a", "GPU-b"]
 
 
 class FakeNvtx:

@@ -26,7 +26,14 @@ from opjax.remote.config import (
 APP_NAME = "opjax-laguna-speculative-v1"
 PORT = 8000
 ARTIFACT_ROOT = "/mnt/spec-artifacts"
-TRAINING_ROOT = "/mnt/training"
+TRAINING_ROOT = "/mnt/training/experiments/serving-native-v2"
+SERVING_GPU = os.environ.get("OPJAX_LAGUNA_SERVING_GPU", "H200")
+SERVING_ATTEMPT_ID = os.environ.get(
+    "OPJAX_LAGUNA_SERVING_ATTEMPT_ID",
+    "20260818-serving-native-v2-h200-v1",
+)
+if not SERVING_ATTEMPT_ID.replace("-", "").isalnum():
+    raise ValueError(f"LAGUNA_SERVING_ATTEMPT_ID_INVALID:{SERVING_ATTEMPT_ID}")
 
 app = modal.App(APP_NAME)
 cache = modal.Volume.from_name(
@@ -58,6 +65,8 @@ image = (
             "OPJAX_SPEC_ARTIFACT_ROOT": ARTIFACT_ROOT,
             "OPJAX_SPEC_ARTIFACT_VOLUME": "opjax-laguna-speculative-artifacts-v1",
             "OPJAX_SPEC_MODAL_ENVIRONMENT": MODAL_ENVIRONMENT,
+            "OPJAX_SPEC_ATTEMPT_ID": SERVING_ATTEMPT_ID,
+            "OPJAX_SPEC_DECLARED_GPU": SERVING_GPU,
         }
     )
     .add_local_python_source("opjax")
@@ -65,7 +74,7 @@ image = (
 
 FUNCTION_OPTIONS = {
     "image": image,
-    "gpu": "H200",
+    "gpu": SERVING_GPU,
     "volumes": {
         HF_CACHE_DIR: cache,
         ARTIFACT_ROOT: artifacts,
@@ -93,7 +102,7 @@ def _launch(
         if proposal_tokens is None
         else f"{checkpoint}-{arm}-{schedule}-{proposal_tokens}"
     )
-    os.environ["OPJAX_SPEC_RUN_ID"] = f"20260814-rope-corrected-{suffix}"
+    os.environ["OPJAX_SPEC_RUN_ID"] = f"{SERVING_ATTEMPT_ID}-{suffix}"
     subprocess.Popen(
         server_command(
             arm,

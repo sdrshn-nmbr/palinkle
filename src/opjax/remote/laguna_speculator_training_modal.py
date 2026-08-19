@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
+import re
 import subprocess
 import time
 
@@ -37,6 +39,12 @@ cache = modal.Volume.from_name(
 )
 training = modal.Volume.from_name(
     "opjax-laguna-speculator-training-v1",
+    environment_name=MODAL_ENVIRONMENT,
+    create_if_missing=True,
+    version=MODAL_VOLUME_VERSION,
+)
+serving_native = modal.Volume.from_name(
+    "opjax-laguna-serving-native-v1",
     environment_name=MODAL_ENVIRONMENT,
     create_if_missing=True,
     version=MODAL_VOLUME_VERSION,
@@ -88,13 +96,25 @@ image = (
         "config/pallas/laguna-dflash-training.py",
         "/opt/opjax-config/laguna-dflash-training.py",
     )
+    .add_local_file(
+        "src/opjax/remote/build_laguna_serving_native_cache.py",
+        "/opt/opjax-execution/build_laguna_serving_native_cache.py",
+    )
+    .add_local_file(
+        "src/opjax/remote/prepare_laguna_serving_native_tokens.py",
+        "/opt/opjax-execution/prepare_laguna_serving_native_tokens.py",
+    )
     .add_local_dir(
         "data/pallas/corpora/laguna-speculator-v1",
         "/opt/opjax-data",
     )
 )
 
-VOLUMES = {HF_CACHE_DIR: cache, str(ROOT): training}
+VOLUMES = {
+    HF_CACHE_DIR: cache,
+    str(ROOT): training,
+    "/mnt/serving-native": serving_native,
+}
 OPTIONS = {
     "image": image,
     "volumes": VOLUMES,
@@ -129,6 +149,31 @@ def _checkpoint_identity(path: Path) -> dict[str, object]:
             json.dumps(files, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest(),
     }
+
+
+def _canonical_sha256(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _validated_json(path: Path, hash_key: str) -> dict[str, object]:
+    if not path.is_file():
+        raise RuntimeError(f"LAGUNA_BOUND_JSON_MISSING:{path}")
+    value = json.loads(path.read_text(encoding="utf-8"))
+    claimed = value.get(hash_key)
+    computed = _canonical_sha256(
+        {key: item for key, item in value.items() if key != hash_key}
+    )
+    if claimed != computed:
+        raise RuntimeError(f"LAGUNA_BOUND_JSON_HASH_INVALID:{path}:{claimed}:{computed}")
+    return value
+
+
+def _experiment_root(namespace: str) -> Path:
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", namespace):
+        raise ValueError(f"LAGUNA_TRAINING_NAMESPACE_INVALID:{namespace}")
+    return ROOT / "experiments" / namespace
 
 
 @app.function(image=image, volumes=VOLUMES, secrets=[secret], timeout=3600, memory=8192)
@@ -193,6 +238,12 @@ def _execution_hashes() -> dict[str, str]:
         "dflash_config": CONFIG_ROOT / "laguna-dflash-training.py",
         "corpus_manifest": DATA_ROOT / "manifest.json",
         "training_driver": Path(__file__),
+        "serving_native_cache_builder": Path(
+            "/opt/opjax-execution/build_laguna_serving_native_cache.py"
+        ),
+        "serving_native_token_builder": Path(
+            "/opt/opjax-execution/prepare_laguna_serving_native_tokens.py"
+        ),
     }
     missing = [name for name, path in paths.items() if not path.is_file()]
     if missing:
@@ -215,7 +266,12 @@ def _telemetry(path: Path) -> tuple[subprocess.Popen[bytes], object]:
     return process, output
 
 
-def _run_observed(command: list[str], run_root: Path) -> dict[str, object]:
+def _run_observed(
+    command: list[str],
+    run_root: Path,
+    *,
+    environment: dict[str, str] | None = None,
+) -> dict[str, object]:
     run_root.mkdir(parents=True, exist_ok=True)
     started = time.time()
     telemetry, telemetry_output = _telemetry(run_root / "gpu.csv")
@@ -227,6 +283,7 @@ def _run_observed(command: list[str], run_root: Path) -> dict[str, object]:
                 check=True,
                 stdout=log,
                 stderr=subprocess.STDOUT,
+                env=environment,
             )
     finally:
         telemetry.terminate()
@@ -264,8 +321,9 @@ def _run_observed(command: list[str], run_root: Path) -> dict[str, object]:
 @app.function(
     image=image, volumes=VOLUMES, secrets=[secret], timeout=3600, memory=16384
 )
-def initialize(arm: str) -> dict[str, object]:
-    output = ROOT / "initialized" / arm
+def initialize(arm: str, namespace: str = "legacy") -> dict[str, object]:
+    experiment_root = _experiment_root(namespace)
+    output = experiment_root / "initialized" / arm
     if output.exists():
         return json.loads((output / "initialization.json").read_text(encoding="utf-8"))
     command = [
@@ -275,9 +333,9 @@ def initialize(arm: str) -> dict[str, object]:
         "--arm",
         arm,
         "--output-root",
-        str(ROOT / "initialized"),
+        str(experiment_root / "initialized"),
     ]
-    run_root = ROOT / "runs" / "initialize" / arm
+    run_root = experiment_root / "runs" / "initialize" / arm
     run_root.mkdir(parents=True, exist_ok=True)
     with (run_root / "run.log").open("wb") as log:
         subprocess.run(
@@ -285,6 +343,283 @@ def initialize(arm: str) -> dict[str, object]:
         )
     training.commit()
     return json.loads((output / "initialization.json").read_text(encoding="utf-8"))
+
+
+@app.function(image=image, volumes=VOLUMES, timeout=1800, memory=16_384)
+def audit_initialization_pair(
+    namespace: str = "serving-native-v2",
+) -> dict[str, object]:
+    experiment_root = _experiment_root(namespace)
+    paths = {
+        arm: experiment_root / "initialized" / arm / "model.safetensors"
+        for arm in ("dflash", "dspark")
+    }
+    if not all(path.is_file() for path in paths.values()):
+        raise RuntimeError("LAGUNA_INITIALIZATION_PAIR_MISSING")
+    with safe_open(paths["dflash"], framework="pt", device="cpu") as dflash, safe_open(
+        paths["dspark"], framework="pt", device="cpu"
+    ) as dspark:
+        dflash_keys = set(dflash.keys())
+        dspark_keys = set(dspark.keys())
+        extra = dspark_keys - dflash_keys
+        expected_extra = {
+            "markov_head.markov_w1.weight",
+            "markov_head.markov_w2.weight",
+            "confidence_head.proj.weight",
+            "confidence_head.proj.bias",
+        }
+        if extra != expected_extra or dflash_keys - dspark_keys:
+            raise RuntimeError(
+                f"LAGUNA_INITIALIZATION_PAIR_KEYS_INVALID:{sorted(extra)}:"
+                f"{sorted(dflash_keys - dspark_keys)}"
+            )
+        mismatches = [
+            name
+            for name in sorted(dflash_keys)
+            if not torch.equal(dflash.get_tensor(name), dspark.get_tensor(name))
+        ]
+    if mismatches:
+        raise RuntimeError(f"LAGUNA_INITIALIZATION_PAIR_MISMATCH:{mismatches[:8]}")
+    result: dict[str, object] = {
+        "schema_version": 1,
+        "namespace": namespace,
+        "shared_tensor_count": len(dflash_keys),
+        "shared_tensors_exact": True,
+        "dspark_only_tensors": sorted(expected_extra),
+        "checkpoints": {arm: _sha256(path) for arm, path in paths.items()},
+    }
+    result["sha256"] = hashlib.sha256(
+        json.dumps(result, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    output = experiment_root / "runs" / "initialize" / "pair-audit.json"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    training.commit()
+    return result
+
+
+@app.function(image=image, volumes=VOLUMES, timeout=1800, memory=16_384)
+def freeze_training_preflight(
+    namespace: str = "serving-native-v2",
+    capture_run_id: str = "serving-native-v2",
+    supersede_existing: bool = False,
+) -> dict[str, object]:
+    experiment_root = _experiment_root(namespace)
+    output = experiment_root / "training-preflight.json"
+    capture_release_path = Path("/mnt/serving-native") / capture_run_id / "release.json"
+    capture_release = _validated_json(capture_release_path, "release_sha256")
+    pair_path = experiment_root / "runs" / "initialize" / "pair-audit.json"
+    pair = _validated_json(pair_path, "sha256")
+    caches = {}
+    ordered_ids = {}
+    for split in ("train", "calibration", "heldout"):
+        cache_root = experiment_root / "cache" / split
+        receipt_path = cache_root / "opjax-receipt.json"
+        cache_manifest_path = cache_root / "manifest.json"
+        receipt = _validated_json(receipt_path, "receipt_sha256")
+        cache_manifest = json.loads(cache_manifest_path.read_text(encoding="utf-8"))
+        source_samples = cache_manifest.get("source_samples")
+        if (
+            receipt.get("capture_release_sha256")
+            != capture_release["release_sha256"]
+            or not isinstance(source_samples, list)
+            or len(source_samples) != capture_release["splits"][split]["record_count"]
+        ):
+            raise RuntimeError(f"LAGUNA_PREFLIGHT_CACHE_INVALID:{split}")
+        ids = [sample["prompt_id"] for sample in source_samples]
+        expected_ids = [record["id"] for record in capture_release["splits"][split]["records"]]
+        if ids != expected_ids:
+            raise RuntimeError(f"LAGUNA_PREFLIGHT_CACHE_ORDER_INVALID:{split}")
+        ordered_ids[split] = ids
+        caches[split] = {
+            "receipt_file_sha256": _sha256(receipt_path),
+            "receipt_sha256": receipt["receipt_sha256"],
+            "manifest_file_sha256": _sha256(cache_manifest_path),
+            "sample_count": len(ids),
+            "ordered_ids_sha256": _canonical_sha256(ids),
+        }
+    initializations = {}
+    for arm in ("dflash", "dspark"):
+        root = experiment_root / "initialized" / arm
+        manifest_path = root / "initialization.json"
+        initializations[arm] = {
+            "manifest_file_sha256": _sha256(manifest_path),
+            "checkpoint": _checkpoint_identity(root),
+        }
+    value: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "opjax_laguna_serving_native_training_preflight",
+        "namespace": namespace,
+        "capture_run_id": capture_run_id,
+        "capture_release_sha256": capture_release["release_sha256"],
+        "capture_release_file_sha256": _sha256(capture_release_path),
+        "caches": caches,
+        "ordered_ids": ordered_ids,
+        "initializations": initializations,
+        "pair_audit_sha256": pair["sha256"],
+        "pair_audit_file_sha256": _sha256(pair_path),
+        "configs": {
+            arm: _sha256(CONFIG_ROOT / f"laguna-{arm}-training.py")
+            for arm in ("dflash", "dspark")
+        },
+        "seed": 42,
+        "global_batch_size": 8,
+        "epochs": 10,
+        "execution_files": _execution_hashes(),
+        "deepspec_revision": DEEPSPEC_REVISION,
+    }
+    value["preflight_sha256"] = _canonical_sha256(value)
+    if output.exists():
+        existing = _validated_json(output, "preflight_sha256")
+        if existing != value:
+            if not supersede_existing:
+                raise RuntimeError("LAGUNA_TRAINING_PREFLIGHT_DRIFT")
+            archive = experiment_root / "training-preflight-attempts" / str(
+                time.time_ns()
+            )
+            archive.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(output, archive)
+        else:
+            return existing
+    output.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    training.commit()
+    return value
+
+
+@app.function(image=image, volumes=VOLUMES, timeout=3600, memory=8192)
+def audit_checkpoint_lineage(
+    namespace: str = "serving-native-v2",
+) -> dict[str, object]:
+    experiment_root = _experiment_root(namespace)
+    preflight = _validated_json(
+        experiment_root / "training-preflight.json", "preflight_sha256"
+    )
+    steps = (0, 13, 26, 39, 52, 65, 78, 91, 104, 117, 120)
+    checkpoints: dict[str, dict[str, object]] = {}
+    training_results: dict[str, object] = {}
+    for arm in ("dflash", "dspark"):
+        arm_checkpoints = {}
+        for step in steps:
+            root = (
+                experiment_root / "initialized" / arm
+                if step == 0
+                else experiment_root / "checkpoints" / arm / f"step_{step}"
+            )
+            arm_checkpoints[str(step)] = _checkpoint_identity(root)
+        if arm_checkpoints["0"] != preflight["initializations"][arm]["checkpoint"]:
+            raise RuntimeError(f"LAGUNA_LINEAGE_INITIALIZATION_MISMATCH:{arm}")
+        result_path = experiment_root / "runs" / "train" / arm / "result.json"
+        train_result = _validated_json(result_path, "result_sha256")
+        if (
+            train_result.get("preflight_sha256") != preflight["preflight_sha256"]
+            or train_result.get("checkpoint") != arm_checkpoints["120"]
+        ):
+            raise RuntimeError(f"LAGUNA_LINEAGE_FINAL_MISMATCH:{arm}")
+        checkpoints[arm] = arm_checkpoints
+        training_results[arm] = {
+            "result_sha256": train_result["result_sha256"],
+            "result_file_sha256": _sha256(result_path),
+        }
+    value: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "opjax_laguna_checkpoint_lineage",
+        "namespace": namespace,
+        "preflight_sha256": preflight["preflight_sha256"],
+        "steps": list(steps),
+        "checkpoints": checkpoints,
+        "training_results": training_results,
+    }
+    value["sha256"] = _canonical_sha256(value)
+    output = experiment_root / "runs" / "eval" / "checkpoint-lineage.json"
+    output.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    training.commit()
+    return value
+
+
+@app.function(image=image, gpu="T4", volumes=VOLUMES, timeout=7200, memory=32_768)
+def prepare_serving_native_tokens(
+    capture_run_id: str = "serving-native-v2",
+) -> dict[str, object]:
+    output = Path("/mnt/serving-native") / capture_run_id / "tokenized"
+    run_root = _experiment_root(capture_run_id) / "runs" / "tokenize"
+    if output.exists():
+        archive = output.parent / "tokenized-attempts" / str(time.time_ns())
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(output, archive)
+    if run_root.exists():
+        archive = run_root.parent / "tokenize-attempts" / str(time.time_ns())
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(run_root, archive)
+    runtime = _run_observed(
+        [
+            "python",
+            "-m",
+            "opjax.remote.prepare_laguna_serving_native_tokens",
+            "--source-root",
+            str(DATA_ROOT),
+            "--output",
+            str(output),
+        ],
+        run_root,
+    )
+    release = json.loads((output / "release.json").read_text(encoding="utf-8"))
+    result = {**release, "runtime": runtime}
+    (run_root / "result.json").write_text(
+        json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    serving_native.commit()
+    training.commit()
+    return result
+
+
+@app.function(image=image, gpu="T4", volumes=VOLUMES, timeout=7200, memory=65_536)
+def build_serving_native_cache(
+    split: str,
+    namespace: str = "serving-native-v2",
+    capture_run_id: str = "serving-native-v2",
+    supersede_existing: bool = False,
+) -> dict[str, object]:
+    if split not in {"train", "calibration", "heldout"}:
+        raise ValueError(f"LAGUNA_CACHE_SPLIT_INVALID:{split}")
+    experiment_root = _experiment_root(namespace)
+    output = experiment_root / "cache" / split
+    run_root = experiment_root / "runs" / "cache" / split
+    if output.exists():
+        receipt_path = output / "opjax-receipt.json"
+        if receipt_path.is_file() and not supersede_existing:
+            raise RuntimeError(f"LAGUNA_CACHE_ALREADY_COMPLETE:{split}")
+        archive = experiment_root / "cache-attempts" / split / str(time.time_ns())
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(output, archive)
+    if run_root.exists():
+        archive = (
+            experiment_root / "runs" / "cache-attempts" / split / str(time.time_ns())
+        )
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(run_root, archive)
+    runtime = _run_observed(
+        [
+            "python",
+            "-m",
+            "opjax.remote.build_laguna_serving_native_cache",
+            "--capture-root",
+            str(Path("/mnt/serving-native") / capture_run_id),
+            "--split",
+            split,
+            "--output",
+            str(output),
+        ],
+        run_root,
+    )
+    receipt = json.loads((output / "opjax-receipt.json").read_text(encoding="utf-8"))
+    receipt["runtime"] = runtime
+    (run_root / "result.json").write_text(
+        json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    training.commit()
+    return receipt
 
 
 @app.function(gpu="H200:4", **OPTIONS)
@@ -317,23 +652,55 @@ def prepare_cache(split: str) -> dict[str, object]:
 
 
 @app.function(gpu="H200:4", **OPTIONS)
-def train_arm(arm: str) -> dict[str, object]:
+def train_arm(
+    arm: str,
+    namespace: str = "legacy",
+    supersede_failed_attempt: bool = False,
+) -> dict[str, object]:
     if arm not in {"dflash", "dspark"}:
         raise ValueError(f"LAGUNA_TRAIN_ARM_INVALID:{arm}")
     config = CONFIG_ROOT / f"laguna-{arm}-training.py"
+    experiment_root = _experiment_root(namespace)
+    preflight_path = experiment_root / "training-preflight.json"
+    preflight = _validated_json(preflight_path, "preflight_sha256")
+    if preflight.get("namespace") != namespace:
+        raise RuntimeError(f"LAGUNA_TRAIN_PREFLIGHT_NAMESPACE:{namespace}")
+    run_root = experiment_root / "runs" / "train" / arm
+    result_path = run_root / "result.json"
+    if result_path.is_file():
+        result = _validated_json(result_path, "result_sha256")
+        if result.get("preflight_sha256") != preflight["preflight_sha256"]:
+            raise RuntimeError(f"LAGUNA_TRAIN_RESULT_PREFLIGHT:{arm}")
+        return result
+    checkpoint_root = experiment_root / "checkpoints" / arm
+    if run_root.exists() or checkpoint_root.exists():
+        if not supersede_failed_attempt:
+            raise RuntimeError(f"LAGUNA_TRAIN_PARTIAL_REQUIRES_EXPLICIT_RESUME:{arm}")
+        attempt_root = (
+            experiment_root / "runs" / "train-attempts" / arm / str(time.time_ns())
+        )
+        attempt_root.mkdir(parents=True, exist_ok=False)
+        if run_root.exists():
+            os.replace(run_root, attempt_root / "run")
+        if checkpoint_root.exists():
+            os.replace(checkpoint_root, attempt_root / "checkpoints")
+    environment = {**os.environ, "OPJAX_LAGUNA_TRAINING_NAMESPACE": namespace}
     runtime = _run_observed(
         ["python", "train.py", "--config", str(config)],
-        ROOT / "runs" / "train" / arm,
+        run_root,
+        environment=environment,
     )
-    latest = (ROOT / "checkpoints" / arm / "step_latest").resolve()
-    model = latest / "model.safetensors"
-    result = {
+    latest = (experiment_root / "checkpoints" / arm / "step_latest").resolve()
+    result: dict[str, object] = {
+        "schema_version": 1,
         "arm": arm,
-        "checkpoint": str(latest),
-        "checkpoint_sha256": _sha256(model),
+        "namespace": namespace,
+        "preflight_sha256": preflight["preflight_sha256"],
+        "checkpoint": _checkpoint_identity(latest),
         "runtime": runtime,
     }
-    (ROOT / "runs" / "train" / arm / "result.json").write_text(
+    result["result_sha256"] = _canonical_sha256(result)
+    result_path.write_text(
         json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     training.commit()
@@ -346,6 +713,7 @@ def evaluate_arm(
     step: int,
     split: str = "calibration",
     variant: str = "raw",
+    namespace: str = "legacy",
 ) -> dict[str, object]:
     if arm not in {"dflash", "dspark"}:
         raise ValueError(f"LAGUNA_EVAL_ARM_INVALID:{arm}")
@@ -355,15 +723,18 @@ def evaluate_arm(
         raise ValueError(f"LAGUNA_EVAL_VARIANT_INVALID:{variant}")
     if variant == "calibrated" and (arm != "dspark" or step == 0):
         raise ValueError(f"LAGUNA_EVAL_VARIANT_UNSUPPORTED:{arm}:{step}:{variant}")
+    experiment_root = _experiment_root(namespace)
     if variant == "calibrated":
-        checkpoint = ROOT / "calibrated" / "dspark" / f"step_{step}"
+        checkpoint = experiment_root / "calibrated" / "dspark" / f"step_{step}"
     else:
         checkpoint = (
-            ROOT / "initialized" / arm
+            experiment_root / "initialized" / arm
             if step == 0
-            else ROOT / "checkpoints" / arm / f"step_{step}"
+            else experiment_root / "checkpoints" / arm / f"step_{step}"
         )
-    run_root = ROOT / "runs" / "eval" / split / arm / variant / f"step_{step}"
+    run_root = (
+        experiment_root / "runs" / "eval" / split / arm / variant / f"step_{step}"
+    )
     command = [
         "python",
         "-m",
@@ -371,7 +742,7 @@ def evaluate_arm(
         "--checkpoint",
         str(checkpoint),
         "--cache",
-        str(ROOT / "cache" / split),
+        str(experiment_root / "cache" / split),
         "--output",
         str(run_root),
         "--num-anchors",
@@ -397,18 +768,19 @@ def evaluate_arm(
 @app.function(
     image=image, volumes=VOLUMES, secrets=[secret], timeout=3600, memory=16384
 )
-def export_dflash(step: int) -> dict[str, object]:
-    output = ROOT / "exports" / "dflash" / f"step_{step}"
+def export_dflash(step: int, namespace: str = "legacy") -> dict[str, object]:
+    experiment_root = _experiment_root(namespace)
+    output = experiment_root / "exports" / "dflash" / f"step_{step}"
     command = [
         "python",
         "-m",
         "opjax.remote.export_laguna_speculator",
         "--checkpoint",
-        str(ROOT / "checkpoints" / "dflash" / f"step_{step}"),
+        str(experiment_root / "checkpoints" / "dflash" / f"step_{step}"),
         "--output",
         str(output),
     ]
-    run_root = ROOT / "runs" / "export" / "dflash" / f"step_{step}"
+    run_root = experiment_root / "runs" / "export" / "dflash" / f"step_{step}"
     run_root.mkdir(parents=True, exist_ok=True)
     with (run_root / "run.log").open("wb") as log:
         subprocess.run(
@@ -419,20 +791,21 @@ def export_dflash(step: int) -> dict[str, object]:
 
 
 @app.function(gpu="H200", **OPTIONS)
-def calibrate_dspark(step: int) -> dict[str, object]:
-    output = ROOT / "calibrated" / "dspark" / f"step_{step}"
+def calibrate_dspark(step: int, namespace: str = "legacy") -> dict[str, object]:
+    experiment_root = _experiment_root(namespace)
+    output = experiment_root / "calibrated" / "dspark" / f"step_{step}"
     command = [
         "python",
         "-m",
         "opjax.remote.calibrate_laguna_dspark",
         "--checkpoint",
-        str(ROOT / "checkpoints" / "dspark" / f"step_{step}"),
+        str(experiment_root / "checkpoints" / "dspark" / f"step_{step}"),
         "--cache",
-        str(ROOT / "cache" / "calibration"),
+        str(experiment_root / "cache" / "calibration"),
         "--output",
         str(output),
     ]
-    run_root = ROOT / "runs" / "calibration" / "dspark" / f"step_{step}"
+    run_root = experiment_root / "runs" / "calibration" / "dspark" / f"step_{step}"
     runtime = _run_observed(command, run_root)
     payload = json.loads((output / "calibration.json").read_text(encoding="utf-8"))
     payload["runtime"] = runtime
@@ -444,11 +817,14 @@ def calibrate_dspark(step: int) -> dict[str, object]:
 
 
 @app.function(image=image, volumes=VOLUMES, timeout=300, memory=4096)
-def select_checkpoint(arm: str, step: int) -> dict[str, object]:
+def select_checkpoint(
+    arm: str, step: int, namespace: str = "legacy"
+) -> dict[str, object]:
     if arm not in {"dflash", "dspark"}:
         raise ValueError(f"LAGUNA_SELECT_ARM_INVALID:{arm}")
+    experiment_root = _experiment_root(namespace)
     evaluation = (
-        ROOT
+        experiment_root
         / "runs"
         / "eval"
         / "calibration"
@@ -460,12 +836,12 @@ def select_checkpoint(arm: str, step: int) -> dict[str, object]:
     if not evaluation.is_file():
         raise RuntimeError(f"LAGUNA_SELECT_EVALUATION_MISSING:{evaluation}")
     source = (
-        ROOT / "exports" / "dflash" / f"step_{step}"
+        experiment_root / "exports" / "dflash" / f"step_{step}"
         if arm == "dflash"
-        else ROOT / "calibrated" / "dspark" / f"step_{step}"
+        else experiment_root / "calibrated" / "dspark" / f"step_{step}"
     )
     identity = _checkpoint_identity(source)
-    selected_root = ROOT / "selected"
+    selected_root = experiment_root / "selected"
     selected_root.mkdir(parents=True, exist_ok=True)
     destination = selected_root / arm
     temporary = selected_root / f".{arm}.tmp"

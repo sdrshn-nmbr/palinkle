@@ -9,14 +9,11 @@ import platform
 import shutil
 import subprocess
 import sys
-import threading
-import time
 import uuid
 from pathlib import Path
 from typing import Any
 
 from huggingface_hub import snapshot_download
-import modal
 
 from opjax.pallas.laguna_speculative import (
     DFLASH,
@@ -27,6 +24,7 @@ from opjax.pallas.laguna_speculative import (
     canonical_sha256,
     normalize_dspark_config,
 )
+from opjax.remote.gpu_runtime_identity import gpu_runtime_identity
 
 DFLASH_SAMPLE_SOURCE = """    # --- Token indices to sample (mask tokens, skip the bonus token) ---
     is_sample = is_query & (query_off > 0)
@@ -98,7 +96,7 @@ def _rewrite_speculative_config(
 
 def _start_gpu_telemetry(*, artifact_dir: Path) -> None:
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    output = (artifact_dir / "gpu.csv").open("ab")
+    output = (artifact_dir / "gpu.csv").open("xb")
     command = [
         "nvidia-smi",
         "--query-gpu=timestamp,index,name,memory.used,memory.total,utilization.gpu,power.draw",
@@ -109,27 +107,13 @@ def _start_gpu_telemetry(*, artifact_dir: Path) -> None:
 
 
 def _start_artifact_commits() -> None:
-    volume_name = os.environ["OPJAX_SPEC_ARTIFACT_VOLUME"]
-    environment_name = os.environ["OPJAX_SPEC_MODAL_ENVIRONMENT"]
-    volume = modal.Volume.from_name(
-        volume_name,
-        environment_name=environment_name,
-        version=1,
+    if "OPJAX_SPEC_ARTIFACT_VOLUME" not in os.environ:
+        return
+    subprocess.Popen(
+        [sys.executable, "-m", "opjax.remote.modal_volume_committer"],
+        stdout=sys.stdout,
+        stderr=sys.stderr,
     )
-
-    def commit_forever() -> None:
-        while True:
-            time.sleep(60)
-            try:
-                volume.commit()
-            except Exception as exc:
-                print(
-                    f"LAGUNA_ARTIFACT_COMMIT_FAILED:{type(exc).__name__}:{exc}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-
-    threading.Thread(target=commit_forever, daemon=True).start()
 
 
 def _checkpoint_identity(arguments: list[str]) -> dict[str, Any] | None:
@@ -256,6 +240,9 @@ def _write_runtime_fingerprint(
     source_files = [
         Path(__file__),
         Path(__file__).with_name("laguna_dspark_vllm_model.py"),
+        Path(__file__).with_name("laguna_target_capture_model.py"),
+        Path(__file__).with_name("modal_volume_committer.py"),
+        Path(__file__).with_name("gpu_runtime_identity.py"),
         Path(__file__).parents[1] / "pallas" / "laguna_speculative.py",
     ]
     fingerprint: dict[str, Any] = {
@@ -266,6 +253,25 @@ def _write_runtime_fingerprint(
         "vllm_source_revision": "unavailable_in_image_build_metadata",
         "python": sys.version,
         "platform": platform.platform(),
+        "attempt_id": os.environ["OPJAX_SPEC_ATTEMPT_ID"],
+        "declared_gpu": os.environ["OPJAX_SPEC_DECLARED_GPU"],
+        "gpu": gpu_runtime_identity(
+            expected_count=int(os.environ.get("OPJAX_EXPECTED_GPU_COUNT", "1"))
+        ),
+        "deployment": {
+            key: os.environ[key]
+            for key in (
+                "MODAL_ENVIRONMENT",
+                "MODAL_FUNCTION_NAME",
+                "MODAL_TASK_ID",
+                "OPJAX_DEPLOYMENT_PROVIDER",
+                "OPJAX_DEPLOYMENT_ID",
+                "OPJAX_DEPLOYMENT_ZONE",
+                "OPJAX_DEPLOYMENT_INSTANCE_ID",
+                "OPJAX_CONTAINER_INTERPRETER",
+            )
+            if key in os.environ
+        },
         "argv": sys.argv,
         "resolved_arguments": arguments,
         "draft_checkpoint": _checkpoint_identity(arguments),
@@ -279,10 +285,8 @@ def _write_runtime_fingerprint(
         },
     }
     fingerprint["sha256"] = canonical_sha256(fingerprint)
-    (artifact_dir / "runtime.json").write_text(
-        json.dumps(fingerprint, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    with (artifact_dir / "runtime.json").open("x", encoding="utf-8") as handle:
+        handle.write(json.dumps(fingerprint, indent=2, sort_keys=True) + "\n")
 
 
 def main() -> None:

@@ -17,6 +17,11 @@ from typing import Any, Protocol, TypeVar
 from huggingface_hub import HfApi
 import torch
 
+from opjax.remote.gpu_runtime_identity import gpu_runtime_identity
+
+
+__all__ = ["gpu_runtime_identity"]
+
 
 T = TypeVar("T")
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
